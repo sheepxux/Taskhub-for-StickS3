@@ -1,0 +1,19 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Step 2+ runtime artifacts
+audio_uploads/
+state.db
+state.db-journal
+models/
+bin/
+memory/
+
+# Editor/IDE
+.vscode/
+.idea/
+.claude/settings.local.json
