@@ -20,12 +20,16 @@ Env overrides:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -39,16 +43,25 @@ POLL_INTERVAL_S = 2.0
 WHISPER_BIN = os.environ.get("WHISPER_BIN") or shutil.which("whisper-cli")
 WHISPER_MODEL = Path(os.environ.get("WHISPER_MODEL", ROOT / "models" / "ggml-large-v3.bin"))
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
+# If set (e.g. http://127.0.0.1:8080), POST to a resident whisper-server so the
+# model stays in memory instead of reloading per file (matters a lot for large-v3).
+WHISPER_SERVER_URL = os.environ.get("WHISPER_SERVER_URL", "").rstrip("/")
 
 
 def _check_tools() -> None:
     missing = []
-    if not WHISPER_BIN:
-        missing.append("whisper-cli (set WHISPER_BIN or `brew install whisper-cpp`)")
     if not FFMPEG_BIN:
         missing.append("ffmpeg (set FFMPEG_BIN or `brew install ffmpeg`)")
+    if WHISPER_SERVER_URL:
+        return _finish_check(missing)  # server mode: no local binary/model needed here
+    if not WHISPER_BIN:
+        missing.append("whisper-cli (set WHISPER_BIN or `brew install whisper-cpp`)")
     if not WHISPER_MODEL.exists():
         missing.append(f"model file {WHISPER_MODEL}")
+    _finish_check(missing)
+
+
+def _finish_check(missing: list[str]) -> None:
     if missing:
         sys.exit("transcribe.py: missing dependencies:\n  - " + "\n  - ".join(missing))
 
@@ -62,6 +75,43 @@ def _decode_to_wav(src: Path, dst: Path) -> None:
 
 
 def _whisper(wav: Path) -> str:
+    if WHISPER_SERVER_URL:
+        return _whisper_via_server(wav)
+    return _whisper_via_cli(wav)
+
+
+def _whisper_via_server(wav: Path) -> str:
+    """POST the WAV to a resident whisper-server /inference endpoint."""
+    boundary = uuid.uuid4().hex
+    fields = {"temperature": "0.0", "response_format": "json", "language": "auto"}
+    parts: list[bytes] = []
+    for k, v in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode()
+    )
+    parts.append(wav.read_bytes())
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        f"{WHISPER_SERVER_URL}/inference",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        payload = resp.read().decode("utf-8")
+    try:
+        return json.loads(payload).get("text", "").strip()
+    except json.JSONDecodeError:
+        return payload.strip()  # response_format may have returned plain text
+
+
+def _whisper_via_cli(wav: Path) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         out_prefix = Path(tmp) / "out"
         subprocess.run(
@@ -162,7 +212,8 @@ def main() -> None:
 
     _check_tools()
     db.init_db()
-    print(f"transcribe worker up. model={WHISPER_MODEL.name}")
+    backend = f"server={WHISPER_SERVER_URL}" if WHISPER_SERVER_URL else f"cli model={WHISPER_MODEL.name}"
+    print(f"transcribe worker up. backend={backend}")
 
     while True:
         entry = _claim_one()

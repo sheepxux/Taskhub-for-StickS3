@@ -20,3 +20,4 @@ memory/
 .idea/
 .claude/settings.local.json
 daily.log
+whisper-server.log
