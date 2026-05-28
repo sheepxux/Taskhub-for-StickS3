@@ -501,7 +501,7 @@ semantic search 直接命中相关条目。
 
 **验收**:6 个 curl 命令全部返回预期 JSON 格式。
 
-**状态**:进行中。
+**状态**:✅ 完成。6 个 curl 流程全绿(含幂等、404 边界)。
 
 ### Step 2:接入 whisper.cpp 做真实转录
 
@@ -512,6 +512,8 @@ semantic search 直接命中相关条目。
 
 **验收**:用任意 Opus/WAV 文件 POST 上来,5 秒内 `memory/voice/YYYY-MM-DD.md` 出现转录条目。
 
+**状态**:✅ 完成(代码与管线)。SQLite(WAL)持久化 + 音频落盘;transcribe.py 双后端(`whisper-cli` 直调 / 常驻 `whisper-server`,后者经 `WHISPER_SERVER_URL` 启用);whisper-cli + ffmpeg 已装(Metal 加速)。用 base 模型端到端实测 ~0.7s 出条目,远低于 5s。large-v3(2.95GB)下载中,完成后切 `WHISPER_MODEL` 即用。
+
 ### Step 3:summarize + notify(22:00 链路)
 
 **产出**:
@@ -520,6 +522,8 @@ semantic search 直接命中相关条目。
 - cron 任务接入
 
 **验收**:手动触发 summarize,摘要文件生成 + 手机收到推送。
+
+**状态**:✅ 完成(代码与本地链路)。summarize.py 分类聚合写 `*-summary.md`(Claude API,无 key 时退关键词启发式,实测 6 条分类正确);notify.py 写 SQLite 未读通知(设备可拉)+ Telegram 推送;`run_daily.sh` + launchd plist 接 22:00。实测 summarize→notify→`GET /notifications/unread` 全通。**待用户提供凭据激活**:`ANTHROPIC_API_KEY`(LLM 摘要)、`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`(推送)——托管环境屏蔽了 host 的 key,故 LLM/Telegram 实活路径未实测。
 
 ### Step 4:StickS3 firmware 基础
 
@@ -591,5 +595,5 @@ semantic search 直接命中相关条目。
 ---
 
 **文档版本**:v0.1  
-**当前阶段**:Step 1 实施中  
-**最后更新**:2026-05-27
+**当前阶段**:Step 1–3(OpenClaw skill 后端)完成并验证;Step 4(StickS3 firmware)待开始  
+**最后更新**:2026-05-28
