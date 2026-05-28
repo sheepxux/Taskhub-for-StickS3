@@ -21,6 +21,8 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
@@ -61,18 +63,17 @@ static uint32_t timeoutMs(S s) {
   }
 }
 
-// ----------------------------------------------------------------- fake data
-struct Entry { const char* time; const char* title; const char* preview; };
-static Entry entries[] = {
-  {"14:32", "咖啡馆灵感", "想到一个产品点子——把本地大模型跑在路由器上，家里设备共享一个隐私推理节点。"},
-  {"16:05", "读 Bret Victor", "Inventing on Principle 那段关于即时反馈的论述，creator 要直接看到结果。"},
-  {"18:20", "买咖啡豆", "明天记得买咖啡豆，埃塞俄比亚水洗那款喝完了。"},
-};
-static int entryCount = 3;
-static int todayCount = 3;        // shown on IDLE
-static int pendingSync = 1;       // 待同步条数
-static bool wifiOk = true;
-static int battPct = 87;
+// ----------------------------------------------------------------- entries (from server)
+// REVIEW shows today's real entries pulled from GET /api/v1/entries/today;
+// titles/previews are whisper/LLM output that lives on the server, not here.
+struct Entry { String time, title, preview, id; };
+static constexpr int MAX_ENTRIES = 24;
+static Entry entries[MAX_ENTRIES];
+static int  entryCount = 0;
+static int  todayCount = 0;        // shown on IDLE (== fetched count)
+static int  pendingSync = 0;       // local /rec/*.wav not yet uploaded
+static bool wifiOk = false;
+static int  battPct = 100;
 
 static bool unreadNotif = true;   // one unread daily summary
 static const char* notifTitle = "今天记了 7 条";
@@ -84,6 +85,7 @@ static uint32_t stateSince = 0;   // millis when current state entered
 static bool     dirty = true;     // needs full redraw
 static uint32_t recordStart = 0;  // RECORDING press time
 static int      reviewIdx = 0;    // REVIEW cursor
+static uint32_t reviewFetchAt = 0; // last fetchToday() while in REVIEW (auto-refresh throttle)
 
 static void enter(S s) {
   state = s;
@@ -300,6 +302,50 @@ static int uploadAll() {
   return countPending();
 }
 
+static String apiUrl(const String& path) {
+  return String("http://") + SERVER_HOST + ":" + String((int)SERVER_PORT) + path;
+}
+
+// Pull today's entries from the server into entries[]/todayCount.
+static void fetchToday() {
+  if (!wifiUp()) return;
+  HTTPClient http;
+  http.begin(apiUrl("/api/v1/entries/today"));
+  http.addHeader("X-Device-Token", DEVICE_TOKEN);
+  int code = http.GET();
+  if (code == 200) {
+    JsonDocument doc;
+    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
+      entryCount = 0;
+      for (JsonObject o : doc.as<JsonArray>()) {
+        if (entryCount >= MAX_ENTRIES) break;
+        Entry& e = entries[entryCount];
+        e.id      = o["id"].as<String>();
+        e.title   = o["title"].as<String>();
+        e.preview = o["preview"].as<String>();
+        String ts = o["recorded_at"].as<String>();   // 2026-05-28T23:04:51+08:00 → 23:04
+        int t = ts.indexOf('T');
+        e.time = (t >= 0 && (int)ts.length() >= t + 6) ? ts.substring(t + 1, t + 6) : ts;
+        entryCount++;
+      }
+      todayCount = entryCount;
+    }
+  }
+  http.end();
+  Serial.printf("[net] fetchToday code=%d count=%d\n", code, entryCount);
+}
+
+static bool deleteEntry(const String& id) {
+  if (!wifiUp() || id.length() == 0) return false;
+  HTTPClient http;
+  http.begin(apiUrl("/api/v1/entries/" + id));
+  http.addHeader("X-Device-Token", DEVICE_TOKEN);
+  int code = http.sendRequest("DELETE");
+  http.end();
+  Serial.printf("[net] delete %s code=%d\n", id.c_str(), code);
+  return code == 200;
+}
+
 // ----------------------------------------------------------------- draw helpers
 static void clearBg() { M5.Display.fillScreen(C_BG); }
 
@@ -397,6 +443,12 @@ static void drawSaved() {
 static void drawReview() {
   clearBg();
   const int W = M5.Display.width();
+  if (entryCount == 0) {
+    centerText("今天还没有记录", M5.Display.height() / 2, C_GRAY, &fonts::efontCN_16);
+    centerText("BtnB 长按退出", 128, C_GRAY, &fonts::efontCN_12);
+    return;
+  }
+  if (reviewIdx >= entryCount) reviewIdx = entryCount - 1;
   Entry& e = entries[reviewIdx];
   // top: index + time
   char idx[16]; snprintf(idx, sizeof(idx), "%d / %d", reviewIdx + 1, entryCount);
@@ -405,8 +457,7 @@ static void drawReview() {
   M5.Display.setTextDatum(top_left);
   M5.Display.drawString(idx, 6, 6);
   M5.Display.setTextDatum(top_right);
-  char ttl[24]; snprintf(ttl, sizeof(ttl), "今天 %s", e.time);
-  M5.Display.drawString(ttl, W - 6, 6);
+  M5.Display.drawString("今天 " + e.time, W - 6, 6);
 
   // title
   M5.Display.setFont(&fonts::efontCN_24);
@@ -505,6 +556,7 @@ static void runSync() {
   enter(S::SYNCING);
   render();
   pendingSync = uploadAll();
+  fetchToday();              // refresh counts/list with what the server now has
   enter(S::IDLE);
 }
 
@@ -520,7 +572,7 @@ static void handleButtons() {
     case S::IDLE:
       if (M5.BtnA.wasPressed()) { recordStart = millis(); startRecording(); enter(S::RECORDING); }
       else if (M5.BtnB.wasHold()) { if (wifiUp()) runSync(); }
-      else if (M5.BtnB.wasClicked()) { if (todayCount > 0) { reviewIdx = 0; enter(S::REVIEW); } }
+      else if (M5.BtnB.wasClicked()) { fetchToday(); reviewFetchAt = millis(); if (entryCount > 0) { reviewIdx = 0; enter(S::REVIEW); } }
       break;
 
     case S::RECORDING:
@@ -548,11 +600,9 @@ static void handleButtons() {
 
     case S::DELETE_CONFIRM:
       if (M5.BtnB.wasDoubleClicked()) {           // confirm delete
-        // remove entries[reviewIdx]
-        for (int i = reviewIdx; i < entryCount - 1; i++) entries[i] = entries[i + 1];
-        entryCount--; if (entryCount < 0) entryCount = 0;
+        if (reviewIdx < entryCount) deleteEntry(entries[reviewIdx].id);
+        fetchToday();                              // re-pull authoritative list
         if (reviewIdx >= entryCount) reviewIdx = entryCount > 0 ? entryCount - 1 : 0;
-        if (todayCount > 0) todayCount--;
         enter(entryCount > 0 ? S::REVIEW : S::IDLE);
       }
       break;
@@ -616,9 +666,16 @@ void setup() {
 void loop() {
   M5.update();
   if (state == S::IDLE) {                        // refresh status shown on the idle screen
+    static bool fetchedOnce = false;
     bool w = wifiUp();
     int b = M5.Power.getBatteryLevel();
     if (w != wifiOk || b != battPct) { wifiOk = w; battPct = b; dirty = true; }
+    if (w && !fetchedOnce) { fetchedOnce = true; fetchToday(); dirty = true; }  // populate count once online
+  }
+  if (state == S::REVIEW && wifiUp() && millis() - reviewFetchAt > 2500) {
+    reviewFetchAt = millis();       // live-refresh so "(转录中)" resolves to the real title in place
+    fetchToday();
+    dirty = true;
   }
   if (state == S::RECORDING) pollRecording();   // drain mic before release check
   handleButtons();
