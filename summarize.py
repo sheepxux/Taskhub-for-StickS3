@@ -15,6 +15,7 @@ cron, but runnable by hand:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -24,7 +25,8 @@ import llm
 
 CST = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parent
-VOICE_DIR = ROOT / "memory" / "voice"
+# Same VOICE_DIR as transcribe.py — override to OpenClaw's indexed memory dir.
+VOICE_DIR = Path(os.environ.get("VOICE_DIR", ROOT / "memory" / "voice"))
 
 CATEGORIES = ["产品点子", "阅读笔记", "待办", "其他"]
 

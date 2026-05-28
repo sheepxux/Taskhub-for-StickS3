@@ -37,8 +37,10 @@ import db
 
 CST = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parent
-VOICE_DIR = ROOT / "memory" / "voice"
-POLL_INTERVAL_S = 2.0
+# Where transcripts land. Point this at OpenClaw's indexed memory dir
+# (~/.openclaw/workspace/memory/voice) so `openclaw memory search` can find them.
+VOICE_DIR = Path(os.environ.get("VOICE_DIR", ROOT / "memory" / "voice"))
+POLL_INTERVAL_S = 0.5
 
 WHISPER_BIN = os.environ.get("WHISPER_BIN") or shutil.which("whisper-cli")
 WHISPER_MODEL = Path(os.environ.get("WHISPER_MODEL", ROOT / "models" / "ggml-large-v3.bin"))
@@ -46,6 +48,10 @@ FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
 # If set (e.g. http://127.0.0.1:8080), POST to a resident whisper-server so the
 # model stays in memory instead of reloading per file (matters a lot for large-v3).
 WHISPER_SERVER_URL = os.environ.get("WHISPER_SERVER_URL", "").rstrip("/")
+# OpenClaw CLI; after each transcript we ask it to reindex so the note is
+# immediately searchable via `openclaw memory search`. Best-effort.
+OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN") or shutil.which("openclaw") \
+    or str(Path.home() / ".local" / "npm" / "bin" / "openclaw")
 
 
 def _check_tools() -> None:
@@ -126,6 +132,20 @@ def _whisper_via_cli(wav: Path) -> str:
     return text.strip()
 
 
+def reindex_memory() -> None:
+    """Best-effort `openclaw memory index` so a new transcript is searchable now.
+    Must never break transcription, so all failures are swallowed."""
+    if not Path(OPENCLAW_BIN).exists():
+        return
+    try:
+        subprocess.run(
+            [OPENCLAW_BIN, "memory", "index"],
+            check=False, capture_output=True, timeout=180,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[index] skipped: {e!r}", file=sys.stderr)
+
+
 def _make_title(text: str) -> str:
     """Short 5-8 char-ish title. Step 3 replaces this with an LLM call."""
     first = text.strip().splitlines()[0] if text.strip() else ""
@@ -196,6 +216,7 @@ def _process(entry: dict) -> None:
         _finish(entry_id, title, _preview(text), text)
         audio_path.unlink(missing_ok=True)
         print(f"[done] {entry_id}  «{title}»  ({len(text)} chars)")
+        reindex_memory()  # make it searchable in OpenClaw right away
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode("utf-8", "replace") if e.stderr else str(e)
         _fail(entry_id, f"{e} :: {stderr}")
