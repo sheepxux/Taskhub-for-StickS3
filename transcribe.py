@@ -1,0 +1,178 @@
+"""
+StickS3 voice-recorder transcription worker (Step 2).
+
+Polls state.db for queued entries and, for each:
+  1. ffmpeg: Opus -> 16 kHz mono WAV
+  2. whisper.cpp (whisper-cli): WAV -> text
+  3. derive a short title
+  4. append to memory/voice/YYYY-MM-DD.md
+  5. delete the staged audio file
+  6. mark the entry done
+
+Run continuously:  python3 transcribe.py
+Drain once & exit: python3 transcribe.py --once
+
+Env overrides:
+  WHISPER_BIN    path to whisper-cli            (default: found on PATH)
+  WHISPER_MODEL  path to ggml model             (default: ./models/ggml-large-v3.bin)
+  FFMPEG_BIN     path to ffmpeg                  (default: found on PATH)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import db
+
+CST = timezone(timedelta(hours=8))
+ROOT = Path(__file__).resolve().parent
+VOICE_DIR = ROOT / "memory" / "voice"
+POLL_INTERVAL_S = 2.0
+
+WHISPER_BIN = os.environ.get("WHISPER_BIN") or shutil.which("whisper-cli")
+WHISPER_MODEL = Path(os.environ.get("WHISPER_MODEL", ROOT / "models" / "ggml-large-v3.bin"))
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
+
+
+def _check_tools() -> None:
+    missing = []
+    if not WHISPER_BIN:
+        missing.append("whisper-cli (set WHISPER_BIN or `brew install whisper-cpp`)")
+    if not FFMPEG_BIN:
+        missing.append("ffmpeg (set FFMPEG_BIN or `brew install ffmpeg`)")
+    if not WHISPER_MODEL.exists():
+        missing.append(f"model file {WHISPER_MODEL}")
+    if missing:
+        sys.exit("transcribe.py: missing dependencies:\n  - " + "\n  - ".join(missing))
+
+
+def _decode_to_wav(src: Path, dst: Path) -> None:
+    subprocess.run(
+        [FFMPEG_BIN, "-y", "-i", str(src), "-ar", "16000", "-ac", "1", "-f", "wav", str(dst)],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _whisper(wav: Path) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        out_prefix = Path(tmp) / "out"
+        subprocess.run(
+            [
+                WHISPER_BIN, "-m", str(WHISPER_MODEL), "-f", str(wav),
+                "-l", "auto", "-nt", "-otxt", "-of", str(out_prefix),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        text = (out_prefix.with_suffix(".txt")).read_text(encoding="utf-8")
+    return text.strip()
+
+
+def _make_title(text: str) -> str:
+    """Short 5-8 char-ish title. Step 3 replaces this with an LLM call."""
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    for sep in ("。", "，", ".", ",", "!", "?", "！", "？"):
+        if sep in first:
+            first = first.split(sep, 1)[0]
+            break
+    return (first[:12] or "无标题").strip()
+
+
+def _preview(text: str, limit: int = 40) -> str:
+    flat = " ".join(text.split())
+    return flat[:limit] + ("..." if len(flat) > limit else "")
+
+
+def _append_markdown(when: datetime, title: str, text: str) -> None:
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    day_file = VOICE_DIR / f"{when.astimezone(CST):%Y-%m-%d}.md"
+    block = f"## {when.astimezone(CST):%H:%M} · {title}\n\n{text}\n\n"
+    with day_file.open("a", encoding="utf-8") as f:
+        f.write(block)
+
+
+def _claim_one() -> dict | None:
+    """Atomically grab one queued entry and mark it transcribing."""
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM entries WHERE status = 'queued' ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        conn.execute("UPDATE entries SET status = 'transcribing' WHERE id = ?", (row["id"],))
+        conn.execute("COMMIT")
+        return dict(row)
+
+
+def _finish(entry_id: str, title: str, preview: str, transcript: str) -> None:
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE entries SET status='done', title=?, preview=?, transcript=? WHERE id=?",
+            (title, preview, transcript, entry_id),
+        )
+
+
+def _fail(entry_id: str, err: str) -> None:
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE entries SET status='error', error=? WHERE id=?", (err[:500], entry_id)
+        )
+
+
+def _process(entry: dict) -> None:
+    entry_id = entry["id"]
+    audio_path = Path(entry["audio_path"]) if entry["audio_path"] else None
+    if not audio_path or not audio_path.exists():
+        _fail(entry_id, f"audio file missing: {audio_path}")
+        return
+    try:
+        when = datetime.fromisoformat(entry["recorded_at"])
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp) / "audio.wav"
+            _decode_to_wav(audio_path, wav)
+            text = _whisper(wav)
+        title = _make_title(text)
+        _append_markdown(when, title, text)
+        _finish(entry_id, title, _preview(text), text)
+        audio_path.unlink(missing_ok=True)
+        print(f"[done] {entry_id}  «{title}»  ({len(text)} chars)")
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", "replace") if e.stderr else str(e)
+        _fail(entry_id, f"{e} :: {stderr}")
+        print(f"[error] {entry_id}: {stderr}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 - worker must survive any single bad entry
+        _fail(entry_id, repr(e))
+        print(f"[error] {entry_id}: {e!r}", file=sys.stderr)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="drain the queue then exit")
+    args = ap.parse_args()
+
+    _check_tools()
+    db.init_db()
+    print(f"transcribe worker up. model={WHISPER_MODEL.name}")
+
+    while True:
+        entry = _claim_one()
+        if entry is None:
+            if args.once:
+                return
+            time.sleep(POLL_INTERVAL_S)
+            continue
+        _process(entry)
+
+
+if __name__ == "__main__":
+    main()
