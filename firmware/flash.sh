@@ -16,8 +16,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-FQBN="esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB,PSRAM=opi"
+# PartitionScheme=custom → esp32 core uses firmware/voice_recorder/partitions.csv
+# (single app + enlarged data partition; see that file for rationale).
+FQBN="esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=custom,PSRAM=opi"
 SKETCH="firmware/voice_recorder"
+# Data (spiffs/LittleFS) partition for read-back: esptool read_flash 0x390000 0x450000
+DATA_OFFSET="0x390000"
+DATA_SIZE="0x450000"
 PORT="$(ls /dev/cu.usbmodem* 2>/dev/null | head -1 || true)"
 
 case "${1:-all}" in

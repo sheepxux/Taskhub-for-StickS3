@@ -487,6 +487,21 @@ semantic search 直接命中相关条目。
 **反思**:不要因为"看上去更高级"就砍掉承载信息的颜色。
 极简的代价是信息密度。
 
+### ADR-007:暂不做 Opus,改用 WAV + 扩大数据分区
+
+**决策**:固件录音保持 16kHz/16bit WAV;通过自定义分区表(砍掉第二个 OTA app 槽)把数据分区从 1.5MB 扩到 4.52MB(≈141s),覆盖离线缓存需求。Opus 编码(原 Step 5b)降级为"暂不做"。
+
+**理由**:
+- 真实需求小:用户出门单次录音 ~1 分钟封顶。1 分钟 WAV=1.92MB,扩分区即可,无需压缩。
+- 电池是真瓶颈,存储不是:设备仅 250mAh。Opus 是实时编码,录音时持续吃 CPU;而录音状态本就是耗电大头。为省"不缺的存储"去烧"稀缺的电",方向错了。WAV 录音近乎只有 I2S DMA + Flash 写,最省电。
+- 复杂度/风险:可用的 ESP32 Opus 库只产裸帧、无 Ogg 容器,需自定义封装并改后端解码,且稳定性需实测。WAV 经 ffmpeg 按内容解码,后端零改动。
+
+**放弃方案**:
+- 现在就上 Opus——复杂度与耗电不匹配 1 分钟的真实需求。
+- 维持 1.5MB 默认分区——只有 ~45s,不够 1 分钟。
+
+**反思**:原设计把 Opus 当默认前提,是在"未量化真实使用画像"时定的。一旦明确"单次 ~1 分钟 + 电池极小",约束的优先级就翻转了——稀缺的是电与简单度,不是字节。先问场景,再选格式。
+
 ---
 
 ## 10. 实施路线图
@@ -535,23 +550,32 @@ semantic search 直接命中相关条目。
 
 **验收**:不录音也能完整跑通所有状态转移,屏幕显示正确。
 
+**状态**:✅ 完成并实测。arduino-cli + esp32@3.3.8 + M5Unified 编译过(56% flash / 7% RAM);烧录到实机,6 个屏幕渲染正确,所有状态转移(录音/保存/丢弃/翻看/删除确认/同步/深睡唤醒→通知)逐项跑通。修复:REVIEW 里「下一条」由 `wasClicked` 改 `wasSingleClicked`,消除单击与双击删除的冲突(代价:翻页响应延迟约半个双击窗口,可接受)。
+
 ### Step 5:录音 + Opus 编码 + Flash 缓存
+
+为降风险拆成两小步(用户确认):先 WAV 跑通麦克风+Flash 通路,再加 Opus。
 
 **产出**:
 - ES8311 麦克风初始化
-- libopus 编码
 - LittleFS 文件系统 + 录音文件写入
+- (5a)WAV 写入;(5b)libopus 编码
 
-**验收**:录一段,从 Flash 拷出 .opus 文件,Mac 上 vlc 能播放,音质清晰。
+**验收**:录一段,从 Flash 拷出音频文件,Mac 上 vlc 能播放,音质清晰。
+
+**Step 5a 状态**:✅ 完成并实测。M5.Mic(16kHz/mono/16bit)双缓冲流式写 WAV 到 LittleFS(`/rec/NNNN.wav`,seq 存 NVS);录音中音量条改读真实麦克风峰值。实机录两条,esptool 读 spiffs 分区 + mklittlefs 解包拷出,VLC 实听清晰、格式校验 mono/16bit/16kHz 正确。已知:M5Unified 默认麦克风增益 `magnification=16` 会让大声处 peak 顶满(削顶),当前可听清,后续若影响 whisper 准确率再调低。
+
+**Step 5b 状态**:⏸ 降级为暂不做(见 ADR-007)。用户真实场景出门单次录音 ~1 分钟封顶 + 电池仅 250mAh,改用「砍掉 OTA 冗余、扩大数据分区」让 WAV 离线缓存到 ~2.3 分钟,既覆盖需求又避免 Opus 实时编码的 CPU/耗电与依赖风险。自定义分区表见 `firmware/voice_recorder/partitions.csv`:单 app 3.5MB + 数据区 4.52MB(≈141s WAV)。
 
 ### Step 6:Wi-Fi + 上传(端到端)
 
 **产出**:
 - Wi-Fi station mode + 自动重连
-- HTTPS client + device token 鉴权
-- 上传 + 重试逻辑
+- HTTP client + 上传 + 重试逻辑(HTTPS/token 见下,本步用明文)
 
 **验收**:真正按下 BtnA → 录 → 松开 → 自动上传 → 几秒内 memory/voice/ 出现转录。
+
+**状态**:✅ 完成并真机实测。固件:WiFi station + 自动重连、NTP(CST-8)校时、保存时写 `.meta` sidecar 存真实录音时间、`uploadAll()` 把 `/rec/*.wav` 以 multipart 上传(成功即删本地、`pendingSync` 实时反映),SAVED 后联网自动同步 / IDLE 长按 BtnB 手动同步;离线则留本地待回家补传。后端:server.py 改绑 `0.0.0.0:5577`(`VR_HOST`/`VR_PORT` 可覆盖),WAV 经 ffmpeg 按内容解码无需改动。实测设备(192.168.110.138)上传 `client_seq=3` → whisper 转出「提醒我明天早上買牛奶」、`recorded_at` 为正确 NTP 时间、写入当日 md,屏幕显示「已同步」。**简化决策**:家庭内网用明文 HTTP、无鉴权(token 发了但 server 暂忽略),设计 §7 的 HTTPS+PSK 留作后续加固。凭据在 `secrets.h`(gitignore)。
 
 ### Step 7(可选):摘要推回 StickS3 + 完整闭环
 
@@ -595,5 +619,5 @@ semantic search 直接命中相关条目。
 ---
 
 **文档版本**:v0.1  
-**当前阶段**:Step 1–3(OpenClaw skill 后端)完成并验证;Step 4(StickS3 firmware)待开始  
+**当前阶段**:Step 1–6 完成并验证(端到端真机闭环已通:按键→录音→WAV→上传→whisper 转录→memory/voice)。Step 5b(Opus)按 ADR-007 暂不做;Step 7(摘要推回设备)可选,待开始。  
 **最后更新**:2026-05-28

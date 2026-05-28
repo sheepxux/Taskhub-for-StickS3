@@ -1,0 +1,12 @@
+# StickS3 voice-recorder custom 8MB layout.
+# We flash over USB and never use OTA, so we drop the second 3.3MB app slot that
+# default_8MB reserves and hand that space to the data partition instead. This
+# grows the offline recording buffer from ~45s (1.5MB) to ~2.3min (4.3MB) of
+# 16kHz/16bit WAV — plenty for the "record while out, sync at home" use case,
+# without the CPU/power cost of on-device Opus encoding on a 250mAh battery.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+app,        app,  factory,  0x10000,  0x380000,
+spiffs,     data, spiffs,   0x390000, 0x450000,
+coredump,   data, coredump, 0x7E0000, 0x20000,

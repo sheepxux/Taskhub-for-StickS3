@@ -171,6 +171,13 @@ async def ack_notification(notification_id: str):
 
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=5577, log_level="info")
+    # Step 6: the StickS3 reaches this over the home LAN, so bind 0.0.0.0 by
+    # default. No auth/TLS yet — fine for a trusted home network. Override with
+    # VR_HOST/VR_PORT if you want to restrict it.
+    host = os.environ.get("VR_HOST", "0.0.0.0")
+    port = int(os.environ.get("VR_PORT", "5577"))
+    uvicorn.run(app, host=host, port=port, log_level="info")

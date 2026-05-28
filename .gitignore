@@ -15,6 +15,12 @@ models/
 bin/
 memory/
 
+# Firmware Wi-Fi / device credentials (never commit)
+firmware/voice_recorder/secrets.h
+
+# arduino-cli build artifacts
+firmware/voice_recorder/build/
+
 # Editor/IDE
 .vscode/
 .idea/

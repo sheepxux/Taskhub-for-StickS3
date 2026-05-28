@@ -1,19 +1,30 @@
 /*
- * StickS3 voice-recorder — Step 4 firmware skeleton.
+ * StickS3 voice-recorder — Step 4 + 5a + 6 firmware.
  *
  * State machine + 6 screens + button handling, per voice-recorder-design.md
- * §4 §5 §6. NO recording, NO Wi-Fi yet — entries/notifications are fake, so the
- * whole UI and every state transition can be exercised on-device.
+ * §4 §5 §6. Step 5a records ES8311 mic → 16 kHz mono PCM (WAV) to LittleFS.
+ * Step 6 adds Wi-Fi (station + auto-reconnect), NTP time, and HTTP multipart
+ * upload to the OpenClaw skill server. Opus (Step 5b) is deferred — WAV goes
+ * end-to-end (the backend decodes by content via ffmpeg). Notifications are
+ * still faked until Step 7.
  *
- * Acceptance (Step 4): without recording, navigate all states and the screen
- * renders correctly.
+ * Wi-Fi / server / device config lives in secrets.h (gitignored; see
+ * secrets.h.example). Step 6 uses plain HTTP on the home LAN, no TLS yet.
+ *
+ * Acceptance (Step 6): hold BtnA → record → release → auto-upload → within a
+ * few seconds memory/voice/YYYY-MM-DD.md gains the transcribed entry.
  *
  * Board: M5Stack ESP32-S3 stick (M5Unified auto-detects the panel).
  * Lib:   M5Unified (pulls in M5GFX). Chinese glyphs via fonts::efontCN_*.
  */
 #include <M5Unified.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <time.h>
 #include <math.h>
 #include <string.h>
+#include "secrets.h"
 
 // ----------------------------------------------------------------- palette
 // Multi-colour state encoding (design §5 / ADR-006).
@@ -82,6 +93,213 @@ static void enter(S s) {
 
 static uint32_t elapsed() { return millis() - stateSince; }
 
+// ----------------------------------------------------------------- recording (Step 5a)
+// ES8311 mic → 16 kHz mono 16-bit PCM, streamed to a WAV on LittleFS.
+// Double-buffered capture (M5.Mic.record is async): we queue recBuf[recQ] and,
+// once a call reports a completed buffer, flush recBuf[recW] (2 behind) to file.
+static constexpr uint32_t REC_SR    = 16000;
+static constexpr size_t   REC_CHUNK = 512;          // samples per buffer (~32 ms)
+static constexpr int      REC_NBUF  = 4;
+static constexpr int      VOL_BARS  = 17;           // matches UI bar count
+
+static int16_t   recBuf[REC_NBUF][REC_CHUNK];
+static int       recQ = 2, recW = 0;                // queue / write indices, offset 2
+static File      recFile;
+static char      recPath[32];
+static bool      recActive = false;
+static uint32_t  recSamples = 0;
+static uint32_t  recDurationMs = 0;
+static int       volBars[VOL_BARS] = {0};           // recent peak levels 0..100
+static int       volHead = 0;
+static Preferences prefs;
+static uint32_t  clientSeq = 0;
+
+// (re)write the 44-byte canonical PCM WAV header for the given data length.
+static void writeWavHeader(File& f, uint32_t dataBytes) {
+  const uint16_t ch = 1, bits = 16, pcm = 1;
+  const uint32_t sr = REC_SR;
+  const uint32_t byteRate = sr * ch * bits / 8;
+  const uint16_t blockAlign = ch * bits / 8;
+  const uint32_t fmtLen = 16, riff = 36 + dataBytes;
+  f.seek(0);
+  f.write((const uint8_t*)"RIFF", 4); f.write((const uint8_t*)&riff, 4);
+  f.write((const uint8_t*)"WAVE", 4);
+  f.write((const uint8_t*)"fmt ", 4); f.write((const uint8_t*)&fmtLen, 4);
+  f.write((const uint8_t*)&pcm, 2);   f.write((const uint8_t*)&ch, 2);
+  f.write((const uint8_t*)&sr, 4);    f.write((const uint8_t*)&byteRate, 4);
+  f.write((const uint8_t*)&blockAlign, 2); f.write((const uint8_t*)&bits, 2);
+  f.write((const uint8_t*)"data", 4); f.write((const uint8_t*)&dataBytes, 4);
+}
+
+// ISO 8601 (+08:00) from NTP-synced clock; empty until time is set.
+static bool timeSynced() { return time(nullptr) > 1700000000; }  // ~2023-11
+static String isoNow() {
+  time_t t = time(nullptr);
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  char buf[40];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S+08:00", &tmv);
+  return String(buf);
+}
+
+static void startRecording() {
+  clientSeq++;
+  prefs.putUInt("seq", clientSeq);
+  snprintf(recPath, sizeof(recPath), "/rec/%04u.wav", clientSeq);
+  recFile = LittleFS.open(recPath, FILE_WRITE);
+  recActive = (bool)recFile;
+  recSamples = 0;
+  recQ = 2; recW = 0;
+  memset(volBars, 0, sizeof(volBars)); volHead = 0;
+  if (recActive) {
+    uint8_t hdr[44] = {0};
+    recFile.write(hdr, sizeof(hdr));   // placeholder, finalized on stop
+  }
+  M5.Speaker.end();                    // mic & speaker are mutually exclusive
+  M5.Mic.begin();
+  Serial.printf("[rec] start %s micEnabled=%d fileOk=%d\n",
+                recPath, (int)M5.Mic.isEnabled(), (int)recActive);
+}
+
+static void pollRecording() {
+  if (!recActive || !M5.Mic.isEnabled()) return;
+  if (M5.Mic.record(recBuf[recQ], REC_CHUNK, REC_SR)) {
+    int16_t* done = recBuf[recW];
+    recFile.write((const uint8_t*)done, REC_CHUNK * sizeof(int16_t));
+    recSamples += REC_CHUNK;
+    int peak = 0;
+    for (size_t i = 0; i < REC_CHUNK; i++) { int a = abs(done[i]); if (a > peak) peak = a; }
+    volBars[volHead] = (peak * 100) / 32768;
+    volHead = (volHead + 1) % VOL_BARS;
+    recQ = (recQ + 1) % REC_NBUF;
+    recW = (recW + 1) % REC_NBUF;
+  }
+}
+
+// Finalize: drain queue, write real header, close. Discards file if !save.
+static void stopRecording(bool save) {
+  while (M5.Mic.isRecording()) { M5.delay(1); }
+  M5.Mic.end();
+  M5.Speaker.begin();
+  if (!recActive) { recDurationMs = 0; return; }
+  uint32_t dataBytes = recSamples * sizeof(int16_t);
+  writeWavHeader(recFile, dataBytes);
+  recFile.close();
+  recActive = false;
+  recDurationMs = (uint32_t)((uint64_t)recSamples * 1000 / REC_SR);
+  if (!save) {
+    LittleFS.remove(recPath);
+    Serial.printf("[rec] discard %s\n", recPath);
+  } else {
+    // Sidecar with capture time + duration, read back at upload so recorded_at
+    // reflects when it was spoken, not when it syncs. Lines: ISO ts, duration_ms.
+    char metaPath[40];
+    snprintf(metaPath, sizeof(metaPath), "/rec/%04u.meta", clientSeq);
+    File m = LittleFS.open(metaPath, FILE_WRITE);
+    if (m) {
+      m.println(timeSynced() ? isoNow() : String(""));
+      m.println(recDurationMs);
+      m.close();
+    }
+    Serial.printf("[rec] saved %s bytes=%u dur=%ums\n", recPath, dataBytes, recDurationMs);
+  }
+}
+
+// ----------------------------------------------------------------- networking (Step 6)
+static bool wifiUp() { return WiFi.status() == WL_CONNECTED; }
+
+static void wifiBegin() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  configTzTime("CST-8", "pool.ntp.org", "time.apple.com", "ntp.aliyun.com");  // +08:00 wall clock
+}
+
+static String baseName(String n) {
+  int s = n.lastIndexOf('/');
+  return s >= 0 ? n.substring(s + 1) : n;     // LittleFS .name() varies: full path vs basename
+}
+
+static int countPending() {
+  File dir = LittleFS.open("/rec");
+  if (!dir) return 0;
+  int n = 0;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (baseName(f.name()).endsWith(".wav")) n++;
+    f.close();
+  }
+  dir.close();
+  return n;
+}
+
+// POST one WAV as multipart/form-data; returns true on HTTP 200, then deletes it.
+static bool uploadOne(const String& wavName) {
+  String base = wavName.substring(0, wavName.lastIndexOf('.'));   // "0001"
+  String wavPath = "/rec/" + wavName, metaPath = "/rec/" + base + ".meta";
+
+  File f = LittleFS.open(wavPath, FILE_READ);
+  if (!f) return false;
+  size_t fsize = f.size();
+
+  String isoTs; uint32_t durMs = 0;
+  File m = LittleFS.open(metaPath, FILE_READ);
+  if (m) { isoTs = m.readStringUntil('\n'); isoTs.trim(); durMs = m.readStringUntil('\n').toInt(); m.close(); }
+  if (isoTs.length() == 0) isoTs = timeSynced() ? isoNow() : "1970-01-01T00:00:00+08:00";
+
+  WiFiClient client;
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) { f.close(); return false; }
+  client.setTimeout(10000);
+
+  const String B = "----sticks3boundary7e3f";
+  auto fld = [&](const char* name, const String& val) {
+    return "--" + B + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + val + "\r\n";
+  };
+  String head = fld("recorded_at", isoTs) + fld("device_id", DEVICE_ID)
+              + fld("duration_ms", String(durMs)) + fld("client_seq", String(base.toInt()))
+              + "--" + B + "\r\nContent-Disposition: form-data; name=\"audio\"; filename=\""
+              + base + ".wav\"\r\nContent-Type: audio/wav\r\n\r\n";
+  String tail = "\r\n--" + B + "--\r\n";
+  size_t contentLen = head.length() + fsize + tail.length();
+
+  client.printf("POST /api/v1/entries HTTP/1.1\r\n");
+  client.printf("Host: %s:%d\r\n", SERVER_HOST, (int)SERVER_PORT);
+  client.printf("X-Device-Token: %s\r\n", DEVICE_TOKEN);
+  client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", B.c_str());
+  client.printf("Content-Length: %u\r\n", (unsigned)contentLen);
+  client.print("Connection: close\r\n\r\n");
+  client.print(head);
+  uint8_t buf[1024];
+  while (f.available()) { size_t n = f.read(buf, sizeof(buf)); client.write(buf, n); }
+  f.close();
+  client.print(tail);
+
+  uint32_t t0 = millis();
+  while (!client.available() && millis() - t0 < 10000) delay(10);
+  String status = client.readStringUntil('\n');   // "HTTP/1.1 200 OK"
+  client.stop();
+
+  bool ok = status.indexOf(" 200") > 0;
+  Serial.printf("[net] upload %s -> %s\n", wavPath.c_str(), status.c_str());
+  if (ok) { LittleFS.remove(wavPath); LittleFS.remove(metaPath); }
+  return ok;
+}
+
+// Upload every pending WAV (cap 16/pass); returns count still pending afterward.
+static int uploadAll() {
+  if (!wifiUp()) return countPending();
+  File dir = LittleFS.open("/rec");
+  if (!dir) return 0;
+  String names[16]; int cnt = 0;
+  for (File f = dir.openNextFile(); f && cnt < 16; f = dir.openNextFile()) {
+    String n = baseName(f.name());
+    if (n.endsWith(".wav")) names[cnt++] = n;
+    f.close();
+  }
+  dir.close();
+  for (int i = 0; i < cnt; i++) uploadOne(names[i]);
+  return countPending();
+}
+
 // ----------------------------------------------------------------- draw helpers
 static void clearBg() { M5.Display.fillScreen(C_BG); }
 
@@ -136,15 +354,18 @@ static void drawRecording() {
   M5.Display.drawCircle(W / 2, 60, r, C_AMBER);
   M5.Display.drawCircle(W / 2, 60, r + 6, C_GRAY);
 
+  // timer driven by samples actually captured, not wall clock
+  uint32_t secs = recSamples / REC_SR;
   char dur[8];
-  snprintf(dur, sizeof(dur), "0:%02u", (t / 1000) % 60);
+  snprintf(dur, sizeof(dur), "%u:%02u", secs / 60, secs % 60);
   centerText(dur, 60, C_WHITE, &fonts::Font4);
 
-  // 17 volume bars (fake jitter)
-  int bars = 17, bw = 8, gap = 4, totalW = bars * bw + (bars - 1) * gap;
+  // 17 volume bars from real mic peak history (oldest → newest)
+  int bars = VOL_BARS, bw = 8, gap = 4, totalW = bars * bw + (bars - 1) * gap;
   int x0 = (W - totalW) / 2;
   for (int i = 0; i < bars; i++) {
-    int h = 4 + (esp_random() % 18);
+    int lvl = volBars[(volHead + i) % VOL_BARS];
+    int h = 4 + (lvl * 18) / 100;
     int x = x0 + i * (bw + gap);
     M5.Display.fillRect(x, 112 - h, bw, h, C_AMBER);
   }
@@ -163,7 +384,10 @@ static void drawSaved() {
   M5.Display.drawLine(cx - 3, cy + 8, cx + 11, cy - 8, C_BG);
   M5.Display.drawLine(cx - 10, cy + 2, cx - 3, cy + 9, C_BG);
   M5.Display.drawLine(cx - 3, cy + 9, cx + 11, cy - 7, C_BG);
-  centerText("已记 0:12", 96, C_WHITE, &fonts::efontCN_16);
+  char saved[16];
+  snprintf(saved, sizeof(saved), "已记 %u:%02u",
+           recDurationMs / 60000, (recDurationMs / 1000) % 60);
+  centerText(saved, 96, C_WHITE, &fonts::efontCN_16);
   if (pendingSync > 0) {
     char p[24]; snprintf(p, sizeof(p), "待同步 %d 条", pendingSync);
     centerText(p, 122, C_AMBER, &fonts::efontCN_12);
@@ -275,6 +499,15 @@ static void render() {
 }
 
 // ----------------------------------------------------------------- transitions
+// Show the syncing screen, then upload pending entries (blocking — clips are
+// small), update the pending count, and return to IDLE.
+static void runSync() {
+  enter(S::SYNCING);
+  render();
+  pendingSync = uploadAll();
+  enter(S::IDLE);
+}
+
 static void handleButtons() {
   switch (state) {
     case S::SLEEP:
@@ -285,16 +518,19 @@ static void handleButtons() {
       break;
 
     case S::IDLE:
-      if (M5.BtnA.wasPressed()) { recordStart = millis(); enter(S::RECORDING); }
-      else if (M5.BtnB.wasHold()) { enter(S::SYNCING); }
+      if (M5.BtnA.wasPressed()) { recordStart = millis(); startRecording(); enter(S::RECORDING); }
+      else if (M5.BtnB.wasHold()) { if (wifiUp()) runSync(); }
       else if (M5.BtnB.wasClicked()) { if (todayCount > 0) { reviewIdx = 0; enter(S::REVIEW); } }
       break;
 
     case S::RECORDING:
       if (M5.BtnA.wasReleased()) {
         uint32_t held = millis() - recordStart;
-        if (held >= 150) {            // saved
-          entryCount++; todayCount++; pendingSync++;
+        bool save = held >= 150;
+        stopRecording(save);
+        if (save) {                    // saved
+          entryCount++; todayCount++;
+          pendingSync = countPending();
           enter(S::SAVED);
         } else {                       // too short → discard
           enter(S::IDLE);
@@ -303,9 +539,11 @@ static void handleButtons() {
       break;
 
     case S::REVIEW:
+      // wasSingleClicked (not wasClicked) waits out the double-click window so the
+      // first tap of a double-click no longer advances the entry. (design ADR-005)
       if (M5.BtnB.wasHold()) { enter(S::IDLE); }
       else if (M5.BtnB.wasDoubleClicked()) { enter(S::DELETE_CONFIRM); }
-      else if (M5.BtnB.wasClicked()) { reviewIdx = (reviewIdx + 1) % entryCount; dirty = true; }
+      else if (M5.BtnB.wasSingleClicked()) { reviewIdx = (reviewIdx + 1) % entryCount; dirty = true; }
       break;
 
     case S::DELETE_CONFIRM:
@@ -334,11 +572,11 @@ static void handleTimeouts() {
   if (to == 0 || elapsed() < to) return;
   switch (state) {
     case S::IDLE:           M5.Display.sleep(); enter(S::SLEEP); break;
-    case S::SAVED:          enter(S::IDLE);   break;
+    // After showing the saved tick, auto-upload if Wi-Fi is up; else stay pending.
+    case S::SAVED:          if (wifiUp() && pendingSync > 0) runSync(); else enter(S::IDLE); break;
     case S::REVIEW:         enter(S::IDLE);   break;
     case S::DELETE_CONFIRM: enter(S::REVIEW); break;
     case S::NOTIFICATION:   enter(S::IDLE);   break;
-    case S::SYNCING:        pendingSync = 0; enter(S::IDLE); break;
     default: break;
   }
 }
@@ -357,12 +595,32 @@ void setup() {
   M5.BtnA.setHoldThresh(150);   // push-to-talk threshold (design §4)
   M5.BtnB.setHoldThresh(600);
   Serial.begin(115200);
-  Serial.println("[StickS3] voice-recorder Step 4 skeleton up");
+
+  if (!LittleFS.begin(true)) {  // format on first boot if unmounted
+    Serial.println("[fs] LittleFS mount FAILED");
+  } else {
+    LittleFS.mkdir("/rec");
+    Serial.printf("[fs] LittleFS ok, total=%u used=%u\n",
+                  (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
+  }
+  prefs.begin("vrec", false);
+  clientSeq = prefs.getUInt("seq", 0);
+  pendingSync = countPending();
+
+  wifiBegin();
+
+  Serial.printf("[StickS3] voice-recorder Step 6 up, seq=%u pending=%d\n", clientSeq, pendingSync);
   enter(S::IDLE);
 }
 
 void loop() {
   M5.update();
+  if (state == S::IDLE) {                        // refresh status shown on the idle screen
+    bool w = wifiUp();
+    int b = M5.Power.getBatteryLevel();
+    if (w != wifiOk || b != battPct) { wifiOk = w; battPct = b; dirty = true; }
+  }
+  if (state == S::RECORDING) pollRecording();   // drain mic before release check
   handleButtons();
   handleTimeouts();
   if (dirty || isAnimated(state)) {
