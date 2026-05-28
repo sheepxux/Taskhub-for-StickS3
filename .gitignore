@@ -9,6 +9,8 @@ venv/
 audio_uploads/
 state.db
 state.db-journal
+state.db-wal
+state.db-shm
 models/
 bin/
 memory/
@@ -17,3 +19,4 @@ memory/
 .vscode/
 .idea/
 .claude/settings.local.json
+daily.log
