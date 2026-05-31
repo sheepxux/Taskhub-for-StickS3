@@ -30,7 +30,8 @@ VOICE_DIR = Path(os.environ.get("VOICE_DIR", ROOT / "memory" / "voice"))
 
 CATEGORIES = ["产品点子", "阅读笔记", "待办", "其他"]
 
-_ENTRY_RE = re.compile(r"^##\s+(\d{1,2}:\d{2})\s+·\s+(.*)$")
+# Heading like "## 14:32 · 标题 #待办"; the trailing #tag is optional and stripped.
+_ENTRY_RE = re.compile(r"^##\s+(\d{1,2}:\d{2})\s+·\s+(.*?)(?:\s+#\S+)?$")
 
 
 @dataclass
@@ -73,12 +74,17 @@ _KEYWORDS = {
 }
 
 
-def _classify_heuristic(e: Entry) -> str:
-    text = f"{e.title} {e.body}"
+def classify_text(text: str) -> str:
+    """Keyword-heuristic tag for a single note. Shared with transcribe.py so the
+    per-note "sticky" tag and the 22:00 summary use the same category logic."""
     for cat in ("待办", "产品点子", "阅读笔记"):
         if any(kw in text for kw in _KEYWORDS[cat]):
             return cat
     return "其他"
+
+
+def _classify_heuristic(e: Entry) -> str:
+    return classify_text(f"{e.title} {e.body}")
 
 
 def summarize_heuristic(entries: list[Entry], date: str) -> str:

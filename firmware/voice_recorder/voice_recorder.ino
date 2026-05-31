@@ -23,6 +23,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
@@ -66,7 +68,7 @@ static uint32_t timeoutMs(S s) {
 // ----------------------------------------------------------------- entries (from server)
 // REVIEW shows today's real entries pulled from GET /api/v1/entries/today;
 // titles/previews are whisper/LLM output that lives on the server, not here.
-struct Entry { String time, title, preview, id; };
+struct Entry { String time, title, preview, id, tag; };
 static constexpr int MAX_ENTRIES = 24;
 static Entry entries[MAX_ENTRIES];
 static int  entryCount = 0;
@@ -86,6 +88,12 @@ static bool     dirty = true;     // needs full redraw
 static uint32_t recordStart = 0;  // RECORDING press time
 static int      reviewIdx = 0;    // REVIEW cursor
 static uint32_t reviewFetchAt = 0; // last fetchToday() while in REVIEW (auto-refresh throttle)
+// Sticky-note "card on a board": a smaller card centred on a black board, with
+// dot indicators below. Two card-sized sprites animate old-out / new-in.
+static constexpr int CARD_W = 196, CARD_H = 92, CARD_X = 22, CARD_Y = 14;
+static M5Canvas cardA(&M5.Display);   // outgoing card
+static M5Canvas cardB(&M5.Display);   // incoming card
+static bool     cardReady = false;
 
 static void enter(S s) {
   state = s;
@@ -323,6 +331,7 @@ static void fetchToday() {
         e.id      = o["id"].as<String>();
         e.title   = o["title"].as<String>();
         e.preview = o["preview"].as<String>();
+        e.tag     = o["tag"].as<String>();
         String ts = o["recorded_at"].as<String>();   // 2026-05-28T23:04:51+08:00 → 23:04
         int t = ts.indexOf('T');
         e.time = (t >= 0 && (int)ts.length() >= t + 6) ? ts.substring(t + 1, t + 6) : ts;
@@ -354,6 +363,14 @@ static void centerText(const char* s, int y, int color, const lgfx::IFont* font)
   M5.Display.setTextColor(color, C_BG);
   M5.Display.setTextDatum(middle_center);
   M5.Display.drawString(s, M5.Display.width() / 2, y);
+}
+
+// Sticky-note category → colour (matches the multi-colour state encoding §5).
+static int tagColor(const String& tag) {
+  if (tag == "待办")   return C_AMBER;
+  if (tag == "产品点子") return C_BLUE;
+  if (tag == "阅读笔记") return C_GREEN;
+  return C_GRAY;  // 其他
 }
 
 // ----------------------------------------------------------------- screens
@@ -440,40 +457,80 @@ static void drawSaved() {
   }
 }
 
-static void drawReview() {
-  clearBg();
+// Render entry[idx] as a colour-coded sticky note into the given card sprite.
+static void renderCard(M5Canvas& spr, int idx) {
+  Entry& e = entries[idx];
+  int col = tagColor(e.tag);
+  spr.fillScreen(C_BG);                          // black corners blend into the board
+  spr.fillRoundRect(0, 0, CARD_W, CARD_H, 10, col);
+  spr.setTextColor(C_BG, col);                   // dark ink on the colour
+
+  spr.setFont(&fonts::efontCN_12);
+  spr.setTextDatum(top_left);
+  spr.drawString(e.tag, 10, 8);
+  spr.setTextDatum(top_right);
+  spr.drawString(e.time, CARD_W - 10, 8);
+  spr.drawFastHLine(10, 26, CARD_W - 20, C_BG);
+
+  spr.setFont(&fonts::efontCN_16);
+  spr.setTextDatum(top_left);
+  spr.drawString(e.title, 10, 32);
+
+  spr.setFont(&fonts::efontCN_12);
+  spr.setTextWrap(true);
+  spr.setCursor(10, 56);
+  spr.print(e.preview);
+  spr.setTextWrap(false);
+}
+
+// Black board + position dots (current filled). Many entries → "i / n" text.
+static void drawBoard(int idx) {
   const int W = M5.Display.width();
-  if (entryCount == 0) {
+  M5.Display.fillScreen(C_BG);
+  int dy = CARD_Y + CARD_H + 12;
+  if (entryCount <= 8) {
+    int gap = 14, totalW = (entryCount - 1) * gap;
+    int x0 = (W - totalW) / 2;
+    for (int i = 0; i < entryCount; i++)
+      M5.Display.fillCircle(x0 + i * gap, dy, i == idx ? 4 : 2, i == idx ? C_WHITE : C_GRAY);
+  } else {
+    char s[16]; snprintf(s, sizeof(s), "%d / %d", idx + 1, entryCount);
+    centerText(s, dy, C_GRAY, &fonts::efontCN_12);
+  }
+}
+
+static void drawReview() {
+  if (entryCount == 0 || !cardReady) {
+    clearBg();
     centerText("今天还没有记录", M5.Display.height() / 2, C_GRAY, &fonts::efontCN_16);
-    centerText("BtnB 长按退出", 128, C_GRAY, &fonts::efontCN_12);
+    centerText("双击返回", 128, C_GRAY, &fonts::efontCN_12);
     return;
   }
   if (reviewIdx >= entryCount) reviewIdx = entryCount - 1;
-  Entry& e = entries[reviewIdx];
-  // top: index + time
-  char idx[16]; snprintf(idx, sizeof(idx), "%d / %d", reviewIdx + 1, entryCount);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextColor(C_GRAY, C_BG);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.drawString(idx, 6, 6);
-  M5.Display.setTextDatum(top_right);
-  M5.Display.drawString("今天 " + e.time, W - 6, 6);
+  drawBoard(reviewIdx);
+  renderCard(cardA, reviewIdx);
+  cardA.pushSprite(CARD_X, CARD_Y);
+}
 
-  // title
-  M5.Display.setFont(&fonts::efontCN_24);
-  M5.Display.setTextColor(C_WHITE, C_BG);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.drawString(e.title, 8, 26);
-
-  // preview (wrap)
-  M5.Display.setFont(&fonts::efontCN_14);
-  M5.Display.setTextColor(C_GRAY, C_BG);
-  M5.Display.setTextWrap(true);
-  M5.Display.setCursor(8, 58);
-  M5.Display.print(e.preview);
-  M5.Display.setTextWrap(false);
-
-  centerText("BtnB 上一条 · 长按退出", 128, C_GRAY, &fonts::efontCN_12);
+// Slide from current to newIdx: dir>0 old exits left / new enters right (and vice versa).
+static void slideTo(int newIdx, int dir) {
+  stateSince = millis();                  // keep REVIEW awake while browsing
+  if (!cardReady || entryCount == 0) { reviewIdx = newIdx; drawReview(); return; }
+  const int W = M5.Display.width();
+  renderCard(cardA, reviewIdx);           // outgoing
+  renderCard(cardB, newIdx);              // incoming
+  const int steps = 8;
+  for (int i = 1; i <= steps; i++) {
+    float p = (float)i / steps;
+    int oldX = CARD_X - (int)(dir * W * p);
+    int newX = CARD_X + (int)(dir * W * (1.0f - p));
+    M5.Display.fillRect(0, CARD_Y, W, CARD_H, C_BG);   // clear only the card band
+    cardA.pushSprite(oldX, CARD_Y);
+    cardB.pushSprite(newX, CARD_Y);
+    M5.delay(14);
+  }
+  reviewIdx = newIdx;
+  drawReview();                           // settle: board + dots + final card
 }
 
 static void drawDeleteConfirm() {
@@ -560,6 +617,26 @@ static void runSync() {
   enter(S::IDLE);
 }
 
+// StickS3 buttons (active-low). Both are RTC-capable GPIOs on the ESP32-S3, so
+// either can wake the chip from deep sleep via ext1.
+static constexpr gpio_num_t PIN_BTN_A = GPIO_NUM_11;
+static constexpr gpio_num_t PIN_BTN_B = GPIO_NUM_12;
+
+// Real deep sleep (design §6): ~50µA vs always-on. Wakes on BtnA/BtnB press, or
+// an hourly timer (NTP + notification pull). Wake = full reboot → setup() runs,
+// so there is no "SLEEP" runtime state to return to. RESET always recovers.
+static void enterDeepSleep() {
+  Serial.println("[pwr] deep sleep");
+  Serial.flush();
+  M5.Display.sleep();                       // panel + backlight off
+  const uint64_t mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
+  esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+  rtc_gpio_pullup_en(PIN_BTN_A);  rtc_gpio_pulldown_dis(PIN_BTN_A);  // idle HIGH, wake on LOW
+  rtc_gpio_pullup_en(PIN_BTN_B);  rtc_gpio_pulldown_dis(PIN_BTN_B);
+  esp_sleep_enable_timer_wakeup(3600ULL * 1000000ULL);  // hourly safety + pull
+  esp_deep_sleep_start();                    // never returns
+}
+
 static void handleButtons() {
   switch (state) {
     case S::SLEEP:
@@ -591,15 +668,16 @@ static void handleButtons() {
       break;
 
     case S::REVIEW:
-      // wasSingleClicked (not wasClicked) waits out the double-click window so the
-      // first tap of a double-click no longer advances the entry. (design ADR-005)
-      if (M5.BtnB.wasHold()) { enter(S::IDLE); }
-      else if (M5.BtnB.wasDoubleClicked()) { enter(S::DELETE_CONFIRM); }
-      else if (M5.BtnB.wasSingleClicked()) { reviewIdx = (reviewIdx + 1) % entryCount; dirty = true; }
+      // BtnA is ALWAYS record — pressing it here jumps straight into recording.
+      // BtnB: single = next (slide), double = return, hold = delete.
+      if (M5.BtnA.wasPressed()) { recordStart = millis(); startRecording(); enter(S::RECORDING); }
+      else if (M5.BtnB.wasHold()) { enter(S::DELETE_CONFIRM); }
+      else if (M5.BtnB.wasDoubleClicked()) { enter(S::IDLE); }
+      else if (M5.BtnB.wasSingleClicked()) { slideTo((reviewIdx + 1) % entryCount, +1); }
       break;
 
     case S::DELETE_CONFIRM:
-      if (M5.BtnB.wasDoubleClicked()) {           // confirm delete
+      if (M5.BtnB.wasClicked()) {                  // a tap confirms; 2s timeout cancels
         if (reviewIdx < entryCount) deleteEntry(entries[reviewIdx].id);
         fetchToday();                              // re-pull authoritative list
         if (reviewIdx >= entryCount) reviewIdx = entryCount > 0 ? entryCount - 1 : 0;
@@ -621,7 +699,7 @@ static void handleTimeouts() {
   uint32_t to = timeoutMs(state);
   if (to == 0 || elapsed() < to) return;
   switch (state) {
-    case S::IDLE:           M5.Display.sleep(); enter(S::SLEEP); break;
+    case S::IDLE:           enterDeepSleep(); break;   // real deep sleep; wakes via reboot
     // After showing the saved tick, auto-upload if Wi-Fi is up; else stay pending.
     case S::SAVED:          if (wifiUp() && pendingSync > 0) runSync(); else enter(S::IDLE); break;
     case S::REVIEW:         enter(S::IDLE);   break;
@@ -643,7 +721,13 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setBrightness(160);
   M5.BtnA.setHoldThresh(150);   // push-to-talk threshold (design §4)
-  M5.BtnB.setHoldThresh(600);
+  // BtnB hold-threshold doubles as the multi-click decision window (M5Unified):
+  // 450ms gives a snappy hold-to-delete and a comfortable double-click-to-return.
+  M5.BtnB.setHoldThresh(450);
+
+  cardA.setPsram(true); cardA.setColorDepth(16);
+  cardB.setPsram(true); cardB.setColorDepth(16);
+  cardReady = cardA.createSprite(CARD_W, CARD_H) && cardB.createSprite(CARD_W, CARD_H);
   Serial.begin(115200);
 
   if (!LittleFS.begin(true)) {  // format on first boot if unmounted
@@ -659,6 +743,11 @@ void setup() {
 
   wifiBegin();
 
+  switch (esp_sleep_get_wakeup_cause()) {     // why did we (re)boot?
+    case ESP_SLEEP_WAKEUP_EXT1:  Serial.println("[pwr] woke: button"); break;
+    case ESP_SLEEP_WAKEUP_TIMER: Serial.println("[pwr] woke: hourly timer"); break;
+    default:                     Serial.println("[pwr] cold boot"); break;
+  }
   Serial.printf("[StickS3] voice-recorder Step 6 up, seq=%u pending=%d\n", clientSeq, pendingSync);
   enter(S::IDLE);
 }

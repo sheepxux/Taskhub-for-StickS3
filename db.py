@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS entries (
     audio_path  TEXT,
     title       TEXT    NOT NULL DEFAULT '(转录中)',
     preview     TEXT    NOT NULL DEFAULT '',
+    tag         TEXT    NOT NULL DEFAULT '其他',  -- sticky-note category
     transcript  TEXT,
     status      TEXT    NOT NULL DEFAULT 'queued',  -- queued|transcribing|done|error
     error       TEXT,
@@ -52,3 +53,7 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        # Migrate older DBs that predate the tag column.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(entries)")}
+        if "tag" not in cols:
+            conn.execute("ALTER TABLE entries ADD COLUMN tag TEXT NOT NULL DEFAULT '其他'")

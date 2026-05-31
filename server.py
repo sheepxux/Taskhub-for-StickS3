@@ -114,7 +114,7 @@ async def list_today():
     items = []
     with db.connect() as conn:
         rows = conn.execute(
-            "SELECT id, recorded_at, duration_ms, title, preview FROM entries"
+            "SELECT id, recorded_at, duration_ms, title, preview, tag FROM entries"
         ).fetchall()
     for r in rows:
         when = datetime.fromisoformat(r["recorded_at"]).astimezone(CST).date()
@@ -127,6 +127,7 @@ async def list_today():
                 "duration_ms": r["duration_ms"],
                 "title": r["title"],
                 "preview": r["preview"],
+                "tag": r["tag"],
             }
         )
     items.sort(key=lambda x: x["recorded_at"])

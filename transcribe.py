@@ -34,6 +34,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import db
+from summarize import classify_text
 
 CST = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parent
@@ -161,10 +162,12 @@ def _preview(text: str, limit: int = 40) -> str:
     return flat[:limit] + ("..." if len(flat) > limit else "")
 
 
-def _append_markdown(when: datetime, title: str, text: str) -> None:
+def _append_markdown(when: datetime, title: str, text: str, tag: str) -> None:
     VOICE_DIR.mkdir(parents=True, exist_ok=True)
     day_file = VOICE_DIR / f"{when.astimezone(CST):%Y-%m-%d}.md"
-    block = f"## {when.astimezone(CST):%H:%M} · {title}\n\n{text}\n\n"
+    # Trailing #tag keeps the heading parseable AND makes the category greppable
+    # / searchable inside OpenClaw memory.
+    block = f"## {when.astimezone(CST):%H:%M} · {title} #{tag}\n\n{text}\n\n"
     with day_file.open("a", encoding="utf-8") as f:
         f.write(block)
 
@@ -184,11 +187,11 @@ def _claim_one() -> dict | None:
         return dict(row)
 
 
-def _finish(entry_id: str, title: str, preview: str, transcript: str) -> None:
+def _finish(entry_id: str, title: str, preview: str, transcript: str, tag: str) -> None:
     with db.connect() as conn:
         conn.execute(
-            "UPDATE entries SET status='done', title=?, preview=?, transcript=? WHERE id=?",
-            (title, preview, transcript, entry_id),
+            "UPDATE entries SET status='done', title=?, preview=?, transcript=?, tag=? WHERE id=?",
+            (title, preview, transcript, tag, entry_id),
         )
 
 
@@ -212,10 +215,11 @@ def _process(entry: dict) -> None:
             _decode_to_wav(audio_path, wav)
             text = _whisper(wav)
         title = _make_title(text)
-        _append_markdown(when, title, text)
-        _finish(entry_id, title, _preview(text), text)
+        tag = classify_text(text)
+        _append_markdown(when, title, text, tag)
+        _finish(entry_id, title, _preview(text), text, tag)
         audio_path.unlink(missing_ok=True)
-        print(f"[done] {entry_id}  «{title}»  ({len(text)} chars)")
+        print(f"[done] {entry_id}  «{title}» #{tag}  ({len(text)} chars)")
         reindex_memory()  # make it searchable in OpenClaw right away
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode("utf-8", "replace") if e.stderr else str(e)
