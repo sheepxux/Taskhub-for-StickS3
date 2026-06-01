@@ -4,8 +4,12 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+node_modules/
 
-# Step 2+ runtime artifacts
+# Runtime artifacts
+.run/
+*.log
+*.pid
 audio_uploads/
 state.db
 state.db-journal
@@ -16,14 +20,17 @@ bin/
 memory/
 
 # Firmware Wi-Fi / device credentials (never commit)
+firmware/task_monitor/secrets.h
 firmware/voice_recorder/secrets.h
 
 # arduino-cli build artifacts
+firmware/task_monitor/build/
 firmware/voice_recorder/build/
 
 # Editor/IDE
 .vscode/
 .idea/
+.claude/
 .claude/settings.local.json
 daily.log
 whisper-server.log

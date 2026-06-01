@@ -1,0 +1,9 @@
+# StickS3 task monitor custom 8MB layout.
+# We do not use OTA here. The enlarged data partition leaves room for cached
+# responses/logs later while keeping the app slot generous.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+app,        app,  factory,  0x10000,  0x380000,
+spiffs,     data, spiffs,   0x390000, 0x450000,
+coredump,   data, coredump, 0x7E0000, 0x20000,
