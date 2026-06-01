@@ -1,22 +1,113 @@
 # TaskHub for StickS3
 
-A tiny M5StickS3 dashboard for monitoring local AI agent tasks from your Mac.
+Tiny hardware status dashboard for local AI agents on your Mac.
 
-TaskHub for StickS3 runs a local Mac hub that reads task metadata from AI tools
-you already use, then sends a compact task list to an M5StickS3 over Wi-Fi. The
-device can show running/recent/done states, token or turn usage when available,
-and open the source app on the Mac with BtnA.
+[![Release](https://img.shields.io/badge/release-v1.0.0-111827)](CHANGELOG.md)
+[![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
+[![Platform](https://img.shields.io/badge/platform-macOS-0f766e)](host)
+[![License](https://img.shields.io/badge/license-MIT-374151)](LICENSE)
+
+TaskHub for StickS3 turns an M5StickS3 into a pocket-sized dashboard for the AI
+work happening on your Mac. A local Mac hub collects task metadata from tools
+such as Codex, Claude Code, OpenClaw, Manus, and Perplexity, then serves a
+compact task list to the StickS3 over your LAN.
+
+The device shows what is running, what recently finished, token or turn usage
+when available, and can open the source app on your Mac with one button.
+
+## What It Does
+
+| Capability | Status |
+| --- | --- |
+| Local Mac hub with LaunchAgent installer | Ready |
+| Wi-Fi discovery from StickS3 to Mac | Ready |
+| Codex task, folder, turn, and token tracking | Ready |
+| Claude Code turn-state and token tracking | Ready |
+| OpenClaw local session/task tracking | Ready |
+| Manus local session metadata and usage counters | Ready |
+| Perplexity local activity indicator | Ready |
+| BtnA open source app on Mac | Ready |
+| BtnB task navigation and hold-to-refresh | Ready |
+| Deep sleep and periodic wake refresh | Ready |
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph "Mac"
+    Hub["Task Hub\nLaunchAgent + HTTP API"]
+    Codex["Codex\nsessions + usage"]
+    Claude["Claude Code\ntranscripts + resume process"]
+    OpenClaw["OpenClaw\nlocal tasks + sessions"]
+    Manus["Manus\nlocal app storage"]
+    Perplexity["Perplexity\nlocal app activity"]
+  end
+
+  subgraph "M5StickS3"
+    Firmware["Task monitor firmware"]
+    Screen["Compact status screen"]
+    Buttons["BtnA / BtnB"]
+    Sleep["Deep sleep timer"]
+  end
+
+  Codex --> Hub
+  Claude --> Hub
+  OpenClaw --> Hub
+  Manus --> Hub
+  Perplexity --> Hub
+  Hub -- "UDP discovery" --> Firmware
+  Firmware -- "GET /tasks?format=stick" --> Hub
+  Firmware -- "POST /tasks/:id/open" --> Hub
+  Firmware --> Screen
+  Buttons --> Firmware
+  Firmware --> Sleep
+```
+
+## Status Model
+
+The Mac hub keeps the full task list. The StickS3 applies a display-only filter
+so old tasks disappear from the tiny screen without deleting anything on your
+Mac.
+
+```mermaid
+stateDiagram-v2
+  [*] --> RUN: "active turn / running process"
+  [*] --> WAIT: "needs input or queued"
+  RUN --> REC: "turn finished recently"
+  WAIT --> RUN: "work resumes"
+  RUN --> FAIL: "error or aborted"
+  REC --> DONE: "terminal state reported"
+  DONE --> Hidden: "older than 10 minutes"
+  IDLE --> Hidden: "older than 10 minutes"
+  REC --> Hidden: "older than 1 hour"
+  FAIL --> [*]: "kept visible until resolved"
+  WAIT --> [*]: "kept visible"
+  RUN --> [*]: "kept visible"
+```
+
+Compact status labels:
+
+| Label | Meaning | StickS3 behavior |
+| --- | --- | --- |
+| `RUN` | Active task or active agent turn | Always visible |
+| `WAIT` | Waiting for input or queued | Always visible |
+| `FAIL` | Failed or needs attention | Always visible |
+| `REC` | Recently active | Hidden after 1 hour |
+| `DONE` | Completed | Hidden after 10 minutes |
+| `IDLE` | App/source idle | Hidden after 10 minutes |
 
 ## Supported Sources
 
-- Codex
-- Claude / Claude Code
-- OpenClaw
-- Manus
-- Perplexity
+| Source | Local signal used |
+| --- | --- |
+| Codex | Session index, session JSONL logs, token usage, active turn markers |
+| Claude Code | Local session metadata, transcript stop reasons, `claude --resume` process |
+| OpenClaw | Local task registry and session stores |
+| Manus | Local app storage, session timestamps, status codes, usage counters |
+| Perplexity | Local preference/cache activity signals |
 
-Support is intentionally local-first. The Mac hub reads local metadata, logs, or
-app storage where available. It does not send your task data to a cloud service.
+Perplexity does not expose a stable local task transcript, so TaskHub reports
+local activity rather than exact task titles.
 
 ## Hardware
 
@@ -26,7 +117,7 @@ app storage where available. It does not send your task data to a cloud service.
 
 ## Quick Start
 
-Install or repair the Mac hub:
+Clone this repository, then install or repair the Mac hub:
 
 ```bash
 ./host/install_task_hub.sh
@@ -62,37 +153,21 @@ every `AUTO_WAKE_SECONDS`.
 
 ## Controls
 
-- BtnA: open the selected task's source app on the Mac
-- BtnB: select the next task
-- BtnB hold: refresh now
-
-## Display Behavior
-
-- `RUN`, `WAIT`, and `FAIL` tasks stay visible.
-- Old `DONE` and `IDLE` tasks are hidden on the StickS3 after 10 minutes.
-- Old `REC` tasks are hidden after 1 hour.
-- This only affects the StickS3 display. The Mac hub and source apps are not
-  modified.
+| Control | Action |
+| --- | --- |
+| BtnA | Open the selected task's source app on the Mac |
+| BtnB | Select the next task |
+| BtnB hold | Refresh immediately |
 
 ## Privacy
 
-TaskHub is designed to run on your LAN.
+TaskHub is local-first by design.
 
-- The StickS3 talks only to your Mac hub.
-- The hub keeps task collection local.
+- The StickS3 talks only to your Mac hub on your LAN.
+- The hub does not upload task data to a cloud service.
 - Firmware secrets are stored in `secrets.h`, which is gitignored.
 - Auth tokens and message bodies are not returned by the StickS3 API.
-- Some adapters inspect local app metadata or storage, depending on what each
-  AI app exposes locally.
-
-## Repository Layout
-
-```text
-firmware/task_monitor/   StickS3 firmware
-host/task_hub.py         Local Mac hub
-host/install_task_hub.sh LaunchAgent installer/repair script
-host/README.md           Hub development and diagnostic notes
-```
+- Adapters read only the local metadata needed to derive task state.
 
 ## Requirements
 
@@ -103,8 +178,17 @@ host/README.md           Hub development and diagnostic notes
 - M5Unified and ArduinoJson libraries
 - Node.js is optional but recommended for Manus local LevelDB parsing
 
+## Repository Layout
+
+```text
+firmware/task_monitor/   StickS3 firmware
+host/task_hub.py         Local Mac hub
+host/install_task_hub.sh LaunchAgent installer/repair script
+host/README.md           Hub development and diagnostic notes
+```
+
 ## Release
 
-Current release target: `v1.0.0`.
+Current release: `v1.0.0`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
