@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.1
+
+Documentation polish release.
+
+### Changed
+
+- Refined the GitHub README into a project landing page.
+- Added architecture and status-flow diagrams to explain the TaskHub pipeline.
+- Expanded setup, controls, supported sources, privacy, and release notes.
+
 ## v1.0.0
 
 Initial public release of TaskHub for StickS3.

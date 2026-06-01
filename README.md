@@ -2,7 +2,7 @@
 
 Tiny hardware status dashboard for local AI agents on your Mac.
 
-[![Release](https://img.shields.io/badge/release-v1.0.0-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.1-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Platform](https://img.shields.io/badge/platform-macOS-0f766e)](host)
 [![License](https://img.shields.io/badge/license-MIT-374151)](LICENSE)
@@ -189,6 +189,6 @@ host/README.md           Hub development and diagnostic notes
 
 ## Release
 
-Current release: `v1.0.0`.
+Current release: `v1.0.1`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
