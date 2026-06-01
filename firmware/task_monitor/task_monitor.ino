@@ -18,7 +18,10 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>           // for esp_wifi_set_ps (deeper modem sleep than WiFi.setSleep default)
+#include <esp32-hal-cpu.h>
 #include <driver/rtc_io.h>
+#include <string.h>             // memcpy for BSSID cache
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -30,7 +33,7 @@
 #define TASK_HUB_PORT   5577
 #define DEVICE_ID       "sticks3-task-01"
 #define DEVICE_TOKEN    "dev-token"
-#define AUTO_WAKE_SECONDS 300
+#define AUTO_WAKE_SECONDS 600
 #endif
 
 #if !defined(TASK_HUB_HOST) && defined(SERVER_HOST)
@@ -42,7 +45,7 @@
 #endif
 
 #if !defined(AUTO_WAKE_SECONDS)
-#define AUTO_WAKE_SECONDS 300
+#define AUTO_WAKE_SECONDS 600
 #endif
 
 #if !defined(DEVICE_ID)
@@ -67,19 +70,56 @@ static constexpr int C_RED = TFT_RED;
 static constexpr int C_BLUE = 0x5BDF;
 
 static constexpr int MAX_TASKS = 10;
-static constexpr uint32_t WIFI_TIMEOUT_MS = 8500;
-static constexpr uint32_t HTTP_TIMEOUT_MS = 12000;
-static constexpr uint32_t DISCOVERY_TIMEOUT_MS = 1200;
+// Tightened: with a cached BSSID hint, a healthy join lands in <1s and the hub
+// answers in <500ms on LAN. A wake that doesn't make it in these windows is
+// almost certainly an outage — bail fast so the radio doesn't drain the cell.
+static constexpr uint32_t WIFI_TIMEOUT_MS = 5000;
+static constexpr uint32_t HTTP_TIMEOUT_MS = 3000;
+static constexpr uint32_t DISCOVERY_TIMEOUT_MS = 900;
 static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
-static constexpr uint32_t ACTIVE_TIMEOUT_MS = 20000;
-static constexpr uint32_t QUIET_TIMER_TIMEOUT_MS = 6000;
+
+#if !defined(INTERACTIVE_TIMEOUT_MS)
+#define INTERACTIVE_TIMEOUT_MS 10000
+#endif
+
+#if !defined(QUIET_TIMER_TIMEOUT_MS)
+#define QUIET_TIMER_TIMEOUT_MS 3000
+#endif
+
+#if !defined(ACTIVE_WAKE_SECONDS)
+#define ACTIVE_WAKE_SECONDS 180
+#endif
+
+#if !defined(LOW_BATTERY_WAKE_SECONDS)
+#define LOW_BATTERY_WAKE_SECONDS 900
+#endif
+
+#if !defined(LOW_BATTERY_THRESHOLD_PCT)
+#define LOW_BATTERY_THRESHOLD_PCT 30
+#endif
+
+#if !defined(DISPLAY_BRIGHTNESS)
+#define DISPLAY_BRIGHTNESS 32
+#endif
+
+#if !defined(LOW_BATTERY_BRIGHTNESS)
+#define LOW_BATTERY_BRIGHTNESS 16
+#endif
+
+#if !defined(POWER_SAVE_CPU_MHZ)
+#define POWER_SAVE_CPU_MHZ 80
+#endif
+
+#if !defined(CHARGE_CURRENT_MA)
+#define CHARGE_CURRENT_MA 200
+#endif
 
 #if !defined(AWAKE_REFRESH_IDLE_MS)
-#define AWAKE_REFRESH_IDLE_MS 5000
+#define AWAKE_REFRESH_IDLE_MS 30000
 #endif
 
 #if !defined(AWAKE_REFRESH_ACTIVE_MS)
-#define AWAKE_REFRESH_ACTIVE_MS 1500
+#define AWAKE_REFRESH_ACTIVE_MS 5000
 #endif
 
 #if !defined(MANUAL_SELECTION_HOLD_MS)
@@ -117,6 +157,15 @@ static constexpr uint32_t QUIET_TIMER_TIMEOUT_MS = 6000;
 static constexpr gpio_num_t PIN_BTN_A = GPIO_NUM_11;
 static constexpr gpio_num_t PIN_BTN_B = GPIO_NUM_12;
 
+// Persisted across deep sleep in RTC slow memory (~8KB available, free).
+// After a successful join we stash the AP's BSSID + channel; on the next wake
+// WiFi.begin() can target the radio directly instead of doing a full
+// passive scan. Drops connect time from ~1.5-3s to ~0.5s, which is the
+// single biggest awake-time win on a battery-bound device.
+RTC_DATA_ATTR static uint8_t  rtcCachedBssid[6] = {0};
+RTC_DATA_ATTR static int32_t  rtcCachedChannel = 0;
+RTC_DATA_ATTR static bool     rtcHasCachedBssid = false;
+
 struct AiTask {
   String id;
   String source;
@@ -142,7 +191,7 @@ static uint32_t lastInputAt = 0;
 static uint32_t lastManualSelectAt = 0;
 static uint32_t lastRefreshAt = 0;
 static uint32_t lastDiscoveryAt = 0;
-static uint32_t activeTimeoutMs = ACTIVE_TIMEOUT_MS;
+static uint32_t activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
 static String hubHost;
 static int hubPort = TASK_HUB_PORT;
 static bool hubDiscovered = false;
@@ -154,6 +203,41 @@ static bool btnBClickEvent = false;
 static bool btnBHoldEvent = false;
 static uint32_t btnBLastChangeAt = 0;
 static uint32_t btnBPressedAt = 0;
+
+static bool lowBatteryMode() {
+  return battPct >= 0 && battPct <= LOW_BATTERY_THRESHOLD_PCT;
+}
+
+static uint8_t clampBrightness(int value) {
+  if (value < 0) return 0;
+  if (value > 255) return 255;
+  return (uint8_t)value;
+}
+
+static uint8_t displayBrightness() {
+  return lowBatteryMode() ? clampBrightness(LOW_BATTERY_BRIGHTNESS) : clampBrightness(DISPLAY_BRIGHTNESS);
+}
+
+static void applyDisplayBrightness() {
+  M5.Display.setBrightness(displayBrightness());
+}
+
+static void applyPowerProfile() {
+#if POWER_SAVE_CPU_MHZ > 0
+  setCpuFrequencyMhz(POWER_SAVE_CPU_MHZ);
+#endif
+#if CHARGE_CURRENT_MA > 0
+  M5.Power.setBatteryCharge(true);
+  M5.Power.setChargeCurrent(CHARGE_CURRENT_MA);
+#endif
+  applyDisplayBrightness();
+}
+
+static uint32_t nextWakeSeconds() {
+  if (lowBatteryMode()) return LOW_BATTERY_WAKE_SECONDS;
+  if (activeCount > 0 || attentionCount > 0) return ACTIVE_WAKE_SECONDS;
+  return AUTO_WAKE_SECONDS;
+}
 
 static String apiBase() {
   String host = hubHost.length() ? hubHost : String(TASK_HUB_HOST);
@@ -182,6 +266,9 @@ static String urlEncode(const String& s) {
   return out;
 }
 
+// Connect with the cached BSSID/channel hint if we have one; on failure fall
+// back to a full scan. Picks the deepest modem-sleep level once associated so
+// the brief idle awake window also draws less current.
 static bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
@@ -189,15 +276,45 @@ static bool ensureWifi() {
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
   WiFi.setSleep(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
-    M5.update();
-    delay(80);
+  auto waitForJoin = [](uint32_t budgetMs) {
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < budgetMs) {
+      M5.update();
+      delay(50);
+    }
+  };
+
+  if (rtcHasCachedBssid && rtcCachedChannel > 0) {
+    // Fast path: aim at the known AP. Most wakes land here, in well under 1s.
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, rtcCachedChannel, rtcCachedBssid);
+    waitForJoin(2500);                      // generous enough for a slow router
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect(false, false);        // hint stale — fall through to scan
+      rtcHasCachedBssid = false;
+    }
   }
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    waitForJoin(WIFI_TIMEOUT_MS);
+  }
+
   wifiOk = WiFi.status() == WL_CONNECTED;
+  if (wifiOk) {
+    // Cache for next wake.
+    const uint8_t* bssid = WiFi.BSSID();
+    if (bssid) {
+      memcpy(rtcCachedBssid, bssid, 6);
+      rtcCachedChannel = WiFi.channel();
+      rtcHasCachedBssid = true;
+    }
+    // Deepest modem sleep level the driver allows. The default sleep(true)
+    // is MIN_MODEM; MAX_MODEM aligns DTIM more aggressively and trims a few
+    // mA off the awake-idle window.
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+  }
   return wifiOk;
 }
 
@@ -267,6 +384,7 @@ static bool discoverHub(bool force) {
 static void updateBattery() {
   int b = M5.Power.getBatteryLevel();
   if (b >= 0 && b <= 100) battPct = b;
+  applyDisplayBrightness();
 }
 
 static int statusColor(const String& status) {
@@ -653,11 +771,13 @@ static bool openSelectedTask() {
 
 static void enterDeepSleep() {
 #if ENABLE_DEEP_SLEEP
+  uint32_t wakeSeconds = nextWakeSeconds();
   M5.Display.fillScreen(C_BG);
-  centerText("sleep", M5.Display.height() / 2, C_GRAY, &fonts::Font0);
+  centerText(String("sleep ") + String(wakeSeconds / 60) + "m", M5.Display.height() / 2, C_GRAY, &fonts::Font0);
   delay(120);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  M5.Display.setBrightness(0);
   M5.Display.sleep();
 
   const uint64_t mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
@@ -666,7 +786,7 @@ static void enterDeepSleep() {
   rtc_gpio_pulldown_dis(PIN_BTN_A);
   rtc_gpio_pullup_en(PIN_BTN_B);
   rtc_gpio_pulldown_dis(PIN_BTN_B);
-  esp_sleep_enable_timer_wakeup((uint64_t)AUTO_WAKE_SECONDS * 1000000ULL);
+  esp_sleep_enable_timer_wakeup((uint64_t)wakeSeconds * 1000000ULL);
   esp_deep_sleep_start();
 #else
   lastInputAt = millis();
@@ -717,22 +837,22 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(1);
-  M5.Display.setBrightness(72);
   pinMode((int)PIN_BTN_B, INPUT_PULLUP);
   M5.BtnA.setHoldThresh(350);
   M5.BtnB.setHoldThresh(600);
   Serial.begin(115200);
+  updateBattery();
+  applyPowerProfile();
   hubHost = String(TASK_HUB_HOST);
   hubPort = TASK_HUB_PORT;
 
   wokeByTimer = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
-  updateBattery();
   drawMessage("连接任务中心", apiBase(), C_BLUE);
 
   bool ok = fetchTasks();
   updateBattery();
 #if ENABLE_DEEP_SLEEP
-  activeTimeoutMs = (wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : ACTIVE_TIMEOUT_MS;
+  activeTimeoutMs = (wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS;
 #else
   activeTimeoutMs = UINT32_MAX;
 #endif
@@ -740,8 +860,9 @@ void setup() {
   lastRefreshAt = millis();
   drawList();
 
-  Serial.printf("[task-monitor] up ok=%d tasks=%d active=%d attention=%d batt=%d deepSleep=%d\n",
-                (int)ok, taskCount, activeCount, attentionCount, battPct, (int)ENABLE_DEEP_SLEEP);
+  Serial.printf("[task-monitor] up ok=%d tasks=%d active=%d attention=%d batt=%d deepSleep=%d wake=%lus bright=%u cpu=%d charge=%d\n",
+                (int)ok, taskCount, activeCount, attentionCount, battPct, (int)ENABLE_DEEP_SLEEP,
+                (unsigned long)nextWakeSeconds(), displayBrightness(), POWER_SAVE_CPU_MHZ, CHARGE_CURRENT_MA);
 }
 
 void loop() {

@@ -59,6 +59,9 @@ PERPLEXITY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_PERPLEXITY_RUNNING_ST
 # instead of re-reading the entire transcript on every /tasks request. Hot for
 # users with many idle sessions on disk.
 _CLAUDE_TRANSCRIPT_CACHE: Dict[str, Dict[str, Any]] = {}
+# Same idea for Codex session rollouts; codex_usage_records() walks up to 80
+# *.jsonl files per /tasks request, so memoising makes idle sessions free.
+_CODEX_SESSION_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def ci_contains(needle: str, hay: str) -> bool:
@@ -535,6 +538,88 @@ def codex_session_index() -> Dict[str, Dict[str, Any]]:
     return records
 
 
+def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
+    """Walk a single codex rollout JSONL once; memoise the result by
+    (path, mtime, size). The hot path on a /tasks request becomes O(1) for
+    every session the user hasn't touched since the previous scan."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cache_key = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = _CODEX_SESSION_CACHE.get(path)
+    if cached and cached.get("_key") == cache_key:
+        return cached
+
+    session_id = ""
+    cwd = ""
+    updated_ms = int(st.st_mtime * 1000)
+    token_usage: Dict[str, Any] = {}
+    rate_percent: Optional[float] = None
+    turns = 0
+    latest_turn_id = ""
+    latest_turn_ms = 0
+    latest_completed_turn_id = ""
+    latest_completed_ms = 0
+    latest_event_ms = updated_ms
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                item_type = str(item.get("type") or "")
+                payload_type = str(payload.get("type") or "")
+                event_ms = iso_to_ms(item.get("timestamp"))
+                if event_ms:
+                    latest_event_ms = max(latest_event_ms, event_ms)
+                if item_type == "session_meta":
+                    session_id = str(payload.get("id") or session_id)
+                    cwd = str(payload.get("cwd") or cwd)
+                    updated_ms = iso_to_ms(payload.get("timestamp")) or updated_ms
+                elif payload_type == "task_started" or item_type == "turn_context" or payload_type == "turn_context":
+                    latest_turn_id = str(payload.get("turn_id") or item.get("turn_id") or latest_turn_id)
+                    latest_turn_ms = safe_ms(payload.get("started_at")) or event_ms or latest_turn_ms
+                    updated_ms = latest_turn_ms or event_ms or updated_ms
+                elif payload_type == "token_count":
+                    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                    raw_usage = info.get("total_token_usage")
+                    if isinstance(raw_usage, dict):
+                        token_usage = raw_usage
+                    limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+                    primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
+                    rate_percent = safe_float(primary.get("used_percent"))
+                    updated_ms = iso_to_ms(item.get("timestamp")) or updated_ms
+                elif payload_type in {"task_complete", "turn_aborted"}:
+                    if payload_type == "task_complete":
+                        turns += 1
+                    latest_completed_turn_id = str(payload.get("turn_id") or latest_completed_turn_id)
+                    latest_completed_ms = safe_ms(payload.get("completed_at")) or latest_completed_ms
+                    updated_ms = latest_completed_ms or updated_ms
+    except OSError:
+        return None
+
+    scan = {
+        "_key": cache_key,
+        "session_id": session_id,
+        "cwd": cwd,
+        "updated_ms": updated_ms,
+        "token_usage": token_usage,
+        "rate_percent": rate_percent,
+        "turns": turns,
+        "latest_turn_id": latest_turn_id,
+        "latest_turn_ms": latest_turn_ms,
+        "latest_completed_turn_id": latest_completed_turn_id,
+        "latest_completed_ms": latest_completed_ms,
+        "latest_event_ms": latest_event_ms,
+    }
+    _CODEX_SESSION_CACHE[path] = scan
+    return scan
+
+
 def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
     root = os.path.expanduser("~/.codex/sessions")
     index = codex_session_index()
@@ -543,56 +628,20 @@ def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
 
     for path in files:
-        session_id = ""
-        cwd = ""
-        updated_ms = int(os.path.getmtime(path) * 1000)
-        token_usage: Dict[str, Any] = {}
-        rate_percent: Optional[float] = None
-        turns = 0
-        latest_turn_id = ""
-        latest_turn_ms = 0
-        latest_completed_turn_id = ""
-        latest_completed_ms = 0
-        latest_event_ms = updated_ms
-
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-                    item_type = str(item.get("type") or "")
-                    payload_type = str(payload.get("type") or "")
-                    event_ms = iso_to_ms(item.get("timestamp"))
-                    if event_ms:
-                        latest_event_ms = max(latest_event_ms, event_ms)
-                    if item_type == "session_meta":
-                        session_id = str(payload.get("id") or session_id)
-                        cwd = str(payload.get("cwd") or cwd)
-                        updated_ms = iso_to_ms(payload.get("timestamp")) or updated_ms
-                    elif payload_type == "task_started" or item_type == "turn_context" or payload_type == "turn_context":
-                        latest_turn_id = str(payload.get("turn_id") or item.get("turn_id") or latest_turn_id)
-                        latest_turn_ms = safe_ms(payload.get("started_at")) or event_ms or latest_turn_ms
-                        updated_ms = latest_turn_ms or event_ms or updated_ms
-                    elif payload_type == "token_count":
-                        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-                        raw_usage = info.get("total_token_usage")
-                        if isinstance(raw_usage, dict):
-                            token_usage = raw_usage
-                        limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
-                        primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
-                        rate_percent = safe_float(primary.get("used_percent"))
-                        updated_ms = iso_to_ms(item.get("timestamp")) or updated_ms
-                    elif payload_type in {"task_complete", "turn_aborted"}:
-                        if payload_type == "task_complete":
-                            turns += 1
-                        latest_completed_turn_id = str(payload.get("turn_id") or latest_completed_turn_id)
-                        latest_completed_ms = safe_ms(payload.get("completed_at")) or latest_completed_ms
-                        updated_ms = latest_completed_ms or updated_ms
-        except OSError:
+        scan = _scan_codex_session(path)
+        if scan is None:
             continue
+        session_id = scan["session_id"]
+        cwd = scan["cwd"]
+        updated_ms = scan["updated_ms"]
+        token_usage = scan["token_usage"]
+        rate_percent = scan["rate_percent"]
+        turns = scan["turns"]
+        latest_turn_id = scan["latest_turn_id"]
+        latest_turn_ms = scan["latest_turn_ms"]
+        latest_completed_turn_id = scan["latest_completed_turn_id"]
+        latest_completed_ms = scan["latest_completed_ms"]
+        latest_event_ms = scan["latest_event_ms"]
 
         indexed = index.get(session_id) or {}
         title = str(indexed.get("title") or "")

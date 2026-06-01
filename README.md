@@ -171,6 +171,20 @@ After flashing, the StickS3 discovers the Mac hub over UDP, fetches the compact
 task list, shows it briefly, then enters deep sleep. It wakes on button press or
 every `AUTO_WAKE_SECONDS`.
 
+Default power profile:
+
+| Setting | Default |
+| --- | --- |
+| Normal timer wake | `AUTO_WAKE_SECONDS=600` |
+| Active/attention timer wake | `ACTIVE_WAKE_SECONDS=180` |
+| Low-battery timer wake | `LOW_BATTERY_WAKE_SECONDS=900` |
+| Timer-wake screen time | `QUIET_TIMER_TIMEOUT_MS=3000` |
+| Button-wake screen time | `INTERACTIVE_TIMEOUT_MS=10000` |
+| Normal brightness | `DISPLAY_BRIGHTNESS=32` |
+| Low-battery brightness | `LOW_BATTERY_BRIGHTNESS=16` |
+| CPU clock | `POWER_SAVE_CPU_MHZ=80` |
+| Charge current | `CHARGE_CURRENT_MA=200` |
+
 ## Controls
 
 | Control | Action |

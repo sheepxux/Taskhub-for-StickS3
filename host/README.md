@@ -76,8 +76,15 @@ The local detail page remains available in the browser at `/tasks/:id`.
 Power behavior:
 
 - The device wakes, fetches tasks, shows them briefly, then enters deep sleep.
-- It also wakes every `AUTO_WAKE_SECONDS` to refresh without USB.
-- No WebSocket is kept open by default; this is intentional for the 250mAh battery.
+- It wakes every `AUTO_WAKE_SECONDS=600` by default, or every
+  `ACTIVE_WAKE_SECONDS=180` while active/attention tasks are visible.
+- Below `LOW_BATTERY_THRESHOLD_PCT=30`, it drops brightness and wakes every
+  `LOW_BATTERY_WAKE_SECONDS=900`.
+- Timer wakes stay interactive for `QUIET_TIMER_TIMEOUT_MS=3000`; button wakes
+  stay interactive for `INTERACTIVE_TIMEOUT_MS=10000`.
+- The firmware uses `POWER_SAVE_CPU_MHZ=80`, `DISPLAY_BRIGHTNESS=32`, and
+  `CHARGE_CURRENT_MA=200` by default.
+- No WebSocket is kept open by default; this is intentional for the small battery.
 
 Current stable build:
 
