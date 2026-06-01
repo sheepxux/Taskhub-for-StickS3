@@ -15,6 +15,10 @@ compact task list to the StickS3 over your LAN.
 The device shows what is running, what recently finished, token or turn usage
 when available, and can open the source app on your Mac with one button.
 
+## Status Flow
+
+![TaskHub status flow](docs/status-flow.svg)
+
 ## What It Does
 
 | Capability | Status |

@@ -1,0 +1,106 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TaskHub for StickS3 Status Flow</title>
+  <desc id="desc">A clear status flow diagram for TaskHub for StickS3 showing task states, visibility rules, and display-only hiding behavior.</desc>
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#EFF6FF"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-25%" width="140%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2L11 7L2 12" stroke="#334155" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="softArrow" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2L11 7L2 12" stroke="#94A3B8" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; }
+      .title { font-size: 36px; font-weight: 800; fill: #0F172A; }
+      .subtitle { font-size: 17px; font-weight: 500; fill: #475569; }
+      .node-title { font-size: 25px; font-weight: 800; fill: #0F172A; }
+      .node-copy { font-size: 15px; font-weight: 600; fill: #475569; }
+      .label { font-size: 13px; font-weight: 800; fill: #334155; }
+      .legend { font-size: 14px; font-weight: 700; fill: #475569; }
+      .edge { stroke: #334155; stroke-width: 2.8; fill: none; marker-end: url(#arrow); }
+      .soft-edge { stroke: #94A3B8; stroke-width: 2.6; fill: none; stroke-dasharray: 8 8; marker-end: url(#softArrow); }
+    </style>
+  </defs>
+
+  <rect width="1280" height="640" rx="32" fill="url(#page)"/>
+  <rect x="40" y="40" width="1200" height="560" rx="28" fill="#FFFFFF" stroke="#DBEAFE"/>
+
+  <text x="84" y="96" class="title">TaskHub Status Flow</text>
+  <text x="84" y="128" class="subtitle">The Mac keeps every task. StickS3 only hides stale display items to keep the tiny screen readable.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="86" y="336" width="168" height="106" rx="18" fill="#FEF9C3" stroke="#EAB308" stroke-width="2"/>
+    <text x="128" y="382" class="node-title">WAIT</text>
+    <text x="116" y="412" class="node-copy">queued or input</text>
+
+    <rect x="310" y="236" width="168" height="106" rx="18" fill="#DCFCE7" stroke="#22C55E" stroke-width="2"/>
+    <text x="350" y="282" class="node-title">RUN</text>
+    <text x="344" y="312" class="node-copy">active turn</text>
+
+    <rect x="534" y="236" width="168" height="106" rx="18" fill="#E0F2FE" stroke="#0EA5E9" stroke-width="2"/>
+    <text x="578" y="282" class="node-title">REC</text>
+    <text x="560" y="312" class="node-copy">recent activity</text>
+
+    <rect x="758" y="154" width="168" height="106" rx="18" fill="#F1F5F9" stroke="#64748B" stroke-width="2"/>
+    <text x="796" y="200" class="node-title">DONE</text>
+    <text x="806" y="230" class="node-copy">completed</text>
+
+    <rect x="758" y="374" width="168" height="106" rx="18" fill="#FEE2E2" stroke="#EF4444" stroke-width="2"/>
+    <text x="804" y="420" class="node-title">FAIL</text>
+    <text x="786" y="450" class="node-copy">needs attention</text>
+
+    <rect x="534" y="414" width="168" height="106" rx="18" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2"/>
+    <text x="582" y="460" class="node-title">IDLE</text>
+    <text x="582" y="490" class="node-copy">source idle</text>
+
+    <rect x="1030" y="264" width="168" height="106" rx="18" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="2"/>
+    <text x="1062" y="310" class="node-title">HIDDEN</text>
+    <text x="1056" y="340" class="node-copy">display only</text>
+  </g>
+
+  <path class="edge" d="M254 389C282 389 288 289 304 289"/>
+  <path class="edge" d="M478 289H528"/>
+  <path class="edge" d="M702 270C724 250 735 228 752 212"/>
+  <path class="edge" d="M478 314C600 370 664 396 752 421"/>
+
+  <path class="soft-edge" d="M926 207C1010 210 1066 230 1096 258"/>
+  <path class="soft-edge" d="M702 289C842 294 950 304 1024 314"/>
+  <path class="soft-edge" d="M702 467C830 540 1010 520 1090 376"/>
+
+  <rect x="268" y="350" width="74" height="26" rx="13" fill="#F1F5F9" stroke="#E2E8F0"/>
+  <text x="286" y="368" class="label">resume</text>
+
+  <rect x="496" y="250" width="70" height="26" rx="13" fill="#F1F5F9" stroke="#E2E8F0"/>
+  <text x="512" y="268" class="label">finish</text>
+
+  <rect x="708" y="226" width="78" height="26" rx="13" fill="#F1F5F9" stroke="#E2E8F0"/>
+  <text x="721" y="244" class="label">terminal</text>
+
+  <rect x="604" y="364" width="58" height="26" rx="13" fill="#FEE2E2" stroke="#FECACA"/>
+  <text x="618" y="382" class="label">error</text>
+
+  <rect x="955" y="219" width="56" height="26" rx="13" fill="#F1F5F9" stroke="#E2E8F0"/>
+  <text x="968" y="237" class="label">10m</text>
+
+  <rect x="858" y="285" width="48" height="26" rx="13" fill="#F1F5F9" stroke="#E2E8F0"/>
+  <text x="873" y="303" class="label">1h</text>
+
+  <rect x="884" y="504" width="56" height="26" rx="13" fill="#F1F5F9" stroke="#E2E8F0"/>
+  <text x="897" y="522" class="label">10m</text>
+
+  <rect x="84" y="548" width="1092" height="34" rx="17" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <circle cx="110" cy="565" r="6" fill="#22C55E"/>
+  <text x="126" y="570" class="legend">RUN, WAIT, and FAIL stay visible</text>
+  <circle cx="384" cy="565" r="6" fill="#0EA5E9"/>
+  <text x="400" y="570" class="legend">REC hides after 1 hour</text>
+  <circle cx="596" cy="565" r="6" fill="#64748B"/>
+  <text x="612" y="570" class="legend">DONE and IDLE hide after 10 minutes</text>
+  <circle cx="910" cy="565" r="6" fill="#CBD5E1"/>
+  <text x="926" y="570" class="legend">Nothing is deleted from the Mac</text>
+</svg>
