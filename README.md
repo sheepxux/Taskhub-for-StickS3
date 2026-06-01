@@ -15,9 +15,25 @@ compact task list to the StickS3 over your LAN.
 The device shows what is running, what recently finished, token or turn usage
 when available, and can open the source app on your Mac with one button.
 
-## Status Flow
+## Screens
 
-![TaskHub status flow](docs/status-flow.svg)
+Pixel-accurate renders of what the StickS3 actually draws, at the device's
+native 240 × 135 resolution. Regenerate with `python3 docs/render_screens.py`.
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/screen-run.png" width="320" alt="RUN screen"/><br/><sub><b>RUN</b> · active agent turn</sub></td>
+    <td align="center"><img src="docs/screen-wait.png" width="320" alt="WAIT screen"/><br/><sub><b>WAIT</b> · needs your input</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screen-fail.png" width="320" alt="FAIL screen"/><br/><sub><b>FAIL</b> · error or attention</sub></td>
+    <td align="center"><img src="docs/screen-done.png" width="320" alt="DONE screen"/><br/><sub><b>DONE</b> · finished task</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screen-empty.png" width="320" alt="No tasks"/><br/><sub>No tasks · idle hub</sub></td>
+    <td align="center"><img src="docs/screen-error.png" width="320" alt="Hub unreachable"/><br/><sub>Hub unreachable · Wi-Fi lost</sub></td>
+  </tr>
+</table>
 
 ## What It Does
 
