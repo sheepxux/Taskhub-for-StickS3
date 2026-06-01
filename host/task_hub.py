@@ -41,13 +41,31 @@ MAX_TASKS = int(os.environ.get("TASK_HUB_MAX_TASKS", "40"))
 ACTIVE_MINUTES = int(os.environ.get("TASK_HUB_ACTIVE_MINUTES", "1440"))
 TASK_CACHE_MS = int(os.environ.get("TASK_HUB_CACHE_MS", "3000"))
 CODEX_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CODEX_RUNNING_STALE_MS", "900000"))
-CLAUDE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLAUDE_RUNNING_STALE_MS", str(CODEX_RUNNING_STALE_MS)))
+# 90s default (was 15min): with process detection now reliable, the time-based
+# fallback only needs to cover the brief gap between a turn finishing and the
+# JSONL flushing its terminal stop_reason. Long-running turns stay marked as
+# running via process detection, so this short window doesn't false-negative.
+CLAUDE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLAUDE_RUNNING_STALE_MS", "90000"))
 CLAUDE_TERMINAL_STOP_REASONS = {"end_turn", "stop_sequence", "max_tokens"}
 OPENCLAW_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_OPENCLAW_RUNNING_STALE_MS", "1800000"))
 MANUS_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_MANUS_RUNNING_STALE_MS", "900000"))
 MANUS_MAX_SESSIONS = int(os.environ.get("TASK_HUB_MANUS_MAX_SESSIONS", "3"))
 MANUS_TERMINAL_STATUS_CODES = {5, 7}
 PERPLEXITY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_PERPLEXITY_RUNNING_STALE_MS", "30000"))
+
+# Memoise the expensive Claude transcript scans. Keyed by JSONL path, value is
+# the scan result tagged with (mtime, size); a cache hit means the file hasn't
+# changed since we last walked it, so we return the prior result instantly
+# instead of re-reading the entire transcript on every /tasks request. Hot for
+# users with many idle sessions on disk.
+_CLAUDE_TRANSCRIPT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def ci_contains(needle: str, hay: str) -> bool:
+    """Case-insensitive substring check. macOS process listings mix
+    `/Claude.app/` (Desktop) and `/claude.app/` (Claude Code binary) in the
+    same path, so case-sensitive matching silently misses half the time."""
+    return needle.lower() in hay.lower()
 
 
 def now_ms() -> int:
@@ -307,11 +325,20 @@ def claude_transcript_path(cli_session_id: str) -> str:
     return max(paths, key=os.path.getmtime)
 
 
-def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> Dict[str, Any]:
-    path = claude_transcript_path(cli_session_id)
-    turns = safe_int(completed_turns)
-    if not path:
-        return {"usage": build_usage(turns=turns), "turns": turns}
+def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
+    """Walk a Claude Code JSONL transcript once and return the accumulated
+    state needed for status + usage. Memoised by (path, mtime, size) so that
+    on the next /tasks request, an unchanged file returns in O(1) instead of
+    re-reading every line — critical when the user has hundreds of historical
+    sessions on disk."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cache_key = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = _CLAUDE_TRANSCRIPT_CACHE.get(path)
+    if cached and cached.get("_key") == cache_key:
+        return cached
 
     fields = {
         "input_tokens": 0,
@@ -319,8 +346,8 @@ def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> 
         "cache_read_input_tokens": 0,
         "output_tokens": 0,
     }
-    seen_requests = set()
-    seen_terminal_requests = set()
+    seen_requests: set = set()
+    seen_terminal_requests: set = set()
     request_count = 0
     model = ""
     terminal_turns = 0
@@ -378,7 +405,7 @@ def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> 
                     for field in fields:
                         fields[field] += safe_int(raw_usage.get(field))
     except OSError:
-        return {"usage": build_usage(turns=turns), "turns": turns}
+        return None
 
     active_turn = False
     if latest_turn_event_ms:
@@ -387,22 +414,13 @@ def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> 
         else:
             active_turn = latest_turn_event_ms > latest_terminal_ms
 
-    total = total_tokens_from_usage(fields, list(fields.keys()))
-    usage = build_usage(
-        total_tokens=total,
-        turns=turns or terminal_turns or request_count,
-        fields={
-            "source": "claude-transcript",
-            "model": model,
-            "requests": request_count,
-            **fields,
-        },
-    )
-    return {
-        "usage": usage,
-        "turns": turns or terminal_turns or request_count,
-        "requests": request_count,
-        "transcript_found": True,
+    scan = {
+        "_key": cache_key,
+        "fields": fields,
+        "total_tokens": total_tokens_from_usage(fields, list(fields.keys())),
+        "model": model,
+        "request_count": request_count,
+        "terminal_turns": terminal_turns,
         "latest_event_ms": latest_turn_event_ms or latest_event_ms,
         "latest_user_ms": latest_user_ms,
         "latest_assistant_ms": latest_assistant_ms,
@@ -410,6 +428,43 @@ def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> 
         "latest_stop_reason": latest_stop_reason,
         "latest_request_id": latest_request_id,
         "active_turn": active_turn,
+    }
+    _CLAUDE_TRANSCRIPT_CACHE[path] = scan
+    return scan
+
+
+def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> Dict[str, Any]:
+    path = claude_transcript_path(cli_session_id)
+    turns = safe_int(completed_turns)
+    if not path:
+        return {"usage": build_usage(turns=turns), "turns": turns}
+    scan = _scan_claude_transcript(path)
+    if scan is None:
+        return {"usage": build_usage(turns=turns), "turns": turns}
+
+    effective_turns = turns or scan["terminal_turns"] or scan["request_count"]
+    usage = build_usage(
+        total_tokens=scan["total_tokens"],
+        turns=effective_turns,
+        fields={
+            "source": "claude-transcript",
+            "model": scan["model"],
+            "requests": scan["request_count"],
+            **scan["fields"],
+        },
+    )
+    return {
+        "usage": usage,
+        "turns": effective_turns,
+        "requests": scan["request_count"],
+        "transcript_found": True,
+        "latest_event_ms": scan["latest_event_ms"],
+        "latest_user_ms": scan["latest_user_ms"],
+        "latest_assistant_ms": scan["latest_assistant_ms"],
+        "latest_terminal_ms": scan["latest_terminal_ms"],
+        "latest_stop_reason": scan["latest_stop_reason"],
+        "latest_request_id": scan["latest_request_id"],
+        "active_turn": scan["active_turn"],
     }
 
 
@@ -931,8 +986,13 @@ class ClaudeAdapter:
     def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
         commands = commands or ps_commands()
         running_resumes = set()
+        # Detect any Claude Code process by --resume flag. Case-insensitive
+        # because the active binary lives under `claude.app/` (lowercase) while
+        # only the launcher wrapper sits in `Claude.app/`; the old anchored
+        # match silently dropped the bare claude.app process (≈half the time).
+        claude_re = re.compile(r"\bclaude\b", re.IGNORECASE)
         for line in commands:
-            if "/Claude.app/" in line and "/claude " in line:
+            if claude_re.search(line) and "--resume" in line:
                 running_resumes.update(re.findall(r"--resume\s+([^\s]+)", line))
 
         roots = [
@@ -962,6 +1022,12 @@ class ClaudeAdapter:
             seen.add(key)
             updated = safe_ms(item.get("lastActivityAt") or item.get("lastFocusedAt") or item.get("createdAt"))
             is_running = bool({session_id, cli_session_id} & running_resumes)
+            # Skip the expensive JSONL scan for sessions metadata says are older
+            # than the active window AND whose process isn't running. This is
+            # what keeps a user with hundreds of archived sessions snappy — we
+            # only ever open the few transcripts that could still be relevant.
+            if not is_running and updated and updated < cutoff:
+                continue
             metrics = claude_session_metrics(cli_session_id, item.get("completedTurns"))
             transcript_updated = safe_int(metrics.get("latest_event_ms"))
             if transcript_updated and (not updated or transcript_updated > updated):
@@ -1044,7 +1110,9 @@ class CodexAdapter:
         tasks: List[Task] = []
         usage_records = codex_usage_records()
         app_is_running = app_running(commands, "/Applications/Codex.app", "Codex")
-        app_server_count = sum("Codex.app/Contents/Resources/codex app-server" in line for line in commands)
+        # Case-insensitive: Codex CLI installs may render the path with mixed
+        # case depending on launcher; same lesson learned from the Claude fix.
+        app_server_count = sum(ci_contains("Codex.app/Contents/Resources/codex app-server", line) for line in commands)
         titles = window_titles("Codex") if app_is_running else []
 
         if app_is_running:
@@ -1074,7 +1142,7 @@ class CodexAdapter:
             )
 
         for line in commands:
-            if "/Codex.app/Contents/Resources/node " not in line or "--session-id" not in line:
+            if not ci_contains("/Codex.app/Contents/Resources/node ", line) or "--session-id" not in line:
                 continue
             session = first_match(r"--session-id\s+([^\s]+)", line)
             cwd = first_match(r"--working-dir\s+(.+?)(?:\s--|$)", line)
