@@ -1607,14 +1607,15 @@ class PerplexityAdapter:
             ),
         ]
         self.computer_paths = [
-            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/Cache.db"),
             os.path.expanduser("~/Library/Caches/ai.perplexity.macv3.perplexityd/Cache.db"),
-            os.path.expanduser("~/Library/HTTPStorages/ai.perplexity.macv3/httpstorages.sqlite"),
             os.path.expanduser("~/Library/HTTPStorages/ai.perplexity.macv3.perplexityd/httpstorages.sqlite"),
             os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/fsCachedData"),
             os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/tool-output-cache"),
             os.path.expanduser("~/Library/Caches/ai.perplexity.macv3.perplexityd/fsCachedData"),
         ]
+        self.indexed_db_glob = os.path.expanduser(
+            "~/Library/WebKit/ai.perplexity.macv3/WebsiteData/Default/*/*/IndexedDB/*/IndexedDB.sqlite3"
+        )
         self._last_signature = ""
         self._last_change_ms = 0
         self._last_computer_signature = ""
@@ -1679,8 +1680,12 @@ class PerplexityAdapter:
                 task(
                     task_id="perplexity-computer",
                     source=self.source,
-                    title="Perplexity Computer",
-                    status=self._computer_status(computer_running, safe_int(computer.get("signal_ms"))),
+                    title=str(computer.get("title") or "Perplexity Computer"),
+                    status=self._computer_status(
+                        computer_running,
+                        safe_int(computer.get("signal_ms")),
+                        str(computer.get("thread_status") or ""),
+                    ),
                     updated_ms=safe_int(computer.get("signal_ms")) or None,
                     subtitle=self._computer_subtitle(computer_running, computer),
                     detail={
@@ -1689,6 +1694,9 @@ class PerplexityAdapter:
                         "last_change_at": ms_to_iso(self._last_computer_change_ms),
                         "status_basis": computer.get("status_basis"),
                         "latest_endpoint": computer.get("latest_endpoint"),
+                        "thread_id": computer.get("thread_id"),
+                        "thread_status": computer.get("thread_status"),
+                        "title_basis": computer.get("title_basis"),
                     },
                     usage={"label": computer.get("usage_label", "")} if computer.get("usage_label") else {},
                     open_action={"type": "app", "target": self.bundle_id},
@@ -1721,6 +1729,11 @@ class PerplexityAdapter:
 
     def _computer_state(self, daemon_running: bool) -> Dict[str, Any]:
         latest_path, signal_ms = self._latest_path_mtime(self.computer_paths)
+        indexeddb = self._computer_indexeddb_hint()
+        indexeddb_ms = safe_int(indexeddb.get("updated_ms"))
+        if indexeddb_ms > signal_ms:
+            latest_path = str(indexeddb.get("path") or latest_path)
+            signal_ms = indexeddb_ms
         latest_endpoint = ""
         for path in self.computer_cache_dbs:
             row = self._safe_latest_cache_row(path)
@@ -1736,6 +1749,9 @@ class PerplexityAdapter:
                 "signal": signal_ms,
                 "path": latest_path,
                 "endpoint": latest_endpoint,
+                "title": indexeddb.get("title"),
+                "thread": indexeddb.get("thread_id"),
+                "thread_status": indexeddb.get("thread_status"),
             },
             sort_keys=True,
         )
@@ -1745,15 +1761,26 @@ class PerplexityAdapter:
         self._last_computer_signature = signature
 
         return {
-            "available": daemon_running or bool(signal_ms),
+            "available": daemon_running or bool(signal_ms) or bool(indexeddb.get("title")),
             "signal_ms": signal_ms,
             "latest_path": latest_path,
             "latest_endpoint": latest_endpoint,
-            "status_basis": "Perplexity macv3 daemon/cache activity",
+            "title": indexeddb.get("title"),
+            "thread_id": indexeddb.get("thread_id"),
+            "thread_status": indexeddb.get("thread_status"),
+            "title_basis": indexeddb.get("title_basis"),
+            "status_basis": (
+                "Perplexity macv3 daemon/cache activity + IndexedDB task cache"
+                if indexeddb
+                else "Perplexity macv3 daemon/cache activity"
+            ),
             "usage_label": "computer daemon" if daemon_running else "",
         }
 
-    def _computer_status(self, daemon_running: bool, signal_ms: int) -> str:
+    def _computer_status(self, daemon_running: bool, signal_ms: int, thread_status: str = "") -> str:
+        mapped = self._map_computer_thread_status(thread_status)
+        if mapped:
+            return mapped
         now = now_ms()
         if (
             daemon_running
@@ -1767,11 +1794,306 @@ class PerplexityAdapter:
             return "recent"
         return "idle"
 
+    def _map_computer_thread_status(self, status: str) -> str:
+        normalized = (status or "").strip().lower().replace("-", "_")
+        if normalized in {"completed", "complete", "done", "succeeded", "success"}:
+            return "done"
+        if normalized in {"failed", "error", "errored", "timed_out", "timeout", "cancelled", "canceled"}:
+            return "failed"
+        if normalized in {"active", "running", "in_progress", "processing", "generating", "streaming"}:
+            return "running"
+        if normalized in {"queued", "pending", "waiting"}:
+            return "waiting"
+        return ""
+
     def _computer_subtitle(self, daemon_running: bool, state: Dict[str, Any]) -> str:
         parts = ["daemon" if daemon_running else "daemon idle"]
         if state.get("signal_ms"):
             parts.append("local activity")
+        if state.get("thread_status"):
+            parts.append(str(state.get("thread_status")))
         return join_parts(parts, " · ")
+
+    def _computer_indexeddb_hint(self) -> Dict[str, Any]:
+        candidates: List[Dict[str, Any]] = []
+        paths = sorted(glob.glob(self.indexed_db_glob), key=self._sqlite_content_mtime_ms, reverse=True)[:6]
+        for path in paths:
+            rows = self._safe_indexeddb_rows(path)
+            if not rows:
+                continue
+            db_mtime = self._sqlite_content_mtime_ms(path)
+            for _, key, value in rows:
+                candidate = self._computer_candidate_from_idb_record(path, db_mtime, key, value)
+                if candidate:
+                    candidates.append(candidate)
+        if not candidates:
+            return {}
+        candidates.sort(key=lambda item: (safe_int(item.get("score")), safe_int(item.get("updated_ms"))), reverse=True)
+        winner = dict(candidates[0])
+        for candidate in candidates[1:]:
+            if candidate.get("title") != winner.get("title"):
+                continue
+            if not winner.get("thread_id") and candidate.get("thread_id"):
+                winner["thread_id"] = candidate.get("thread_id")
+            if not winner.get("thread_status") and candidate.get("thread_status"):
+                winner["thread_status"] = candidate.get("thread_status")
+        winner.pop("score", None)
+        return winner
+
+    def _safe_indexeddb_rows(self, path: str) -> List[Tuple[Any, Any, Any]]:
+        if not os.path.exists(path):
+            return []
+        try:
+            return self._indexeddb_rows(path)
+        except Exception:
+            with tempfile.TemporaryDirectory(prefix="sticks3-pplx-idb-") as tmp:
+                copy_path = os.path.join(tmp, "IndexedDB.sqlite3")
+                try:
+                    shutil.copy2(path, copy_path)
+                    for suffix in ("-wal", "-shm"):
+                        src = f"{path}{suffix}"
+                        if os.path.exists(src):
+                            shutil.copy2(src, f"{copy_path}{suffix}")
+                except OSError:
+                    return []
+                try:
+                    return self._indexeddb_rows(copy_path)
+                except Exception:
+                    return []
+
+    def _indexeddb_rows(self, path: str) -> List[Tuple[Any, Any, Any]]:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con.text_factory = bytes
+        try:
+            return con.execute("select recordID, key, value from Records").fetchall()
+        finally:
+            con.close()
+
+    def _computer_candidate_from_idb_record(
+        self, path: str, updated_ms: int, key: Any, value: Any
+    ) -> Dict[str, Any]:
+        key_text = " ".join(item[1] for item in self._idb_positioned_strings(key)).lower()
+        if not key_text or "/rest/tasks/shortcuts" in key_text:
+            return {}
+        interesting = (
+            "thread_metadata" in key_text
+            or "all_results" in key_text
+            or "/rest/thread/list_recent" in key_text
+            or "/computer" in key_text
+            or "/rest/tasks" in key_text
+        )
+        if not interesting:
+            return {}
+        fields = self._idb_fields(value)
+        title = (
+            self._clean_task_title(fields.get("thread_title"))
+            or self._clean_task_title(fields.get("title"))
+            or self._clean_task_title(fields.get("task_name"))
+            or self._clean_task_title(fields.get("task_description"))
+        )
+        if not title:
+            return {}
+        score = 0
+        if "thread_metadata" in key_text:
+            score += 90
+        if "all_results" in key_text:
+            score += 80
+        if "/rest/thread/list_recent" in key_text:
+            score += 70
+        if "/computer" in key_text or "/rest/tasks" in key_text:
+            score += 20
+        if fields.get("thread_status"):
+            score += 10
+        if fields.get("thread_title"):
+            score += 5
+        return {
+            "title": title,
+            "thread_id": fields.get("backend_uuid") or fields.get("uuid") or "",
+            "thread_status": fields.get("thread_status") or "",
+            "updated_ms": updated_ms,
+            "path": path,
+            "title_basis": "Perplexity IndexedDB task cache",
+            "score": score,
+        }
+
+    def _idb_fields(self, value: Any) -> Dict[str, str]:
+        items = self._idb_positioned_strings(value)
+        names = {
+            "backend_uuid",
+            "thread_status",
+            "thread_status_summary",
+            "thread_status_summary_enum",
+            "thread_title",
+            "thread_url_slug",
+            "title",
+            "task_name",
+            "task_description",
+            "todo_task_status",
+            "uuid",
+        }
+        fields: Dict[str, str] = {}
+        for idx, (_, text, _) in enumerate(items):
+            if text not in names or text in fields:
+                continue
+            if text in {"backend_uuid", "uuid"}:
+                for _, candidate, _ in items[idx + 1 : idx + 12]:
+                    cleaned = self._clean_idb_value(candidate)
+                    if re.fullmatch(
+                        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                        cleaned,
+                    ):
+                        fields[text] = cleaned
+                        break
+                continue
+            if text in {"title", "thread_title", "task_name", "task_description"}:
+                best_title = ""
+                for _, candidate, _ in items[idx + 1 : idx + 12]:
+                    cleaned = self._clean_idb_value(candidate)
+                    if not cleaned or cleaned in names:
+                        continue
+                    title = self._clean_task_title(cleaned)
+                    if title and len(title) > len(best_title):
+                        best_title = title
+                if best_title:
+                    fields[text] = best_title
+                continue
+            for _, candidate, _ in items[idx + 1 : idx + 10]:
+                cleaned = self._clean_idb_value(candidate)
+                if not cleaned or cleaned in names:
+                    continue
+                if text == "thread_status":
+                    if self._map_computer_thread_status(cleaned):
+                        fields[text] = cleaned
+                        break
+                    continue
+                if text in {"thread_status_summary", "thread_status_summary_enum", "todo_task_status"}:
+                    continue
+                fields[text] = cleaned
+                break
+        return fields
+
+    def _idb_positioned_strings(self, value: Any) -> List[Tuple[int, str, str]]:
+        data = self._ensure_bytes(value)
+        found: List[Tuple[int, str, str]] = []
+        for match in re.finditer(rb"[\x20-\x7e]{3,}", data):
+            text = match.group().decode("utf-8", "ignore")
+            if text:
+                found.append((match.start(), text, "ascii"))
+        for start in (0, 1):
+            idx = start
+            while idx + 1 < len(data):
+                chars: List[str] = []
+                end = idx
+                while end + 1 < len(data):
+                    codepoint = data[end] | (data[end + 1] << 8)
+                    if codepoint in (9, 10, 13) or (codepoint >= 32 and codepoint not in (0xFFFE, 0xFFFF)):
+                        char = chr(codepoint)
+                        if char.isprintable() and char != "\x00":
+                            chars.append(char)
+                            end += 2
+                            continue
+                    break
+                if len(chars) >= 3:
+                    text = "".join(chars)
+                    if any(char.isalnum() for char in text):
+                        found.append((idx, text, "utf16"))
+                    idx = max(end, idx + 2)
+                else:
+                    idx += 2
+        found.sort(key=lambda item: (item[0], 0 if item[2] == "ascii" else 1))
+        out: List[Tuple[int, str, str]] = []
+        seen = set()
+        for pos, text, encoding in found:
+            cleaned = self._clean_idb_value(text)
+            if not cleaned:
+                continue
+            key = (pos, cleaned)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((pos, cleaned, encoding))
+        return out
+
+    def _ensure_bytes(self, value: Any) -> bytes:
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8", "ignore")
+        try:
+            return bytes(value)
+        except Exception:
+            return str(value).encode("utf-8", "ignore")
+
+    def _clean_idb_value(self, value: Any) -> str:
+        text = str(value or "").strip().strip("\x00")
+        if not text or self._has_idb_noise_marker(text):
+            return ""
+        packed = self._decode_packed_ascii(text)
+        if packed:
+            text = packed
+        if not text or self._looks_like_idb_noise(text):
+            return ""
+        return html.unescape(text)
+
+    def _clean_task_title(self, value: Any) -> str:
+        text = self._clean_idb_value(value)
+        if not text or len(text) < 2 or len(text) > 120:
+            return ""
+        if text.lower() in {
+            "answer_preview",
+            "items",
+            "link",
+            "query_source",
+            "related_queries",
+            "updated_at",
+        }:
+            return ""
+        if text.startswith(("http://", "https://", "/rest/", "pplx-query-cache-")):
+            return ""
+        if text in {
+            "completed",
+            "failed",
+            "incomplete",
+            "pending",
+            "running",
+            "success",
+        }:
+            return ""
+        return text
+
+    def _looks_like_idb_noise(self, text: str) -> bool:
+        if "\ufffd" in text:
+            return True
+        if self._has_idb_noise_marker(text):
+            return True
+        return False
+
+    def _has_idb_noise_marker(self, text: str) -> bool:
+        markers = {"耀", "璀", "疀", "犀", "榀", "憀", "沀", "熀", "∀", "ⴀ", "㐀", "㌀", "㤀"}
+        return any(marker in text for marker in markers)
+
+    def _decode_packed_ascii(self, text: str) -> str:
+        decoded: List[str] = []
+        useful_bytes = 0
+        skipped_bytes = 0
+        for char in text:
+            codepoint = ord(char)
+            if codepoint <= 0xFF:
+                return ""
+            if codepoint > 0xFFFF:
+                return ""
+            for byte in (codepoint >> 8, codepoint & 0xFF):
+                if 32 <= byte <= 126:
+                    decoded.append(chr(byte))
+                    useful_bytes += 1
+                elif byte in (0, 0x80):
+                    skipped_bytes += 1
+                else:
+                    return ""
+        result = "".join(decoded).strip()
+        if useful_bytes >= 3 and useful_bytes >= skipped_bytes and re.search(r"[A-Za-z0-9]", result):
+            return result
+        return ""
 
     def _usage(self, state: Dict[str, Any]) -> Dict[str, Any]:
         query_count = safe_int(state.get("local_query_count"))
@@ -1920,6 +2242,15 @@ class PerplexityAdapter:
     def _latest_mtime_ms(self, paths: Iterable[str]) -> int:
         return max((self._path_mtime_ms(path) for path in paths), default=0)
 
+    def _sqlite_content_mtime_ms(self, path: str) -> int:
+        mtimes = []
+        for item in (path, f"{path}-wal"):
+            try:
+                mtimes.append(int(os.path.getmtime(item) * 1000))
+            except OSError:
+                continue
+        return max(mtimes) if mtimes else 0
+
     def _latest_path_mtime(self, paths: Iterable[str]) -> Tuple[str, int]:
         latest_path = ""
         latest_ms = 0
@@ -1941,7 +2272,7 @@ class PerplexityAdapter:
             except OSError:
                 pass
         else:
-            for item in [path, f"{path}-wal", f"{path}-shm"]:
+            for item in [path, f"{path}-wal"]:
                 try:
                     mtimes.append(int(os.path.getmtime(item) * 1000))
                 except OSError:
