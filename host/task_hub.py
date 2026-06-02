@@ -52,6 +52,9 @@ MANUS_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_MANUS_RUNNING_STALE_MS", "
 MANUS_MAX_SESSIONS = int(os.environ.get("TASK_HUB_MANUS_MAX_SESSIONS", "3"))
 MANUS_TERMINAL_STATUS_CODES = {5, 7}
 PERPLEXITY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_PERPLEXITY_RUNNING_STALE_MS", "30000"))
+PERPLEXITY_COMPUTER_RUNNING_STALE_MS = int(
+    os.environ.get("TASK_HUB_PERPLEXITY_COMPUTER_RUNNING_STALE_MS", "3600000")
+)
 
 # Memoise the expensive Claude transcript scans. Keyed by JSONL path, value is
 # the scan result tagged with (mtime, size); a cache hit means the file hasn't
@@ -1579,21 +1582,48 @@ class PerplexityAdapter:
         self.bundle_id = "ai.perplexity.macv3"
         self.bundle_fragment = "/Applications/Perplexity.app"
         self.binary_name = "Perplexity"
-        self.pref_path = os.path.expanduser(
-            "~/Library/Containers/ai.perplexity.mac/Data/Library/Preferences/ai.perplexity.mac.plist"
-        )
-        self.cache_db = os.path.expanduser(
-            "~/Library/Containers/ai.perplexity.mac/Data/Library/Caches/ai.perplexity.mac/Cache.db"
-        )
-        self.http_storage = os.path.expanduser(
-            "~/Library/Containers/ai.perplexity.mac/Data/Library/HTTPStorages/ai.perplexity.mac/httpstorages.sqlite"
-        )
+        self.daemon_bundle_fragment = "Perplexity Helper.app"
+        self.daemon_binary_name = "perplexityd"
+        self.pref_paths = [
+            os.path.expanduser("~/Library/Preferences/ai.perplexity.macv3.plist"),
+            os.path.expanduser(
+                "~/Library/Containers/ai.perplexity.mac/Data/Library/Preferences/ai.perplexity.mac.plist"
+            ),
+        ]
+        self.cache_dbs = [
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/Cache.db"),
+            os.path.expanduser(
+                "~/Library/Containers/ai.perplexity.mac/Data/Library/Caches/ai.perplexity.mac/Cache.db"
+            ),
+        ]
+        self.computer_cache_dbs = [
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/Cache.db"),
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3.perplexityd/Cache.db"),
+        ]
+        self.http_storages = [
+            os.path.expanduser("~/Library/HTTPStorages/ai.perplexity.macv3/httpstorages.sqlite"),
+            os.path.expanduser(
+                "~/Library/Containers/ai.perplexity.mac/Data/Library/HTTPStorages/ai.perplexity.mac/httpstorages.sqlite"
+            ),
+        ]
+        self.computer_paths = [
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/Cache.db"),
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3.perplexityd/Cache.db"),
+            os.path.expanduser("~/Library/HTTPStorages/ai.perplexity.macv3/httpstorages.sqlite"),
+            os.path.expanduser("~/Library/HTTPStorages/ai.perplexity.macv3.perplexityd/httpstorages.sqlite"),
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/fsCachedData"),
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3/tool-output-cache"),
+            os.path.expanduser("~/Library/Caches/ai.perplexity.macv3.perplexityd/fsCachedData"),
+        ]
         self._last_signature = ""
         self._last_change_ms = 0
+        self._last_computer_signature = ""
+        self._last_computer_change_ms = 0
 
     def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
         commands = commands or ps_commands()
         running = app_running(commands, self.bundle_fragment, self.binary_name)
+        computer_running = self._daemon_running(commands)
         titles = window_titles(self.app_name) if running else []
         state = self._read_local_state()
         signal_ms = max(
@@ -1621,7 +1651,7 @@ class PerplexityAdapter:
         title = titles[0] if titles and titles[0] != self.app_name else self.source
         usage = self._usage(state)
         subtitle = self._subtitle(running, state)
-        return [
+        tasks = [
             task(
                 task_id="perplexity-app",
                 source=self.source,
@@ -1643,6 +1673,28 @@ class PerplexityAdapter:
                 open_action={"type": "app", "target": self.bundle_id},
             )
         ]
+        computer = self._computer_state(computer_running)
+        if computer.get("available"):
+            tasks.append(
+                task(
+                    task_id="perplexity-computer",
+                    source=self.source,
+                    title="Perplexity Computer",
+                    status=self._computer_status(computer_running, safe_int(computer.get("signal_ms"))),
+                    updated_ms=safe_int(computer.get("signal_ms")) or None,
+                    subtitle=self._computer_subtitle(computer_running, computer),
+                    detail={
+                        "daemon_running": computer_running,
+                        "last_local_signal_at": ms_to_iso(safe_int(computer.get("signal_ms"))),
+                        "last_change_at": ms_to_iso(self._last_computer_change_ms),
+                        "status_basis": computer.get("status_basis"),
+                        "latest_endpoint": computer.get("latest_endpoint"),
+                    },
+                    usage={"label": computer.get("usage_label", "")} if computer.get("usage_label") else {},
+                    open_action={"type": "app", "target": self.bundle_id},
+                )
+            )
+        return tasks
 
     def _status(self, running: bool, signal_ms: int) -> str:
         now = now_ms()
@@ -1658,6 +1710,66 @@ class PerplexityAdapter:
         if endpoint:
             parts.append(str(endpoint))
         elif any(state.get(key) for key in ("prefs_mtime_ms", "cache_mtime_ms", "http_mtime_ms")):
+            parts.append("local activity")
+        return join_parts(parts, " · ")
+
+    def _daemon_running(self, commands: Iterable[str]) -> bool:
+        return any(
+            ci_contains(self.daemon_bundle_fragment, line) and ci_contains(f"/MacOS/{self.daemon_binary_name}", line)
+            for line in commands
+        )
+
+    def _computer_state(self, daemon_running: bool) -> Dict[str, Any]:
+        latest_path, signal_ms = self._latest_path_mtime(self.computer_paths)
+        latest_endpoint = ""
+        for path in self.computer_cache_dbs:
+            row = self._safe_latest_cache_row(path)
+            if not row:
+                continue
+            endpoint = self._sanitize_endpoint(str(row[0] or ""))
+            if endpoint:
+                latest_endpoint = endpoint
+                break
+        signature = json.dumps(
+            {
+                "daemon": daemon_running,
+                "signal": signal_ms,
+                "path": latest_path,
+                "endpoint": latest_endpoint,
+            },
+            sort_keys=True,
+        )
+        now = now_ms()
+        if self._last_computer_signature and signature != self._last_computer_signature:
+            self._last_computer_change_ms = now
+        self._last_computer_signature = signature
+
+        return {
+            "available": daemon_running or bool(signal_ms),
+            "signal_ms": signal_ms,
+            "latest_path": latest_path,
+            "latest_endpoint": latest_endpoint,
+            "status_basis": "Perplexity macv3 daemon/cache activity",
+            "usage_label": "computer daemon" if daemon_running else "",
+        }
+
+    def _computer_status(self, daemon_running: bool, signal_ms: int) -> str:
+        now = now_ms()
+        if (
+            daemon_running
+            and self._last_computer_change_ms
+            and now - self._last_computer_change_ms < PERPLEXITY_COMPUTER_RUNNING_STALE_MS
+        ):
+            return "running"
+        if daemon_running and signal_ms and now - signal_ms < PERPLEXITY_COMPUTER_RUNNING_STALE_MS:
+            return "running"
+        if signal_ms and now - signal_ms < ACTIVE_MINUTES * 60 * 1000:
+            return "recent"
+        return "idle"
+
+    def _computer_subtitle(self, daemon_running: bool, state: Dict[str, Any]) -> str:
+        parts = ["daemon" if daemon_running else "daemon idle"]
+        if state.get("signal_ms"):
             parts.append("local activity")
         return join_parts(parts, " · ")
 
@@ -1688,24 +1800,25 @@ class PerplexityAdapter:
         state.update(prefs)
         cache = self._read_cache_hint()
         state.update(cache)
-        http_mtime = self._path_mtime_ms(self.http_storage)
+        http_mtime = self._latest_mtime_ms(self.http_storages)
         if http_mtime:
             state["http_mtime_ms"] = http_mtime
         state["status_basis"] = "local preferences + WebKit cache mtimes" if state else "app process only"
         return state
 
     def _read_preferences(self) -> Dict[str, Any]:
-        if not os.path.exists(self.pref_path):
+        pref_path = next((path for path in self.pref_paths if os.path.exists(path)), self.pref_paths[0])
+        if not os.path.exists(pref_path):
             return self._read_preferences_with_defaults()
-        path = self.pref_path
+        path = pref_path
         temp_dir: Optional[tempfile.TemporaryDirectory[str]] = None
         try:
             temp_dir = tempfile.TemporaryDirectory(prefix="sticks3-pplx-pref-")
             copy_path = os.path.join(temp_dir.name, "preferences.plist")
-            shutil.copy2(self.pref_path, copy_path)
+            shutil.copy2(pref_path, copy_path)
             path = copy_path
         except Exception:
-            path = self.pref_path
+            path = pref_path
         try:
             with open(path, "rb") as fh:
                 data = plistlib.load(fh)
@@ -1718,36 +1831,38 @@ class PerplexityAdapter:
         if not isinstance(data, dict):
             return self._read_preferences_with_defaults()
         return {
-            "prefs_mtime_ms": self._path_mtime_ms(self.pref_path),
+            "prefs_mtime_ms": self._path_mtime_ms(pref_path),
             "local_query_count": safe_int(data.get("ThreadViewModel.localQueryCount")),
             "local_deep_research_query_count": safe_int(data.get("localDeepResearchQueryCount")),
             "local_query_count_for_prompt": safe_int(data.get("localQueryCountForPrompt")),
         }
 
     def _read_preferences_with_defaults(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"prefs_mtime_ms": self._path_mtime_ms(self.pref_path)}
+        out: Dict[str, Any] = {"prefs_mtime_ms": self._latest_mtime_ms(self.pref_paths)}
         fields = {
             "ThreadViewModel.localQueryCount": "local_query_count",
             "localDeepResearchQueryCount": "local_deep_research_query_count",
             "localQueryCountForPrompt": "local_query_count_for_prompt",
         }
-        for key, target in fields.items():
-            code, stdout, _ = run(["/usr/bin/defaults", "read", "ai.perplexity.mac", key], timeout=1)
-            if code == 0 and stdout.strip():
-                out[target] = safe_int(stdout.strip())
+        for domain in ("ai.perplexity.macv3", "ai.perplexity.mac"):
+            for key, target in fields.items():
+                if target in out:
+                    continue
+                code, stdout, _ = run(["/usr/bin/defaults", "read", domain, key], timeout=1)
+                if code == 0 and stdout.strip():
+                    out[target] = safe_int(stdout.strip())
         return out
 
     def _read_cache_hint(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
-        cache_mtime = self._path_mtime_ms(self.cache_db)
+        cache_mtime = self._latest_mtime_ms(self.cache_dbs)
         if cache_mtime:
             out["cache_mtime_ms"] = cache_mtime
-        if not os.path.exists(self.cache_db):
-            return out
-        try:
-            row = self._latest_cache_row(self.cache_db)
-        except Exception:
-            row = self._latest_cache_row_from_copy()
+        row = None
+        for path in self.cache_dbs:
+            row = self._safe_latest_cache_row(path)
+            if row:
+                break
         if not row:
             return out
         endpoint = self._sanitize_endpoint(str(row[0] or ""))
@@ -1758,6 +1873,14 @@ class PerplexityAdapter:
             out["latest_cache_ms"] = latest_ms
         return out
 
+    def _safe_latest_cache_row(self, path: str) -> Optional[Tuple[Any, Any]]:
+        if not os.path.exists(path):
+            return None
+        try:
+            return self._latest_cache_row(path)
+        except Exception:
+            return self._latest_cache_row_from_copy(path)
+
     def _latest_cache_row(self, path: str) -> Optional[Tuple[Any, Any]]:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
@@ -1765,7 +1888,12 @@ class PerplexityAdapter:
                 """
                 select request_key, time_stamp
                 from cfurl_cache_response
-                where request_key like '%perplexity%' or request_key like '%pplx%'
+                where (request_key like '%perplexity%' or request_key like '%pplx%')
+                  and request_key not like '%favicon%'
+                  and request_key not like '%gstatic.com%'
+                  and request_key not like '%r2cdn.perplexity.ai/source%'
+                  and request_key not like '%frontend-cdn.perplexity.ai/_agi_assets%'
+                  and request_key not like '%cloudfront.net/thumbnails%'
                 order by time_stamp desc
                 limit 1
                 """
@@ -1773,13 +1901,13 @@ class PerplexityAdapter:
         finally:
             con.close()
 
-    def _latest_cache_row_from_copy(self) -> Optional[Tuple[Any, Any]]:
+    def _latest_cache_row_from_copy(self, path: str) -> Optional[Tuple[Any, Any]]:
         with tempfile.TemporaryDirectory(prefix="sticks3-pplx-cache-") as tmp:
             copy_path = os.path.join(tmp, "Cache.db")
             try:
-                shutil.copy2(self.cache_db, copy_path)
+                shutil.copy2(path, copy_path)
                 for suffix in ("-wal", "-shm"):
-                    src = f"{self.cache_db}{suffix}"
+                    src = f"{path}{suffix}"
                     if os.path.exists(src):
                         shutil.copy2(src, f"{copy_path}{suffix}")
             except OSError:
@@ -1789,13 +1917,35 @@ class PerplexityAdapter:
             except Exception:
                 return None
 
+    def _latest_mtime_ms(self, paths: Iterable[str]) -> int:
+        return max((self._path_mtime_ms(path) for path in paths), default=0)
+
+    def _latest_path_mtime(self, paths: Iterable[str]) -> Tuple[str, int]:
+        latest_path = ""
+        latest_ms = 0
+        for path in paths:
+            mtime = self._path_mtime_ms(path)
+            if mtime > latest_ms:
+                latest_path = path
+                latest_ms = mtime
+        return latest_path, latest_ms
+
     def _path_mtime_ms(self, path: str) -> int:
         mtimes = []
-        for item in [path, f"{path}-wal", f"{path}-shm"]:
+        if os.path.isdir(path):
             try:
-                mtimes.append(int(os.path.getmtime(item) * 1000))
+                for name in os.listdir(path):
+                    item = os.path.join(path, name)
+                    if os.path.isfile(item):
+                        mtimes.append(int(os.path.getmtime(item) * 1000))
             except OSError:
-                continue
+                pass
+        else:
+            for item in [path, f"{path}-wal", f"{path}-shm"]:
+                try:
+                    mtimes.append(int(os.path.getmtime(item) * 1000))
+                except OSError:
+                    continue
         return max(mtimes) if mtimes else 0
 
     def _parse_cache_time(self, value: Any) -> int:
