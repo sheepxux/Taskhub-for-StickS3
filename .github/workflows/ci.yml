@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  host-tests:
+    name: Host adapter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Pure stdlib unittest — no dependencies to install.
+      - name: Run adapter regression tests
+        run: python3 -m unittest discover -s host/tests -v
+      - name: Byte-compile host
+        run: python3 -m py_compile host/task_hub.py
+
+  firmware-build:
+    name: Firmware compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - name: Install ESP32 core + libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.8
+          arduino-cli lib install M5Unified ArduinoJson
+      - name: Provide placeholder secrets.h
+        run: cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
+      # Use the repo's custom partition table (firmware/task_monitor/partitions.csv),
+      # the same scheme the device is flashed with — the firmware is larger than
+      # the stock 1.3MB app slot, so a big-app layout is required.
+      - name: Compile task_monitor
+        run: |
+          arduino-cli compile \
+            -b "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=custom,PSRAM=opi" \
+            firmware/task_monitor
