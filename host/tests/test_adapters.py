@@ -199,5 +199,68 @@ class CodexSessionScan(unittest.TestCase):
             th._CODEX_SESSION_CACHE.pop(path, None)
 
 
+class ExternalIngest(unittest.TestCase):
+    def test_accepts_single_task_and_lists_it(self):
+        ext = th.ExternalTaskAdapter()
+        ok, _, n = ext.ingest({"source": "Gemini", "title": "Refactor pricing page", "status": "running"})
+        self.assertTrue(ok)
+        self.assertEqual(n, 1)
+        tasks = ext.list_tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["source"], "Gemini")
+        self.assertEqual(tasks[0]["title"], "Refactor pricing page")
+        self.assertEqual(tasks[0]["status"], "running")
+        self.assertTrue(tasks[0]["id"].startswith("ext-"))
+
+    def test_accepts_batch(self):
+        ext = th.ExternalTaskAdapter()
+        ok, _, n = ext.ingest({"tasks": [
+            {"source": "Lovable", "title": "Build landing page"},
+            {"source": "Perplexity", "title": "Research competitors", "status": "waiting"},
+        ]})
+        self.assertTrue(ok)
+        self.assertEqual(n, 2)
+        self.assertEqual(len(ext.list_tasks()), 2)
+
+    def test_rejects_missing_fields(self):
+        ext = th.ExternalTaskAdapter()
+        ok, _, n = ext.ingest({"source": "Gemini"})           # no title
+        self.assertTrue(ok)        # call succeeds…
+        self.assertEqual(n, 0)     # …but nothing accepted
+        self.assertEqual(len(ext.list_tasks()), 0)
+
+    def test_rejects_garbage_payload(self):
+        ext = th.ExternalTaskAdapter()
+        ok, _, n = ext.ingest("not a task")
+        self.assertFalse(ok)
+
+    def test_refresh_updates_same_id(self):
+        ext = th.ExternalTaskAdapter()
+        ext.ingest({"id": "ext-x", "source": "Gemini", "title": "First", "status": "running"})
+        ext.ingest({"id": "ext-x", "source": "Gemini", "title": "Second", "status": "done"})
+        tasks = ext.list_tasks()
+        self.assertEqual(len(tasks), 1)            # same id → replaced, not duplicated
+        self.assertEqual(tasks[0]["title"], "Second")
+        self.assertEqual(tasks[0]["status"], "done")
+
+    def test_waiting_sets_attention(self):
+        ext = th.ExternalTaskAdapter()
+        ext.ingest({"source": "Lovable", "title": "Need API key", "status": "waiting"})
+        self.assertTrue(ext.list_tasks()[0]["needs_attention"])
+
+    def test_expired_tasks_drop_out(self):
+        ext = th.ExternalTaskAdapter()
+        ext.ingest({"source": "Gemini", "title": "Quick task", "ttl_sec": 1})
+        # Force expiry by rewinding the stored expiry timestamp into the past.
+        for entry in ext._store.values():
+            entry["expires_ms"] = th.now_ms() - 1
+        self.assertEqual(len(ext.list_tasks()), 0)
+
+    def test_url_becomes_open_action(self):
+        ext = th.ExternalTaskAdapter()
+        ext.ingest({"source": "Lovable", "title": "Open project", "url": "https://lovable.dev/p/123"})
+        self.assertEqual(ext.list_tasks()[0]["_open"], {"type": "url", "target": "https://lovable.dev/p/123"})
+
+
 if __name__ == "__main__":
     unittest.main()

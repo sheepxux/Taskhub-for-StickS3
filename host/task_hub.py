@@ -3927,8 +3927,82 @@ class PeerManager:
         }
 
 
+EXTERNAL_TASK_TTL_MS = int(os.environ.get("TASK_HUB_EXTERNAL_TTL_MS", "90000"))
+EXTERNAL_MAX_TASKS = int(os.environ.get("TASK_HUB_EXTERNAL_MAX", "50"))
+
+
+class ExternalTaskAdapter:
+    """Holds tasks pushed in over POST /ingest — e.g. a browser extension that
+    reads web-app task titles the Host cannot see locally (Gemini, Lovable,
+    plain Perplexity). Each task carries its own ttl and expires unless the
+    pusher refreshes it, so a closed tab or stopped script ages out on its own.
+
+    Thread-safe: the HTTP server is threaded, so ingest (writer) and list_tasks
+    (reader, from the aggregator) can run concurrently."""
+
+    source = "External"
+
+    def __init__(self) -> None:
+        self._store: Dict[str, Dict[str, Any]] = {}  # id -> {"kwargs", "expires_ms"}
+        self._lock = threading.Lock()
+
+    def ingest(self, payload: Any) -> Tuple[bool, str, int]:
+        if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
+            items = payload["tasks"]
+        elif isinstance(payload, dict):
+            items = [payload]
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            return False, "expected a task object or {\"tasks\":[...]}", 0
+
+        now = now_ms()
+        accepted = 0
+        with self._lock:
+            for raw in items:
+                if not isinstance(raw, dict):
+                    continue
+                source = str(raw.get("source") or "").strip()
+                title = str(raw.get("title") or "").strip()
+                if not source or not title:
+                    continue  # source + title are the minimum to be useful
+                raw_id = str(raw.get("id") or "").strip() or (source + "|" + title)
+                tid = raw_id if raw_id.startswith("ext-") else stable_id("ext", raw_id)
+                ttl = safe_int(raw.get("ttl_sec")) * 1000 or EXTERNAL_TASK_TTL_MS
+                url = str(raw.get("url") or "").strip()
+                status = normalize_status(str(raw.get("status") or "running"))
+                kwargs = {
+                    "task_id": tid,
+                    "source": source,
+                    "title": title[:200],
+                    "status": status,
+                    "updated_ms": safe_ms(raw.get("updated_ms")) or now,
+                    "subtitle": str(raw.get("subtitle") or "")[:200],
+                    "detail": {"via": "ingest", **(raw.get("detail") if isinstance(raw.get("detail"), dict) else {})},
+                    "usage": raw.get("usage") if isinstance(raw.get("usage"), dict) else None,
+                    "open_action": {"type": "url", "target": url} if url else None,
+                    "needs_attention": bool(raw.get("needs_attention")) or status == "waiting",
+                }
+                self._store[tid] = {"kwargs": kwargs, "expires_ms": now + ttl}
+                accepted += 1
+            # Cap memory: keep the entries that expire latest (freshest pushers).
+            if len(self._store) > EXTERNAL_MAX_TASKS:
+                kept = sorted(self._store.items(), key=lambda kv: kv[1]["expires_ms"], reverse=True)[:EXTERNAL_MAX_TASKS]
+                self._store = dict(kept)
+        return True, "ok", accepted
+
+    def list_tasks(self) -> List[Task]:
+        now = now_ms()
+        with self._lock:
+            live = {tid: v for tid, v in self._store.items() if v["expires_ms"] > now}
+            self._store = live  # prune expired in place
+            # Rebuild via task() so age_sec/updated_at are fresh each read.
+            return [task(**v["kwargs"]) for v in live.values()]
+
+
 class Hub:
     def __init__(self, token: str = DEFAULT_TOKEN, http_port: int = DEFAULT_PORT, discovery_port: int = DEFAULT_DISCOVERY_PORT) -> None:
+        self.external = ExternalTaskAdapter()
         self.adapters = [
             OpenClawAdapter(),
             ClaudeAdapter(),
@@ -3937,6 +4011,7 @@ class Hub:
             PerplexityAdapter(),
             GeminiAdapter(),
             LovableAdapter(),
+            self.external,
         ]
         self.cache: List[Task] = []
         self.cache_at = 0
@@ -3980,6 +4055,11 @@ class Hub:
         self.cache = sorted(dedup.values(), key=sort_key)[:MAX_TASKS]
         self.cache_at = now_ms()
         return self.cache
+
+    def ingest(self, payload: Any) -> Tuple[bool, str, int]:
+        result = self.external.ingest(payload)
+        self.cache_at = 0  # force the next /tasks read to include the new push
+        return result
 
     def find_task(self, task_id: str) -> Optional[Task]:
         for item in self.list_tasks():
@@ -4225,6 +4305,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == "/ingest":
+            if not self.authorized():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > 256 * 1024:
+                self.send_json(400, {"ok": False, "error": "missing or oversized body"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+            except (json.JSONDecodeError, ValueError):
+                self.send_json(400, {"ok": False, "error": "invalid JSON"})
+                return
+            ok, message, accepted = self.hub.ingest(payload)
+            self.send_json(200 if ok else 400, {"ok": ok, "accepted": accepted, "message": message})
+            return
+
         match = re.fullmatch(r"/tasks/([^/]+)/(open|open-native)", parsed.path)
         if not match:
             self.send_json(404, {"ok": False, "error": "not found"})

@@ -13,21 +13,29 @@ no local file to read.
 A browser extension is the only way to read the real on-page task title: it runs
 inside the page and can read the DOM directly.
 
-## Current Host ingest gap (grounded)
+## Host ingest endpoint (implemented)
 
-As of v1.1.1 the Host exposes **no inbound task endpoint**. Routes today:
+`POST /ingest` now exists (token-gated, backed by `ExternalTaskAdapter`).
+Push a single task or a batch; each entry lives for a TTL (default 90s) and
+ages out unless refreshed, so a closed tab disappears on its own.
 
-- `GET /health`, `GET /tasks`, `GET /tasks/:id(.json)`, `GET /peers(.json)`,
-  `GET /debug/lovable`
-- `POST /tasks/:id/open`, `POST /tasks/:id/open-native`
+```bash
+curl -X POST http://127.0.0.1:5577/ingest \
+  -H "X-Device-Token: $TOKEN" \
+  -d '{"source":"Gemini","title":"Refactor pricing page","status":"running","url":"https://gemini.google.com/app/abc"}'
+# -> {"ok":true,"accepted":1,"message":"ok"}
+```
 
-So step one for any extension path is a new **`POST /ingest`** endpoint that
-accepts externally-sourced tasks. The existing `task()` schema is already a
-clean target:
+Accepted fields (only `source` + `title` are required):
 
 ```json
-{ "id", "source", "title", "status", "updated_ms", "subtitle", "detail", "usage" }
+{ "id?", "source", "title", "status?", "subtitle?", "url?",
+  "updated_ms?", "ttl_sec?", "needs_attention?", "detail?", "usage?" }
 ```
+
+Batch form: `{"tasks": [ {...}, {...} ]}`. The ingested task merges into
+`/tasks` alongside the local adapters. This means the extension is now the
+only remaining piece — the Host side is done.
 
 ## Architecture
 
