@@ -2,6 +2,8 @@
 
 A pocket hardware dashboard for AI agent work across your Macs.
 
+[简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
+
 [![Release](https://img.shields.io/badge/release-v1.1.1-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
@@ -156,6 +158,8 @@ flowchart LR
 
 ## Quick Start
 
+For the full installation guide, see [INSTALL.md](INSTALL.md).
+
 ### 1. Install requirements
 
 - macOS
@@ -171,7 +175,7 @@ flowchart LR
 ```bash
 git clone https://github.com/sheepxux/Taskhub-for-StickS3.git
 cd Taskhub-for-StickS3
-./host/install_task_hub.sh
+./scripts/setup.sh
 ```
 
 Check the Host:
@@ -192,7 +196,23 @@ It also creates or reuses the device token at:
 ~/Library/Application Support/StickS3TaskHub/token
 ```
 
-### 3. Configure the firmware
+The setup helper installs or repairs the Host, creates
+`firmware/task_monitor/secrets.h`, syncs the shared token, and prompts for Wi-Fi
+values if needed.
+
+To install Arduino dependencies and compile firmware:
+
+```bash
+./scripts/setup.sh --deps --compile
+```
+
+To compile and upload while the StickS3 is plugged in:
+
+```bash
+./scripts/setup.sh --deps --upload
+```
+
+### 3. Configure the firmware manually
 
 ```bash
 cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
@@ -348,6 +368,8 @@ firmware/flash_task_monitor.sh
 host/task_hub.py         Local macOS Host
 host/install_task_hub.sh LaunchAgent installer/repair script
 host/README.md           Host diagnostics and adapter notes
+scripts/setup.sh         First-run setup helper
+INSTALL.md               Full installation and troubleshooting guide
 docs/                    Device screen renders
 CHANGELOG.md             Release notes
 ```

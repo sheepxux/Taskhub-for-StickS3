@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `INSTALL.md` with full first-run, manual, multi-Mac, update, uninstall, and troubleshooting instructions.
+- `scripts/setup.sh` for conservative first-run setup, token sync, firmware secret generation, optional Arduino dependency install, compile, and upload.
+- `README.zh-CN.md` as a Chinese project landing page.
+
+### Changed
+
+- README now links to the Chinese version and the installation guide, and uses the setup helper in Quick Start.
+
 ## v1.1.1
 
 Multi-device diagnostics release.
