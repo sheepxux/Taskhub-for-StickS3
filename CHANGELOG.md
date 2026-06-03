@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.1.1
+
+Multi-device diagnostics release.
+
+### Added
+
+- `/peers` HTML page for LAN Host discovery and fetch diagnostics.
+- `/peers.json` for machine-readable peer status, task counts, latency, and last errors.
+- `/debug/lovable` for Lovable app/browser status inputs, including renderer CPU and running-state basis.
+
+### Changed
+
+- Peer aggregation now records successful empty task lists separately from fetch failures.
+- Health and peer diagnostics report TaskHub version `1.1.1`.
+- README rebuilt as a public project landing page with setup, source accuracy,
+  diagnostics, privacy, troubleshooting, and roadmap sections.
+
+## v1.1.0
+
+Multi-device TaskHub release.
+
+### Added
+
+- LAN peer discovery between authorized TaskHub Hosts using the existing UDP discovery channel.
+- Host aggregation of peer `/tasks?scope=local` task lists so one StickS3 can show tasks across Macs.
+- Remote task open forwarding: BtnA on a remote task asks the original Mac Host to open the source app.
+- Device identity fields (`device_id`, `device_name`, `device_label`) in health, full task, and compact StickS3 payloads.
+- StickS3 display support for `Source@Device` labels.
+- Lovable desktop app detection, renderer-CPU running heuristic, and orange-red Lovable icon.
+
+### Changed
+
+- `/tasks` now returns aggregated local + peer tasks by default; use `scope=local` for only this Mac.
+- The compact StickS3 payload includes `d` for the source device label.
+
 ## v1.0.1
 
 Documentation polish release.

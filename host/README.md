@@ -34,6 +34,9 @@ Useful checks:
 ```bash
 curl http://127.0.0.1:5577/health
 curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/tasks?format=stick&limit=8'
+curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/tasks?scope=local&limit=8'
+curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/peers.json'
+curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/debug/lovable'
 ```
 
 Discovery check:
@@ -73,6 +76,22 @@ Button behavior:
 
 The local detail page remains available in the browser at `/tasks/:id`.
 
+Multi-device mode:
+
+- Install this Host on every Mac you want to include.
+- Use the same `TASK_HUB_TOKEN` / firmware `DEVICE_TOKEN` on each Mac.
+- Each Host announces `TASK_HUB_DEVICE_NAME` and `TASK_HUB_DEVICE_ID` in UDP discovery.
+- Any Host can aggregate peers: it fetches `/tasks?scope=local` from discovered
+  peers and rewrites remote IDs so BtnA can forward open requests back to the
+  original Mac.
+- Disable peer aggregation with `TASK_HUB_ENABLE_PEERS=0`.
+- Tune LAN polling with `TASK_HUB_PEER_DISCOVERY_MS`, `TASK_HUB_PEER_CACHE_MS`,
+  `TASK_HUB_PEER_DISCOVERY_TIMEOUT_MS`, and `TASK_HUB_PEER_HTTP_TIMEOUT_MS`.
+- Open `/peers` locally to inspect discovered Hosts, fetch latency, task count,
+  last success, and the latest error for each peer.
+- Use `/debug/lovable` to inspect Lovable renderer CPU, browser-tab signals,
+  and the specific basis used for `RUN` versus `REC`.
+
 Power behavior:
 
 - The device wakes, fetches tasks, shows them briefly, then enters deep sleep.
@@ -90,7 +109,10 @@ Current stable build:
 
 - `ENABLE_DEEP_SLEEP` defaults to `1`. The device wakes, fetches the list, stays briefly interactive, then sleeps again. Override `ENABLE_DEEP_SLEEP` to `0` in `secrets.h` for UI/network debugging.
 - Codex, Claude Code, and OpenClaw tasks include local token/turn or session usage when their logs expose it. OpenClaw uses its local task registry and session status instead of process-open detection.
+- Codex and Claude Code can mark recent assistant questions or explicit confirmation prompts as `WAIT`; the StickS3 keeps the display on and refreshes while a visible `WAIT` task exists.
 - Claude Code status is based on transcript turn state plus the matching `claude --resume` process. Active tool-use turns stay `RUN` even when a long tool call does not append transcript lines for several minutes. The compact subtitle uses `folder · tN · state` to fit the StickS3 screen.
 - Manus is read from local app storage (`Local Storage/leveldb`) when the `classic-level` Node dependency is available to the hub. It uses local `sessions_detail`, `task_finished`, timestamps, and session usage counters; no message body or auth token is returned by the API. To keep the StickS3 list usable, Manus history is capped by `TASK_HUB_MANUS_MAX_SESSIONS` (default `3`).
 - Perplexity uses local preferences for query counters when macOS allows the background hub to read them, and WebKit cache/WAL mtimes for recent activity. It marks `RUN` only when the hub observes those local signals change during polling; otherwise it stays `REC` or `IDLE` because no stable local task transcript or task database has been found yet.
+- Gemini uses the local Gemini app process plus settings/log/cache mtimes, and also scans browser tabs for `gemini.google.com` in Safari, Chrome, Arc, Edge, Brave, and Chromium. When a Gemini tab is visible in Safari, accessibility headings can provide the current page/task title; background tabs and Chromium browsers fall back to the tab title, often just `Gemini`. It only marks `RUN` when a visible browser signal such as a stop-generation control is exposed.
+- Lovable detects `Lovable.app` (`dev.lovable.build`) through its app process, renderer CPU, and local `lovable-desktop` storage/cache mtimes, and also scans browser tabs for `lovable.dev` in Safari, Chrome, Arc, Edge, Brave, and Chromium. It shows up to `TASK_HUB_LOVABLE_MAX_TABS=3` open Lovable project tabs, opens the original app or tab URL from BtnA, and marks `RUN` when a visible page exposes generation/building controls or when the Lovable renderer exceeds `TASK_HUB_LOVABLE_RENDERER_RUN_CPU=8.0`; app-only local cache activity stays `REC`.
 - StickS3 hides old display-only tasks without deleting them on the Mac. Defaults: `DONE`/`IDLE` after 10 minutes, `REC` after 1 hour, `RUN`/`WAIT`/`FAIL` never. Override with `STICK_HIDE_DONE_AFTER_SEC`, `STICK_HIDE_IDLE_AFTER_SEC`, `STICK_HIDE_RECENT_AFTER_SEC`, and `STICK_HIDE_UNKNOWN_AFTER_SEC`.

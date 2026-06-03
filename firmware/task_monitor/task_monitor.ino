@@ -67,7 +67,11 @@ static constexpr int C_GRAY = TFT_DARKGREY;
 static constexpr int C_GREEN = TFT_GREEN;
 static constexpr int C_AMBER = TFT_ORANGE;
 static constexpr int C_RED = TFT_RED;
+static constexpr int C_LOVABLE_RED = 0xFA20;
+static constexpr int C_LOVABLE_ORANGE = 0xFD20;
+static constexpr int C_LOVABLE_SHADOW = 0x5BFF;
 static constexpr int C_BLUE = 0x5BDF;
+static constexpr int C_CARD = 0x1082;
 
 static constexpr int MAX_TASKS = 10;
 // Tightened: with a cached BSSID hint, a healthy join lands in <1s and the hub
@@ -122,6 +126,10 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 #define AWAKE_REFRESH_ACTIVE_MS 5000
 #endif
 
+#if !defined(AWAKE_REFRESH_WAIT_MS)
+#define AWAKE_REFRESH_WAIT_MS 5000
+#endif
+
 #if !defined(MANUAL_SELECTION_HOLD_MS)
 #define MANUAL_SELECTION_HOLD_MS 10000
 #endif
@@ -173,6 +181,7 @@ struct AiTask {
   String status;
   String subtitle;
   String usage;
+  String device;
   bool attention = false;
   uint32_t ageSec = 0;
 };
@@ -182,11 +191,13 @@ static int taskCount = 0;
 static int selected = 0;
 static int activeCount = 0;
 static int attentionCount = 0;
+static int waitCount = 0;
 static int totalCount = 0;
 static int hiddenCount = 0;
 static int battPct = 100;
 static bool wifiOk = false;
 static bool wokeByTimer = false;
+static bool wokeFromSleep = false;
 static uint32_t lastInputAt = 0;
 static uint32_t lastManualSelectAt = 0;
 static uint32_t lastRefreshAt = 0;
@@ -203,6 +214,12 @@ static bool btnBClickEvent = false;
 static bool btnBHoldEvent = false;
 static uint32_t btnBLastChangeAt = 0;
 static uint32_t btnBPressedAt = 0;
+static bool bootScreenActive = false;
+static String bootStatusText;
+
+static void setBootStatus(const String& text, int color);
+static void topBar();
+static void centerText(const String& text, int y, int color, const lgfx::IFont* font);
 
 static bool lowBatteryMode() {
   return battPct >= 0 && battPct <= LOW_BATTERY_THRESHOLD_PCT;
@@ -235,7 +252,7 @@ static void applyPowerProfile() {
 
 static uint32_t nextWakeSeconds() {
   if (lowBatteryMode()) return LOW_BATTERY_WAKE_SECONDS;
-  if (activeCount > 0 || attentionCount > 0) return ACTIVE_WAKE_SECONDS;
+  if (waitCount > 0 || activeCount > 0 || attentionCount > 0) return ACTIVE_WAKE_SECONDS;
   return AUTO_WAKE_SECONDS;
 }
 
@@ -245,6 +262,7 @@ static String apiBase() {
 }
 
 static uint32_t awakeRefreshMs() {
+  if (waitCount > 0) return AWAKE_REFRESH_WAIT_MS;
   return (activeCount > 0 || attentionCount > 0) ? AWAKE_REFRESH_ACTIVE_MS : AWAKE_REFRESH_IDLE_MS;
 }
 
@@ -272,9 +290,11 @@ static String urlEncode(const String& s) {
 static bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
+    setBootStatus("wifi ok", C_GREEN);
     return true;
   }
 
+  setBootStatus("wifi...", C_BLUE);
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setSleep(true);
@@ -303,6 +323,7 @@ static bool ensureWifi() {
 
   wifiOk = WiFi.status() == WL_CONNECTED;
   if (wifiOk) {
+    setBootStatus("wifi ok", C_GREEN);
     // Cache for next wake.
     const uint8_t* bssid = WiFi.BSSID();
     if (bssid) {
@@ -314,6 +335,8 @@ static bool ensureWifi() {
     // is MIN_MODEM; MAX_MODEM aligns DTIM more aggressively and trims a few
     // mA off the awake-idle window.
     esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+  } else {
+    setBootStatus("wifi failed", C_RED);
   }
   return wifiOk;
 }
@@ -324,6 +347,7 @@ static bool discoverHub(bool force) {
     return true;
   }
 
+  setBootStatus("hub...", C_BLUE);
   lastDiscoveryAt = millis();
   WiFiUDP udp;
   if (!udp.begin(0)) {
@@ -372,12 +396,14 @@ static bool discoverHub(bool force) {
     hubPort = port;
     hubDiscovered = true;
     Serial.printf("[task-monitor] discovery ok host=%s port=%d\n", hubHost.c_str(), hubPort);
+    setBootStatus("hub ok", C_GREEN);
     udp.stop();
     return true;
   }
 
   udp.stop();
   Serial.printf("[task-monitor] discovery fallback host=%s port=%d\n", hubHost.c_str(), hubPort);
+  setBootStatus("hub fallback", C_AMBER);
   return false;
 }
 
@@ -496,6 +522,10 @@ static bool isPriorityTask(const AiTask& t) {
   return t.attention || t.status == "run" || t.status == "wait" || t.status == "fail";
 }
 
+static bool hasWaitingTasks() {
+  return waitCount > 0;
+}
+
 static uint32_t hideAfterSec(const String& status) {
   if (status == "run" || status == "wait" || status == "fail") return 0;
   if (status == "done") return STICK_HIDE_DONE_AFTER_SEC;
@@ -550,12 +580,190 @@ static void updateBtnBEdge() {
   }
 }
 
+static void drawTaskHubMark(int x, int y, int scale, int color) {
+  auto px = [&](int px, int py, int w, int h) {
+    M5.Display.fillRect(x + px * scale, y + py * scale, w * scale, h * scale, color);
+  };
+
+  // 24x22 pixel computer mark derived from the TaskHub logo.
+  px(6, 1, 15, 1);
+  px(5, 2, 1, 11);
+  px(20, 2, 1, 12);
+  px(6, 13, 15, 1);
+  px(21, 3, 2, 1);
+  px(22, 4, 1, 10);
+  px(21, 14, 2, 1);
+
+  px(8, 4, 12, 1);
+  px(8, 5, 1, 8);
+  px(19, 5, 1, 8);
+  px(9, 12, 10, 1);
+  px(12, 7, 4, 1);
+  px(10, 9, 8, 1);
+  px(11, 11, 6, 1);
+
+  px(4, 14, 17, 1);
+  px(3, 15, 1, 4);
+  px(21, 15, 1, 4);
+  px(4, 18, 17, 1);
+  px(6, 16, 2, 1);
+  px(17, 16, 5, 1);
+  px(22, 15, 1, 3);
+  px(20, 19, 3, 1);
+
+  px(3, 18, 1, 1);
+  px(2, 19, 1, 1);
+  px(1, 20, 1, 1);
+  px(0, 21, 20, 1);
+  px(20, 19, 1, 1);
+  px(19, 20, 1, 1);
+}
+
+static void drawTaskHubMiniMark(int x, int y, int color) {
+  M5.Display.drawRect(x + 4, y, 9, 7, color);
+  M5.Display.drawRect(x + 5, y + 2, 7, 4, color);
+  M5.Display.drawLine(x + 13, y + 1, x + 15, y + 3, color);
+  M5.Display.drawLine(x + 15, y + 3, x + 15, y + 9, color);
+  M5.Display.drawLine(x + 4, y + 8, x + 14, y + 8, color);
+  M5.Display.drawRect(x + 3, y + 9, 13, 3, color);
+  M5.Display.drawLine(x + 3, y + 12, x + 1, y + 15, color);
+  M5.Display.drawLine(x + 16, y + 12, x + 13, y + 15, color);
+  M5.Display.drawLine(x + 1, y + 15, x + 13, y + 15, color);
+  M5.Display.drawFastHLine(x + 7, y + 3, 3, color);
+  M5.Display.drawFastHLine(x + 7, y + 5, 5, color);
+}
+
+static int sourceLogoColor(const String& source) {
+  String s = source;
+  s.toLowerCase();
+  if (s.indexOf("codex") >= 0) return C_BLUE;
+  if (s.indexOf("claude") >= 0) return C_AMBER;
+  if (s.indexOf("perplexity") >= 0) return C_WHITE;
+  if (s.indexOf("gemini") >= 0) return C_BLUE;
+  if (s.indexOf("lovable") >= 0) return C_LOVABLE_RED;
+  if (s.indexOf("manus") >= 0) return C_GREEN;
+  if (s.indexOf("openclaw") >= 0 || s.indexOf("claw") >= 0) return C_RED;
+  return C_GRAY;
+}
+
+static void drawAiSourceIcon(const String& source, int x, int y, int bg) {
+  String s = source;
+  s.toLowerCase();
+  int c = sourceLogoColor(source);
+  M5.Display.fillRect(x, y, 12, 12, bg);
+
+  if (s.indexOf("codex") >= 0) {
+    M5.Display.fillCircle(x + 4, y + 5, 3, c);
+    M5.Display.fillCircle(x + 7, y + 5, 4, c);
+    M5.Display.fillCircle(x + 8, y + 8, 3, c);
+    M5.Display.fillRect(x + 2, y + 5, 8, 6, c);
+    M5.Display.drawLine(x + 3, y + 4, x + 5, y + 6, C_WHITE);
+    M5.Display.drawLine(x + 5, y + 6, x + 3, y + 8, C_WHITE);
+    M5.Display.drawFastHLine(x + 7, y + 8, 3, C_WHITE);
+  } else if (s.indexOf("claude") >= 0) {
+    M5.Display.drawFastVLine(x + 6, y + 1, 10, c);
+    M5.Display.drawFastHLine(x + 1, y + 6, 10, c);
+    M5.Display.drawLine(x + 3, y + 3, x + 9, y + 9, c);
+    M5.Display.drawLine(x + 9, y + 3, x + 3, y + 9, c);
+  } else if (s.indexOf("perplexity") >= 0) {
+    M5.Display.drawFastVLine(x + 6, y + 0, 12, c);
+    M5.Display.drawFastHLine(x + 1, y + 6, 11, c);
+    M5.Display.drawLine(x + 2, y + 1, x + 6, y + 5, c);
+    M5.Display.drawLine(x + 10, y + 1, x + 6, y + 5, c);
+    M5.Display.drawLine(x + 2, y + 11, x + 6, y + 7, c);
+    M5.Display.drawLine(x + 10, y + 11, x + 6, y + 7, c);
+    M5.Display.drawLine(x + 2, y + 1, x + 2, y + 11, c);
+    M5.Display.drawLine(x + 10, y + 1, x + 10, y + 11, c);
+  } else if (s.indexOf("gemini") >= 0) {
+    M5.Display.fillTriangle(x + 6, y + 0, x + 8, y + 5, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 6, y + 0, x + 4, y + 5, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 6, y + 11, x + 8, y + 7, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 6, y + 11, x + 4, y + 7, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 0, y + 6, x + 5, y + 4, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 11, y + 6, x + 7, y + 4, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 0, y + 6, x + 5, y + 8, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 11, y + 6, x + 7, y + 8, x + 6, y + 6, c);
+  } else if (s.indexOf("lovable") >= 0) {
+    M5.Display.fillRect(x + 2, y + 8, 7, 3, C_LOVABLE_SHADOW);
+    M5.Display.fillCircle(x + 4, y + 4, 3, C_LOVABLE_ORANGE);
+    M5.Display.fillCircle(x + 8, y + 4, 3, C_LOVABLE_RED);
+    M5.Display.fillTriangle(x + 1, y + 5, x + 11, y + 5, x + 6, y + 11, C_LOVABLE_RED);
+    M5.Display.fillTriangle(x + 2, y + 5, x + 7, y + 5, x + 6, y + 10, C_LOVABLE_ORANGE);
+    M5.Display.drawPixel(x + 6, y + 2, C_LOVABLE_RED);
+    M5.Display.drawPixel(x + 0, y + 2, bg);
+    M5.Display.drawPixel(x + 11, y + 2, bg);
+  } else if (s.indexOf("manus") >= 0) {
+    M5.Display.drawFastVLine(x + 2, y + 2, 9, c);
+    M5.Display.drawFastVLine(x + 10, y + 2, 9, c);
+    M5.Display.drawLine(x + 3, y + 3, x + 6, y + 7, c);
+    M5.Display.drawLine(x + 9, y + 3, x + 6, y + 7, c);
+  } else if (s.indexOf("openclaw") >= 0 || s.indexOf("claw") >= 0) {
+    M5.Display.drawLine(x + 3, y + 1, x + 1, y + 0, c);
+    M5.Display.drawLine(x + 9, y + 1, x + 11, y + 0, c);
+    M5.Display.fillCircle(x + 6, y + 6, 5, c);
+    M5.Display.fillCircle(x + 1, y + 6, 2, c);
+    M5.Display.fillCircle(x + 11, y + 6, 2, c);
+    M5.Display.fillRect(x + 4, y + 10, 2, 2, c);
+    M5.Display.fillRect(x + 7, y + 10, 2, 2, c);
+    M5.Display.fillCircle(x + 4, y + 5, 1, C_BG);
+    M5.Display.fillCircle(x + 8, y + 5, 1, C_BG);
+  } else {
+    M5.Display.drawRect(x + 1, y + 1, 10, 10, c);
+    M5.Display.drawLine(x + 3, y + 9, x + 6, y + 2, c);
+    M5.Display.drawLine(x + 6, y + 2, x + 9, y + 9, c);
+    M5.Display.drawFastHLine(x + 4, y + 6, 5, c);
+  }
+}
+
+static void drawBootScreen(const String& status) {
+  bootScreenActive = true;
+  bootStatusText = "";
+  M5.Display.fillScreen(C_BG);
+  int scale = 3;
+  int iconW = 24 * scale;
+  int iconH = 22 * scale;
+  int iconX = (M5.Display.width() - iconW) / 2;
+  int iconY = 8;
+  drawTaskHubMark(iconX, iconY, scale, C_BLUE);
+
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setFont(&fonts::efontCN_16);
+  M5.Display.setTextColor(C_BLUE, C_BG);
+  M5.Display.drawString("TaskHub", M5.Display.width() / 2, iconY + iconH + 15);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextColor(C_GRAY, C_BG);
+  M5.Display.drawString("Developed by Axu", M5.Display.width() / 2, iconY + iconH + 30);
+  setBootStatus(status, C_GRAY);
+}
+
+static void drawWakeSyncScreen(const String& status) {
+  bootScreenActive = true;
+  bootStatusText = "";
+  M5.Display.fillScreen(C_BG);
+  topBar();
+  centerText("连接 Wi-Fi", 56, C_BLUE, &fonts::efontCN_16);
+  centerText("同步任务状态", 84, C_GRAY, &fonts::efontCN_12);
+  setBootStatus(status, C_GRAY);
+}
+
+static void setBootStatus(const String& text, int color) {
+  if (!bootScreenActive || text == bootStatusText) return;
+  bootStatusText = text;
+  int y = M5.Display.height() - 18;
+  M5.Display.fillRect(0, y - 4, M5.Display.width(), 22, C_BG);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextColor(color, C_BG);
+  M5.Display.drawString(text, M5.Display.width() / 2, y);
+}
+
 static void topBar() {
   M5.Display.fillRect(0, 0, M5.Display.width(), 20, C_BG);
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(C_GRAY, C_BG);
-  M5.Display.drawString("AI TASKS", 6, 6);
+  drawTaskHubMiniMark(5, 2, C_BLUE);
+  M5.Display.drawString("TaskHub", 26, 6);
 
   M5.Display.setTextDatum(top_right);
   M5.Display.setTextColor(wifiOk ? C_GREEN : C_AMBER, C_BG);
@@ -604,28 +812,34 @@ static void drawList() {
   int contentX = cardX + 14;
   int contentW = cardW - 24;
 
-  M5.Display.fillRoundRect(cardX, cardY, cardW, cardH, 7, 0x1082);
+  M5.Display.fillRoundRect(cardX, cardY, cardW, cardH, 7, C_CARD);
   M5.Display.fillRoundRect(cardX, cardY, 8, cardH, 7, col);
 
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(col, 0x1082);
+  M5.Display.setTextColor(col, C_CARD);
   M5.Display.drawString(statusLabel(t.status), contentX, cardY + 8);
-  drawFittedText(t.source, contentX + 38, cardY + 8, screenW - contentX - 94, C_GRAY, 0x1082, &fonts::Font0);
+  int sourceIconX = contentX + 38;
+  int sourceTextX = sourceIconX + 15;
+  drawAiSourceIcon(t.source, sourceIconX, cardY + 7, C_CARD);
+  String sourceLabel = t.source;
+  if (t.device.length()) sourceLabel += "@" + t.device;
+  drawFittedText(sourceLabel, sourceTextX, cardY + 8, screenW - sourceTextX - 58, C_GRAY, C_CARD, &fonts::Font0);
 
   M5.Display.setTextDatum(top_right);
-  M5.Display.setTextColor(C_GRAY, 0x1082);
+  M5.Display.setTextColor(C_GRAY, C_CARD);
   M5.Display.drawString(ageLabel(t.ageSec), screenW - 16, cardY + 8);
 
-  drawWrappedText(t.title, contentX, cardY + 28, contentW, 18, 2, C_WHITE, 0x1082, &fonts::efontCN_16);
+  drawWrappedText(t.title, contentX, cardY + 28, contentW, 18, 2, C_WHITE, C_CARD, &fonts::efontCN_16);
 
   String meta = t.subtitle.length() ? t.subtitle : t.usage;
-  drawFittedText(meta, contentX, cardY + cardH - 22, contentW, C_GRAY, 0x1082, &fonts::efontCN_12);
+  drawFittedText(meta, contentX, cardY + cardH - 22, contentW, C_GRAY, C_CARD, &fonts::efontCN_12);
 
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(t.usage.length() ? C_AMBER : (attentionCount > 0 ? C_AMBER : C_GRAY), C_BG);
   M5.Display.setTextDatum(bottom_left);
   String footerLeft = t.usage.length() ? t.usage : String(activeCount) + " active · " + String(attentionCount) + " alert";
+  if (!t.usage.length() && waitCount > 0) footerLeft += " · " + String(waitCount) + " wait";
   if (!t.usage.length() && hiddenCount > 0) footerLeft += " · " + String(hiddenCount) + " hidden";
   M5.Display.drawString(fitText(footerLeft, &fonts::Font0, screenW - 78), 6, screenH - 3);
 
@@ -651,6 +865,7 @@ static bool fetchTasks() {
   bool requestOpen = false;
   HTTPClient http;
   String url = apiBase() + "/tasks?format=stick&limit=" + String(MAX_TASKS);
+  setBootStatus("sync...", C_BLUE);
   http.begin(url);
   requestOpen = true;
   http.setTimeout(HTTP_TIMEOUT_MS);
@@ -671,6 +886,7 @@ static bool fetchTasks() {
 
   if (code != 200) {
     lastError = String("HTTP ") + String(code);
+    setBootStatus(lastError, C_RED);
     Serial.printf("[task-monitor] fetch failed: http=%d url=%s\n", code, url.c_str());
     if (requestOpen) http.end();
     return false;
@@ -683,6 +899,7 @@ static bool fetchTasks() {
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
     lastError = "JSON error";
+    setBootStatus(lastError, C_RED);
     Serial.printf("[task-monitor] fetch failed: json=%s\n", err.c_str());
     return false;
   }
@@ -692,6 +909,7 @@ static bool fetchTasks() {
   attentionCount = doc["attention"] | 0;
   taskCount = 0;
   hiddenCount = 0;
+  waitCount = 0;
 
   JsonArray arr = doc["tasks"].as<JsonArray>();
   for (JsonObject o : arr) {
@@ -711,10 +929,13 @@ static bool fetchTasks() {
     t.ageSec = ageSec;
     t.subtitle = o["sub"].as<String>();
     t.usage = o["us"].as<String>();
+    t.device = o["d"].as<String>();
+    if (t.status == "wait") waitCount++;
   }
-  Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wifi=%s ip=%s\n",
-                taskCount, hiddenCount, totalCount, activeCount, attentionCount,
+  Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d wifi=%s ip=%s\n",
+                taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount,
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+  setBootStatus("ready", C_GREEN);
   if (taskCount == 0) {
     selected = 0;
   } else if (lastManualSelectAt != 0 && millis() - lastManualSelectAt < MANUAL_SELECTION_HOLD_MS) {
@@ -797,11 +1018,22 @@ static void enterDeepSleep() {
 
 static void refreshNow() {
   drawMessage("刷新中", apiBase(), C_AMBER);
-  fetchTasks();
+  bool ok = fetchTasks();
   updateBattery();
+  if (hasWaitingTasks()) {
+    M5.Display.wakeup();
+    applyDisplayBrightness();
+    activeTimeoutMs = UINT32_MAX;
+#if ENABLE_DEEP_SLEEP
+  } else if (activeTimeoutMs == UINT32_MAX) {
+    activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
+    lastInputAt = millis();
+#endif
+  }
   lastRefreshAt = millis();
   drawList();
   lastInputAt = millis();
+  (void)ok;
 }
 
 static void handleButtons() {
@@ -846,22 +1078,29 @@ void setup() {
   hubHost = String(TASK_HUB_HOST);
   hubPort = TASK_HUB_PORT;
 
-  wokeByTimer = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
-  drawMessage("连接任务中心", apiBase(), C_BLUE);
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  wokeByTimer = wakeCause == ESP_SLEEP_WAKEUP_TIMER;
+  wokeFromSleep = wakeCause == ESP_SLEEP_WAKEUP_TIMER || wakeCause == ESP_SLEEP_WAKEUP_EXT1;
+  if (wokeFromSleep) {
+    drawWakeSyncScreen("wifi...");
+  } else {
+    drawBootScreen("boot...");
+  }
 
   bool ok = fetchTasks();
   updateBattery();
 #if ENABLE_DEEP_SLEEP
-  activeTimeoutMs = (wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS;
+  activeTimeoutMs = hasWaitingTasks() ? UINT32_MAX : ((wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS);
 #else
   activeTimeoutMs = UINT32_MAX;
 #endif
   lastInputAt = millis();
   lastRefreshAt = millis();
+  bootScreenActive = false;
   drawList();
 
-  Serial.printf("[task-monitor] up ok=%d tasks=%d active=%d attention=%d batt=%d deepSleep=%d wake=%lus bright=%u cpu=%d charge=%d\n",
-                (int)ok, taskCount, activeCount, attentionCount, battPct, (int)ENABLE_DEEP_SLEEP,
+  Serial.printf("[task-monitor] up ok=%d tasks=%d active=%d attention=%d wait=%d batt=%d deepSleep=%d wake=%lus bright=%u cpu=%d charge=%d\n",
+                (int)ok, taskCount, activeCount, attentionCount, waitCount, battPct, (int)ENABLE_DEEP_SLEEP,
                 (unsigned long)nextWakeSeconds(), displayBrightness(), POWER_SAVE_CPU_MHZ, CHARGE_CURRENT_MA);
 }
 
@@ -880,14 +1119,25 @@ void loop() {
     if (old != battPct || oldWifi != wifiOk) drawList();
   }
 
-#if !ENABLE_DEEP_SLEEP
-  if (millis() - lastRefreshAt > awakeRefreshMs() && millis() - lastInputAt > AUTO_REFRESH_INPUT_GUARD_MS) {
-    fetchTasks();
+  if ((!ENABLE_DEEP_SLEEP || hasWaitingTasks()) &&
+      millis() - lastRefreshAt > awakeRefreshMs() &&
+      millis() - lastInputAt > AUTO_REFRESH_INPUT_GUARD_MS) {
+    bool ok = fetchTasks();
     updateBattery();
+    if (hasWaitingTasks()) {
+      M5.Display.wakeup();
+      applyDisplayBrightness();
+      activeTimeoutMs = UINT32_MAX;
+#if ENABLE_DEEP_SLEEP
+    } else if (activeTimeoutMs == UINT32_MAX) {
+      activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
+      lastInputAt = millis();
+#endif
+    }
     lastRefreshAt = millis();
     drawList();
+    (void)ok;
   }
-#endif
 
   if (millis() - lastInputAt > activeTimeoutMs) {
     enterDeepSleep();

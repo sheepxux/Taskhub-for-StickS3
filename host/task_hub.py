@@ -25,7 +25,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -37,16 +39,30 @@ DEFAULT_PORT = int(os.environ.get("TASK_HUB_PORT", "5577"))
 DEFAULT_BIND = os.environ.get("TASK_HUB_BIND", "0.0.0.0")
 DEFAULT_TOKEN = os.environ.get("TASK_HUB_TOKEN", "dev-token")
 DEFAULT_DISCOVERY_PORT = int(os.environ.get("TASK_HUB_DISCOVERY_PORT", "5578"))
+TASK_HUB_VERSION = "1.1.1"
+DEVICE_NAME = os.environ.get("TASK_HUB_DEVICE_NAME") or socket.gethostname().split(".")[0] or "TaskHub"
+DEVICE_ID = os.environ.get("TASK_HUB_DEVICE_ID") or (
+    "host-" + hashlib.sha1(f"{socket.gethostname()}:{os.path.expanduser('~')}".encode("utf-8", "ignore")).hexdigest()[:12]
+)
+PEER_ENABLED = os.environ.get("TASK_HUB_ENABLE_PEERS", "1").lower() not in {"0", "false", "no", "off"}
+PEER_DISCOVERY_MS = int(os.environ.get("TASK_HUB_PEER_DISCOVERY_MS", "15000"))
+PEER_CACHE_MS = int(os.environ.get("TASK_HUB_PEER_CACHE_MS", "5000"))
+PEER_DISCOVERY_TIMEOUT_MS = int(os.environ.get("TASK_HUB_PEER_DISCOVERY_TIMEOUT_MS", "350"))
+PEER_HTTP_TIMEOUT_MS = int(os.environ.get("TASK_HUB_PEER_HTTP_TIMEOUT_MS", "1200"))
+PEER_MAX = int(os.environ.get("TASK_HUB_PEER_MAX", "8"))
 MAX_TASKS = int(os.environ.get("TASK_HUB_MAX_TASKS", "40"))
 ACTIVE_MINUTES = int(os.environ.get("TASK_HUB_ACTIVE_MINUTES", "1440"))
 TASK_CACHE_MS = int(os.environ.get("TASK_HUB_CACHE_MS", "3000"))
 CODEX_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CODEX_RUNNING_STALE_MS", "900000"))
+QUESTION_WAITING_STALE_MS = int(os.environ.get("TASK_HUB_QUESTION_WAITING_STALE_MS", "3600000"))
 # 90s default (was 15min): with process detection now reliable, the time-based
 # fallback only needs to cover the brief gap between a turn finishing and the
 # JSONL flushing its terminal stop_reason. Long-running turns stay marked as
 # running via process detection, so this short window doesn't false-negative.
 CLAUDE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLAUDE_RUNNING_STALE_MS", "90000"))
 CLAUDE_TERMINAL_STOP_REASONS = {"end_turn", "stop_sequence", "max_tokens"}
+CLAUDE_HUMAN_INPUT_TOOLS = {"AskUserQuestion"}
+CODEX_HUMAN_INPUT_FUNCTIONS = {"request_user_input"}
 OPENCLAW_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_OPENCLAW_RUNNING_STALE_MS", "1800000"))
 MANUS_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_MANUS_RUNNING_STALE_MS", "900000"))
 MANUS_MAX_SESSIONS = int(os.environ.get("TASK_HUB_MANUS_MAX_SESSIONS", "3"))
@@ -55,6 +71,17 @@ PERPLEXITY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_PERPLEXITY_RUNNING_ST
 PERPLEXITY_COMPUTER_RUNNING_STALE_MS = int(
     os.environ.get("TASK_HUB_PERPLEXITY_COMPUTER_RUNNING_STALE_MS", "3600000")
 )
+GEMINI_ACTIVITY_STALE_MS = int(os.environ.get("TASK_HUB_GEMINI_ACTIVITY_STALE_MS", str(ACTIVE_MINUTES * 60 * 1000)))
+GEMINI_BROWSER_POLL_MS = int(os.environ.get("TASK_HUB_GEMINI_BROWSER_POLL_MS", "10000"))
+LOVABLE_BROWSER_POLL_MS = int(os.environ.get("TASK_HUB_LOVABLE_BROWSER_POLL_MS", "10000"))
+LOVABLE_ACTIVITY_STALE_MS = int(os.environ.get("TASK_HUB_LOVABLE_ACTIVITY_STALE_MS", str(ACTIVE_MINUTES * 60 * 1000)))
+LOVABLE_RENDERER_RUN_CPU = float(os.environ.get("TASK_HUB_LOVABLE_RENDERER_RUN_CPU", "8.0"))
+LOVABLE_DOMAINS = tuple(
+    part.strip().lower()
+    for part in os.environ.get("TASK_HUB_LOVABLE_DOMAINS", "lovable.dev").split(",")
+    if part.strip()
+)
+LOVABLE_MAX_TABS = int(os.environ.get("TASK_HUB_LOVABLE_MAX_TABS", "3"))
 
 # Memoise the expensive Claude transcript scans. Keyed by JSONL path, value is
 # the scan result tagged with (mtime, size); a cache hit means the file hasn't
@@ -89,9 +116,33 @@ def stable_id(prefix: str, raw: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def short_device_label(name: str) -> str:
+    label = re.sub(r"\.local$", "", str(name or ""), flags=re.IGNORECASE).strip()
+    label = label.replace("MacBook-Pro", "MBP").replace("MacBook", "MB")
+    label = label.replace("Mac-Studio", "Studio").replace("Mac-mini", "Mini")
+    label = re.sub(r"[^A-Za-z0-9_-]+", "", label) or "Hub"
+    return label[:10]
+
+
+def attach_device(task_obj: Task, *, device_id: str, device_name: str, origin: str = "local") -> Task:
+    task_obj["device_id"] = device_id
+    task_obj["device_name"] = device_name
+    task_obj["device_label"] = short_device_label(device_name)
+    task_obj["origin"] = origin
+    return task_obj
+
+
 def run(args: List[str], timeout: float = 4.0) -> Tuple[int, str, str]:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def run_osascript(script: str, timeout: float = 4.0) -> Tuple[int, str, str]:
+    try:
+        proc = subprocess.run(["osascript"], input=script, capture_output=True, text=True, timeout=timeout)
         return proc.returncode, proc.stdout, proc.stderr
     except Exception as exc:
         return 1, "", str(exc)
@@ -213,6 +264,11 @@ def app_running(commands: Iterable[str], bundle_path_fragment: str, binary_name:
     return False
 
 
+def process_name_running(name: str) -> bool:
+    code, _, _ = run(["pgrep", "-x", name], timeout=0.5)
+    return code == 0
+
+
 def window_titles(app_name: str) -> List[str]:
     script = (
         f'tell application "System Events" to '
@@ -266,6 +322,120 @@ def folder_label(path: str) -> str:
 
 def join_parts(parts: Iterable[Any], sep: str = " · ") -> str:
     return sep.join(str(part) for part in parts if part not in (None, ""))
+
+
+def extract_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "")
+                if item_type in {"text", "output_text", "message"} and isinstance(item.get("text"), str):
+                    parts.append(str(item.get("text")))
+                elif item_type in {"text", "output_text", "message"} and isinstance(item.get("content"), str):
+                    parts.append(str(item.get("content")))
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        for key in ("text", "message", "content"):
+            if isinstance(value.get(key), str):
+                return str(value.get(key))
+    return ""
+
+
+def tool_use_names(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    names: List[str] = []
+    for item in value:
+        if isinstance(item, dict) and item.get("type") == "tool_use":
+            name = str(item.get("name") or "").strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def is_human_question(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if not compact or len(compact) > 1200:
+        return False
+    tail = compact[-320:].lower()
+    prompt_markers = [
+        "please confirm",
+        "please approve",
+        "confirm before",
+        "confirm this",
+        "approve this",
+        "permission",
+        "approval",
+        "should i",
+        "would you like",
+        "do you want me",
+        "which option",
+        "choose one",
+        "please choose",
+        "please provide",
+        "please reply",
+        "how should i",
+        "how would you like",
+        "what would you prefer",
+        "which would you prefer",
+        "shall i",
+        "go ahead",
+        "continue?",
+        "waiting for your",
+        "need your confirmation",
+        "need your approval",
+        "requires your",
+        "请确认",
+        "需要你确认",
+        "需要您确认",
+        "需要你批准",
+        "需要您批准",
+        "等你确认",
+        "等您确认",
+        "等你回复",
+        "等您回复",
+        "要我现在",
+        "要我继续",
+        "要不要我",
+        "是否继续",
+        "选哪个",
+        "哪个方案",
+        "哪种方案",
+        "请选择",
+        "选择一个",
+        "请提供",
+        "请回复",
+        "请告诉我",
+        "等你选择",
+        "等您选择",
+        "你希望我",
+        "您希望我",
+        "你要我",
+        "您要我",
+        "可以继续吗",
+        "继续吗",
+        "现在开始吗",
+    ]
+    return any(marker in tail for marker in prompt_markers)
+
+
+def is_waiting_for_human(latest_assistant_ms: int, latest_user_ms: int, latest_text: str) -> bool:
+    if not latest_assistant_ms or latest_assistant_ms <= latest_user_ms:
+        return False
+    if now_ms() - latest_assistant_ms > QUESTION_WAITING_STALE_MS:
+        return False
+    return is_human_question(latest_text)
+
+
+def is_unanswered_human_input_request(request_ms: int, latest_user_ms: int) -> bool:
+    if not request_ms or request_ms <= latest_user_ms:
+        return False
+    return now_ms() - request_ms <= QUESTION_WAITING_STALE_MS
 
 
 def build_usage(
@@ -362,9 +532,13 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
     latest_user_ms = 0
     latest_assistant_ms = 0
     latest_terminal_ms = 0
+    latest_human_input_request_ms = 0
+    latest_non_human_tool_use_ms = 0
     latest_stop_reason = ""
     latest_request_id = ""
     latest_turn_event_type = ""
+    latest_assistant_text_ms = 0
+    latest_assistant_text = ""
 
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -391,6 +565,16 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
                             latest_assistant_ms = event_ms
                             latest_stop_reason = stop_reason
                             latest_request_id = str(item.get("requestId") or message.get("id") or item.get("uuid") or "")
+                            content = message.get("content")
+                            tool_names = tool_use_names(content)
+                            if any(name in CLAUDE_HUMAN_INPUT_TOOLS for name in tool_names):
+                                latest_human_input_request_ms = event_ms
+                            elif tool_names:
+                                latest_non_human_tool_use_ms = event_ms
+                            text = extract_text(content)
+                            if text:
+                                latest_assistant_text_ms = event_ms
+                                latest_assistant_text = text
                             if stop_reason in CLAUDE_TERMINAL_STOP_REASONS:
                                 latest_terminal_ms = event_ms
                                 terminal_key = latest_request_id or str(item.get("uuid") or event_ms)
@@ -430,10 +614,20 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
         "latest_event_ms": latest_turn_event_ms or latest_event_ms,
         "latest_user_ms": latest_user_ms,
         "latest_assistant_ms": latest_assistant_ms,
+        "latest_assistant_text_ms": latest_assistant_text_ms,
         "latest_terminal_ms": latest_terminal_ms,
+        "latest_human_input_request_ms": latest_human_input_request_ms,
+        "latest_non_human_tool_use_ms": latest_non_human_tool_use_ms,
         "latest_stop_reason": latest_stop_reason,
         "latest_request_id": latest_request_id,
         "active_turn": active_turn,
+        "waiting_for_user": (
+            is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
+            or (
+                latest_non_human_tool_use_ms < latest_assistant_text_ms
+                and is_waiting_for_human(latest_assistant_text_ms, latest_user_ms, latest_assistant_text)
+            )
+        ),
     }
     _CLAUDE_TRANSCRIPT_CACHE[path] = scan
     return scan
@@ -468,9 +662,11 @@ def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> 
         "latest_user_ms": scan["latest_user_ms"],
         "latest_assistant_ms": scan["latest_assistant_ms"],
         "latest_terminal_ms": scan["latest_terminal_ms"],
+        "latest_human_input_request_ms": scan["latest_human_input_request_ms"],
         "latest_stop_reason": scan["latest_stop_reason"],
         "latest_request_id": scan["latest_request_id"],
         "active_turn": scan["active_turn"],
+        "waiting_for_user": scan.get("waiting_for_user", False),
     }
 
 
@@ -480,6 +676,8 @@ def claude_usage(cli_session_id: str, completed_turns: Any = None) -> Dict[str, 
 
 def claude_status(metrics: Dict[str, Any], updated_ms: Optional[int], process_running: bool = False) -> str:
     latest = safe_int(metrics.get("latest_event_ms") or updated_ms)
+    if metrics.get("waiting_for_user"):
+        return "waiting"
     if metrics.get("active_turn"):
         if process_running:
             return "running"
@@ -492,6 +690,8 @@ def claude_status(metrics: Dict[str, Any], updated_ms: Optional[int], process_ru
 
 def claude_turn_state(metrics: Dict[str, Any]) -> str:
     stop_reason = str(metrics.get("latest_stop_reason") or "")
+    if metrics.get("waiting_for_user"):
+        return "wait"
     if metrics.get("active_turn"):
         if stop_reason == "tool_use":
             return "tool"
@@ -565,6 +765,11 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
     latest_completed_turn_id = ""
     latest_completed_ms = 0
     latest_event_ms = updated_ms
+    latest_user_ms = 0
+    latest_agent_message_ms = 0
+    latest_agent_message_text = ""
+    latest_tool_call_ms = 0
+    latest_human_input_request_ms = 0
 
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -583,10 +788,39 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
                     session_id = str(payload.get("id") or session_id)
                     cwd = str(payload.get("cwd") or cwd)
                     updated_ms = iso_to_ms(payload.get("timestamp")) or updated_ms
+                elif payload_type == "user_message":
+                    latest_user_ms = event_ms or latest_user_ms
                 elif payload_type == "task_started" or item_type == "turn_context" or payload_type == "turn_context":
                     latest_turn_id = str(payload.get("turn_id") or item.get("turn_id") or latest_turn_id)
                     latest_turn_ms = safe_ms(payload.get("started_at")) or event_ms or latest_turn_ms
                     updated_ms = latest_turn_ms or event_ms or updated_ms
+                elif payload_type == "agent_message":
+                    latest_agent_message_ms = event_ms or latest_agent_message_ms
+                    latest_agent_message_text = str(payload.get("message") or latest_agent_message_text)
+                    updated_ms = event_ms or updated_ms
+                elif item_type == "response_item" and payload_type == "message":
+                    role = str(payload.get("role") or "")
+                    if role == "assistant":
+                        text = extract_text(payload.get("content"))
+                        if text:
+                            latest_agent_message_ms = event_ms or latest_agent_message_ms
+                            latest_agent_message_text = text
+                            updated_ms = event_ms or updated_ms
+                    elif role == "user":
+                        latest_user_ms = event_ms or latest_user_ms
+                elif item_type == "response_item" and payload_type in {
+                    "function_call",
+                    "custom_tool_call",
+                    "local_shell_call",
+                    "mcp_tool_call",
+                    "tool_search_call",
+                    "web_search_call",
+                    "image_generation_call",
+                }:
+                    name = str(payload.get("name") or "")
+                    if name in CODEX_HUMAN_INPUT_FUNCTIONS:
+                        latest_human_input_request_ms = event_ms or latest_human_input_request_ms
+                    latest_tool_call_ms = event_ms or latest_tool_call_ms
                 elif payload_type == "token_count":
                     info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
                     raw_usage = info.get("total_token_usage")
@@ -618,6 +852,17 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
         "latest_completed_turn_id": latest_completed_turn_id,
         "latest_completed_ms": latest_completed_ms,
         "latest_event_ms": latest_event_ms,
+        "latest_user_ms": latest_user_ms,
+        "latest_agent_message_ms": latest_agent_message_ms,
+        "latest_tool_call_ms": latest_tool_call_ms,
+        "latest_human_input_request_ms": latest_human_input_request_ms,
+        "waiting_for_user": (
+            is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
+            or (
+                latest_tool_call_ms < latest_agent_message_ms
+                and is_waiting_for_human(latest_agent_message_ms, latest_user_ms, latest_agent_message_text)
+            )
+        ),
     }
     _CODEX_SESSION_CACHE[path] = scan
     return scan
@@ -645,6 +890,8 @@ def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
         latest_completed_turn_id = scan["latest_completed_turn_id"]
         latest_completed_ms = scan["latest_completed_ms"]
         latest_event_ms = scan["latest_event_ms"]
+        latest_human_input_request_ms = scan["latest_human_input_request_ms"]
+        waiting_for_user = bool(scan.get("waiting_for_user"))
 
         indexed = index.get(session_id) or {}
         title = str(indexed.get("title") or "")
@@ -682,7 +929,9 @@ def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
                 "latest_turn_ms": latest_turn_ms,
                 "latest_completed_turn_id": latest_completed_turn_id,
                 "latest_completed_ms": latest_completed_ms,
+                "latest_human_input_request_ms": latest_human_input_request_ms,
                 "active_turn": bool(latest_turn_id and latest_turn_id != latest_completed_turn_id),
+                "waiting_for_user": waiting_for_user,
                 "path": path,
                 "usage": usage,
             }
@@ -736,6 +985,8 @@ def codex_subtitle(record: Dict[str, Any], fallback: str = "") -> str:
 
 def codex_status(record: Dict[str, Any], app_is_running: bool = False) -> str:
     latest = safe_int(record.get("latest_event_ms") or record.get("updated_ms"))
+    if record.get("waiting_for_user"):
+        return "waiting"
     active_turn = bool(record.get("active_turn"))
     if active_turn and latest and now_ms() - latest < CODEX_RUNNING_STALE_MS:
         return "running"
@@ -1110,6 +1361,7 @@ class ClaudeAdapter:
                         "completed_turns": item.get("completedTurns"),
                         "process_running": is_running,
                         "active_turn": bool(metrics.get("active_turn")),
+                        "waiting_for_user": bool(metrics.get("waiting_for_user")),
                         "turn_state": claude_turn_state(metrics),
                         "latest_stop_reason": metrics.get("latest_stop_reason"),
                         "latest_event_at": ms_to_iso(safe_int(metrics.get("latest_event_ms"))),
@@ -1117,6 +1369,7 @@ class ClaudeAdapter:
                     },
                     usage=usage,
                     open_action={"type": "app", "target": "com.anthropic.claudefordesktop"},
+                    needs_attention=status == "waiting",
                 )
             )
 
@@ -1141,6 +1394,7 @@ class ClaudeAdapter:
                             "session_id": resume_id,
                             "process_running": True,
                             "active_turn": bool(metrics.get("active_turn")),
+                            "waiting_for_user": bool(metrics.get("waiting_for_user")),
                             "turn_state": claude_turn_state(metrics),
                             "latest_stop_reason": metrics.get("latest_stop_reason"),
                             "latest_event_at": ms_to_iso(safe_int(metrics.get("latest_event_ms"))),
@@ -1148,6 +1402,7 @@ class ClaudeAdapter:
                         },
                         usage=metrics.get("usage") or {},
                         open_action={"type": "app", "target": "com.anthropic.claudefordesktop"},
+                        needs_attention=status == "waiting",
                     )
                 )
 
@@ -1187,9 +1442,11 @@ class CodexAdapter:
                         "folder": record.get("folder"),
                         "usage_source": usage.get("source"),
                         "app_server_count": app_server_count,
+                        "waiting_for_user": bool(record.get("waiting_for_user")),
                     },
                     usage=usage,
                     open_action={"type": "app", "target": "com.openai.codex"},
+                    needs_attention=status == "waiting",
                 )
             )
 
@@ -1219,9 +1476,11 @@ class CodexAdapter:
                         "cwd": cwd or record.get("cwd"),
                         "folder": record.get("folder") or project,
                         "usage_source": usage.get("source"),
+                        "waiting_for_user": bool(record.get("waiting_for_user")),
                     },
                     usage=usage,
                     open_action={"type": "app", "target": "com.openai.codex"},
+                    needs_attention=status == "waiting",
                 )
             )
 
@@ -1239,9 +1498,11 @@ class CodexAdapter:
                         "session_id": record.get("id"),
                         "cwd": record.get("cwd"),
                         "folder": record.get("folder"),
+                        "waiting_for_user": bool(record.get("waiting_for_user")),
                     },
                     usage=usage,
                     open_action={"type": "app", "target": "com.openai.codex"},
+                    needs_attention=bool(record.get("waiting_for_user")),
                 )
             )
         return tasks
@@ -2325,6 +2586,816 @@ class AppAdapter:
         ]
 
 
+GEMINI_SAFARI_SCRIPT = r'''
+set AppleScript's text item delimiters to " | "
+set sep to ASCII character 9
+set tabTitle to ""
+set tabUrl to ""
+set frontTitle to ""
+set frontUrl to ""
+tell application "Safari"
+  if not running then return ""
+  try
+    set frontTitle to name of current tab of front window
+    set frontUrl to URL of current tab of front window
+  on error
+    return ""
+  end try
+  set out to "FRONT" & sep & frontTitle & sep & frontUrl & linefeed
+  try
+    repeat with w in windows
+      repeat with t in tabs of w
+        set out to out & "TAB" & sep & (name of t as text) & sep & (URL of t as text) & linefeed
+      end repeat
+    end repeat
+  end try
+end tell
+if frontUrl does not contain "gemini.google.com" and frontUrl does not contain "bard.google.com" then return out
+
+tell application "System Events"
+  try
+    tell process "Safari"
+      set webArea to UI element 1 of scroll area 1 of group 1 of group 1 of tab group 1 of splitter group 1 of window 1
+      set mainGroup to group 2 of webArea
+      set out to out & "MAIN" & sep & (name of every UI element of mainGroup as text) & linefeed
+      try
+        set out to out & "NAV" & sep & (name of every UI element of group 2 of mainGroup as text) & linefeed
+      end try
+      try
+        set out to out & "PROMPT" & sep & (name of every UI element of group 3 of mainGroup as text) & linefeed
+      end try
+      try
+        set out to out & "PROMPTV" & sep & (value of every UI element of group 3 of mainGroup as text) & linefeed
+      end try
+    end tell
+  end try
+end tell
+return out
+'''
+
+GEMINI_CHROMIUM_BROWSERS = [
+    ("Google Chrome", "Chrome"),
+    ("Arc", "Arc"),
+    ("Microsoft Edge", "Edge"),
+    ("Brave Browser", "Brave"),
+    ("Chromium", "Chromium"),
+]
+
+
+class GeminiAdapter:
+    source = "Gemini"
+
+    def __init__(self) -> None:
+        self.app_name = "Gemini"
+        self.bundle_id = "com.google.GeminiMacOS"
+        self.bundle_fragment = "/Applications/Gemini.app"
+        self.binary_name = "Gemini"
+        self.launcher_fragment = "GeminiAppLauncher.app/Contents/MacOS/GeminiAppLauncher"
+        self.activity_paths = [
+            os.path.expanduser("~/Library/Application Support/com.google.GeminiMacOS/Data/minichat-settings.store"),
+            os.path.expanduser("~/Library/Application Support/com.google.GeminiMacOS/Data/minichat-settings.store-wal"),
+        ]
+        self.activity_globs = [
+            os.path.expanduser("~/Library/Caches/com.google.GeminiMacOS/Logs/diagnostic*.log"),
+            os.path.expanduser("~/Library/Caches/com.google.GeminiMacOS/Logs/launcher*.log"),
+            os.path.expanduser("~/Library/Caches/com.google.GeminiMacOS/PerformanceLogs/*.json"),
+        ]
+        self._browser_cache: Dict[str, Any] = {}
+        self._browser_cache_at = 0
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        running = self._running(commands)
+        signal_ms, signal_path = self._latest_activity()
+        browser = self._browser_state()
+        title = self.source
+        status = self._status(signal_ms)
+        subtitle = self._subtitle(running, signal_ms)
+        updated_ms = signal_ms or now_ms()
+        open_action = {"type": "app", "target": self.bundle_id}
+        status_basis = "Gemini app process + local settings/log/cache mtimes"
+
+        if browser.get("present"):
+            title = str(browser.get("title") or title or self.source)
+            status = str(browser.get("status") or status)
+            updated_ms = safe_int(browser.get("updated_ms")) or updated_ms
+            subtitle = self._browser_subtitle(browser, running)
+            status_basis = str(browser.get("status_basis") or status_basis)
+            if browser.get("url"):
+                open_action = {"type": "url", "target": str(browser.get("url"))}
+
+        return [
+            task(
+                task_id="gemini-app",
+                source=self.source,
+                title=title,
+                status=status,
+                updated_ms=updated_ms,
+                subtitle=subtitle,
+                detail={
+                    "running": running,
+                    "signal_ms": signal_ms,
+                    "signal_path": signal_path,
+                    "browser": browser.get("browser"),
+                    "browser_url": browser.get("url"),
+                    "browser_frontmost": browser.get("frontmost"),
+                    "browser_title_basis": browser.get("title_basis"),
+                    "status_basis": status_basis,
+                },
+                open_action=open_action,
+            )
+        ]
+
+    def _running(self, commands: Iterable[str]) -> bool:
+        for line in commands:
+            if not ci_contains(self.bundle_fragment, line):
+                continue
+            if ci_contains(f"/MacOS/{self.binary_name}", line) or ci_contains(self.launcher_fragment, line):
+                return True
+        return False
+
+    def _status(self, signal_ms: int) -> str:
+        if signal_ms and now_ms() - signal_ms < GEMINI_ACTIVITY_STALE_MS:
+            return "recent"
+        return "idle"
+
+    def _subtitle(self, running: bool, signal_ms: int) -> str:
+        parts = ["app open" if running else "not running"]
+        if signal_ms:
+            parts.append("local activity")
+        return join_parts(parts, " · ")
+
+    def _browser_subtitle(self, browser: Dict[str, Any], app_running_flag: bool) -> str:
+        parts = [str(browser.get("browser") or "Safari"), "web" if browser.get("frontmost") else "tab"]
+        if browser.get("running_signal"):
+            parts.append("generating")
+        elif browser.get("title_basis"):
+            parts.append("visible task")
+        elif app_running_flag:
+            parts.append("app open")
+        return join_parts(parts, " · ")
+
+    def _browser_state(self) -> Dict[str, Any]:
+        now = now_ms()
+        if self._browser_cache and now - self._browser_cache_at < GEMINI_BROWSER_POLL_MS:
+            return self._browser_cache
+
+        states: List[Dict[str, Any]] = []
+        code, out, _ = run_osascript(GEMINI_SAFARI_SCRIPT, timeout=2.0)
+        if code == 0 and out.strip():
+            state = self._parse_safari_state(out)
+            if state:
+                states.append(state)
+
+        states.extend(self._chromium_states())
+        state = self._best_browser_state(states)
+        self._browser_cache = state
+        self._browser_cache_at = now
+        return state
+
+    def _chromium_states(self) -> List[Dict[str, Any]]:
+        states: List[Dict[str, Any]] = []
+        for app_name, browser_name in GEMINI_CHROMIUM_BROWSERS:
+            if not process_name_running(app_name):
+                continue
+            script = self._chromium_script(app_name)
+            code, out, _ = run_osascript(script, timeout=1.0)
+            if code != 0 or not out.strip():
+                continue
+            state = self._parse_chromium_state(out, browser_name)
+            if state:
+                states.append(state)
+        return states
+
+    def _chromium_script(self, app_name: str) -> str:
+        return f'''
+set sep to ASCII character 9
+tell application "System Events"
+  if not (exists process "{app_name}") then return ""
+end tell
+tell application "{app_name}"
+  set out to ""
+  try
+    set out to out & "FRONT" & sep & (title of active tab of front window as text) & sep & (URL of active tab of front window as text) & linefeed
+  end try
+  try
+    repeat with w in windows
+      repeat with t in tabs of w
+        set out to out & "TAB" & sep & (title of t as text) & sep & (URL of t as text) & linefeed
+      end repeat
+    end repeat
+  end try
+  return out
+end tell
+'''
+
+    def _best_browser_state(self, states: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not states:
+            return {}
+        for state in states:
+            if state.get("title_basis"):
+                return state
+        for state in states:
+            if state.get("frontmost"):
+                return state
+        return states[0]
+
+    def _parse_safari_state(self, out: str) -> Dict[str, Any]:
+        front_is_gemini = False
+        tab_title = ""
+        tab_url = ""
+        labels: List[str] = []
+        for raw_line in out.splitlines():
+            parts = raw_line.split("\t", 2)
+            if not parts:
+                continue
+            key = parts[0]
+            if key == "FRONT" and len(parts) >= 3:
+                front_title = parts[1].strip()
+                front_url = parts[2].strip()
+                front_is_gemini = self._is_gemini_url(front_url)
+                if front_is_gemini:
+                    tab_title = front_title
+                    tab_url = front_url
+            elif key == "TAB" and len(parts) >= 3:
+                candidate_title = parts[1].strip()
+                candidate_url = parts[2].strip()
+                if not tab_url and self._is_gemini_url(candidate_url):
+                    tab_title = candidate_title
+                    tab_url = candidate_url
+            elif key in {"MAIN", "NAV", "PROMPT", "PROMPTV"} and len(parts) >= 2:
+                labels.extend(self._split_apple_list(parts[1]))
+
+        if not tab_url or not self._is_gemini_url(tab_url):
+            return {}
+
+        title, title_basis = self._browser_title(tab_title, labels)
+        running_signal = self._browser_running_signal(labels)
+        return {
+            "present": True,
+            "browser": "Safari",
+            "url": tab_url,
+            "title": title or "Gemini",
+            "title_basis": title_basis,
+            "status": "running" if running_signal else "recent",
+            "updated_ms": now_ms(),
+            "running_signal": running_signal,
+            "frontmost": front_is_gemini,
+            "status_basis": (
+                "Safari Gemini Web accessibility headings" if front_is_gemini else "Safari Gemini Web tab"
+            ),
+        }
+
+    def _parse_chromium_state(self, out: str, browser_name: str) -> Dict[str, Any]:
+        front_is_gemini = False
+        tab_title = ""
+        tab_url = ""
+        for raw_line in out.splitlines():
+            parts = raw_line.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            key, candidate_title, candidate_url = parts[0], parts[1].strip(), parts[2].strip()
+            if key == "FRONT":
+                front_is_gemini = self._is_gemini_url(candidate_url)
+                if front_is_gemini:
+                    tab_title = candidate_title
+                    tab_url = candidate_url
+            elif key == "TAB" and not tab_url and self._is_gemini_url(candidate_url):
+                tab_title = candidate_title
+                tab_url = candidate_url
+
+        if not tab_url:
+            return {}
+
+        title, title_basis = self._browser_title(tab_title, [])
+        return {
+            "present": True,
+            "browser": browser_name,
+            "url": tab_url,
+            "title": title or "Gemini",
+            "title_basis": title_basis,
+            "status": "recent",
+            "updated_ms": now_ms(),
+            "running_signal": False,
+            "frontmost": front_is_gemini,
+            "status_basis": f"{browser_name} Gemini Web tab",
+        }
+
+    def _split_apple_list(self, value: str) -> List[str]:
+        return [
+            item.strip()
+            for item in value.split(" | ")
+            if item.strip() and item.strip().lower() != "missing value"
+        ]
+
+    def _is_gemini_url(self, url: str) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower()
+        return host.endswith("gemini.google.com") or host.endswith("bard.google.com")
+
+    def _browser_title(self, tab_title: str, labels: List[str]) -> Tuple[str, str]:
+        for label in labels:
+            if self._is_useful_browser_title(label):
+                return label, "safari-accessibility"
+        if self._is_useful_browser_title(tab_title):
+            return tab_title, "safari-tab-title"
+        return "Gemini", ""
+
+    def _is_useful_browser_title(self, value: str) -> bool:
+        text = re.sub(r"\s+", " ", value or "").strip()
+        if not text:
+            return False
+        generic = {
+            "gemini",
+            "google gemini",
+            "conversation with gemini",
+            "hi chester, what's the move?",
+            "ready when you are",
+            "welcome to gemini",
+            "new chat",
+            "side navigation",
+            "main actions menu",
+            "additional actions menu",
+            "close sidebar",
+            "toggle recents",
+            "temporary chat",
+            "enter a prompt for gemini",
+        }
+        return text.lower() not in generic and len(text) <= 96
+
+    def _browser_running_signal(self, labels: List[str]) -> bool:
+        joined = " ".join(labels).lower()
+        markers = [
+            "stop generating",
+            "stop response",
+            "stop responding",
+            "cancel response",
+            "cancel generation",
+        ]
+        return any(marker in joined for marker in markers)
+
+    def _latest_activity(self) -> Tuple[int, str]:
+        candidates = list(self.activity_paths)
+        for pattern in self.activity_globs:
+            candidates.extend(glob.glob(pattern))
+
+        best_ms = 0
+        best_path = ""
+        for path in candidates:
+            try:
+                if not os.path.isfile(path):
+                    continue
+                mtime_ms = int(os.path.getmtime(path) * 1000)
+            except OSError:
+                continue
+            if mtime_ms > best_ms:
+                best_ms = mtime_ms
+                best_path = path
+        return best_ms, best_path
+
+
+class LovableAdapter:
+    source = "Lovable"
+
+    def __init__(self) -> None:
+        self.app_name = "Lovable"
+        self.bundle_id = "dev.lovable.build"
+        self.bundle_fragment = "/Applications/Lovable.app"
+        self.binary_name = "Lovable"
+        self.app_support_dir = os.path.expanduser("~/Library/Application Support/lovable-desktop")
+        self.app_activity_globs = [
+            os.path.join(self.app_support_dir, "Local Storage/leveldb/*"),
+            os.path.join(self.app_support_dir, "IndexedDB/https_lovable.dev_0.indexeddb.leveldb/*"),
+            os.path.join(self.app_support_dir, "Session Storage/*"),
+            os.path.join(self.app_support_dir, "Cookies"),
+            os.path.join(self.app_support_dir, "Network Persistent State"),
+            os.path.join(self.app_support_dir, "sentry/session.json"),
+        ]
+        self._browser_cache: List[Dict[str, Any]] = []
+        self._browser_cache_at = 0
+        self._last_app_signature = ""
+        self._last_app_change_ms = 0
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        states = self._browser_states()
+        tasks: List[Task] = []
+        app_state = self._app_state(commands)
+        if app_state.get("available"):
+            tasks.append(self._app_task(app_state))
+        for index, state in enumerate(states[:LOVABLE_MAX_TABS]):
+            url = str(state.get("url") or "https://lovable.dev/")
+            title = str(state.get("title") or "Lovable")
+            running_signal = bool(state.get("running_signal"))
+            status = "running" if running_signal else "recent"
+            subtitle = self._subtitle(state)
+            tasks.append(
+                task(
+                    task_id=stable_id("lovable", url),
+                    source=self.source,
+                    title=title,
+                    status=status,
+                    updated_ms=safe_int(state.get("updated_ms")) or now_ms(),
+                    subtitle=subtitle,
+                    detail={
+                        "browser": state.get("browser"),
+                        "browser_url": url,
+                        "browser_frontmost": state.get("frontmost"),
+                        "title_basis": state.get("title_basis"),
+                        "status_basis": state.get("status_basis"),
+                        "running_signal": running_signal,
+                        "tab_index": index + 1,
+                    },
+                    open_action={"type": "url", "target": url},
+                )
+            )
+        return tasks
+
+    def debug_snapshot(self, commands: Optional[List[str]] = None) -> Dict[str, Any]:
+        commands = commands or ps_commands()
+        app = self._app_state(commands)
+        browsers = []
+        for state in self._browser_states():
+            browsers.append(
+                {
+                    "browser": state.get("browser"),
+                    "url": state.get("url"),
+                    "title": state.get("title"),
+                    "title_basis": state.get("title_basis"),
+                    "frontmost": state.get("frontmost"),
+                    "running_signal": state.get("running_signal"),
+                    "status_basis": state.get("status_basis"),
+                }
+            )
+        return {
+            "source": self.source,
+            "bundle_id": self.bundle_id,
+            "app_support_dir": self.app_support_dir,
+            "renderer_cpu_threshold": LOVABLE_RENDERER_RUN_CPU,
+            "browser_poll_ms": LOVABLE_BROWSER_POLL_MS,
+            "max_tabs": LOVABLE_MAX_TABS,
+            "app": app,
+            "browsers": browsers,
+        }
+
+    def _app_state(self, commands: List[str]) -> Dict[str, Any]:
+        running = app_running(commands, self.bundle_fragment, self.binary_name)
+        window_names = window_titles(self.app_name) if running else []
+        labels = self._accessibility_labels(self.app_name) if running else []
+        signal_path, signal_ms = self._latest_app_activity()
+        renderer_cpu = self._renderer_cpu_percent() if running else 0.0
+        signature = json.dumps(
+            {
+                "running": running,
+                "signal_ms": signal_ms,
+                "signal_path": signal_path,
+                "window": window_names[:2],
+            },
+            sort_keys=True,
+        )
+        current_ms = now_ms()
+        if self._last_app_signature and signature != self._last_app_signature:
+            self._last_app_change_ms = current_ms
+        self._last_app_signature = signature
+        running_signal = self._running_signal(labels, " ".join(window_names))
+        cpu_running_signal = renderer_cpu >= LOVABLE_RENDERER_RUN_CPU
+        title, title_basis = self._browser_title(window_names[0] if window_names else "", labels, "")
+        if title == "Lovable" and title_basis == "":
+            title_basis = "app-window" if window_names else ""
+        return {
+            "available": running or bool(signal_ms),
+            "running": running,
+            "running_signal": running_signal,
+            "cpu_running_signal": cpu_running_signal,
+            "renderer_cpu_percent": renderer_cpu,
+            "title": title,
+            "title_basis": title_basis,
+            "window_names": window_names,
+            "signal_ms": signal_ms,
+            "signal_path": signal_path,
+            "last_change_ms": self._last_app_change_ms,
+            "status": self._app_status(running, running_signal, cpu_running_signal, signal_ms),
+        }
+
+    def _app_task(self, state: Dict[str, Any]) -> Task:
+        running = bool(state.get("running"))
+        signal_ms = safe_int(state.get("signal_ms"))
+        status = str(state.get("status") or "idle")
+        subtitle_parts = ["app open" if running else "app idle"]
+        if state.get("running_signal") or state.get("cpu_running_signal"):
+            subtitle_parts.append("generating")
+        elif signal_ms:
+            subtitle_parts.append("local activity")
+        return task(
+            task_id="lovable-app",
+            source=self.source,
+            title=str(state.get("title") or "Lovable"),
+            status=status,
+            updated_ms=signal_ms or None,
+            subtitle=join_parts(subtitle_parts, " · "),
+            detail={
+                "app_running": running,
+                "bundle_id": self.bundle_id,
+                "last_local_signal_at": ms_to_iso(signal_ms),
+                "last_change_at": ms_to_iso(safe_int(state.get("last_change_ms"))),
+                "signal_path": state.get("signal_path"),
+                "renderer_cpu_percent": round(safe_float(state.get("renderer_cpu_percent")), 1),
+                "renderer_cpu_threshold": LOVABLE_RENDERER_RUN_CPU,
+                "running_signal": bool(state.get("running_signal")),
+                "cpu_running_signal": bool(state.get("cpu_running_signal")),
+                "title_basis": state.get("title_basis"),
+                "window_names": state.get("window_names"),
+                "status_basis": (
+                    "Lovable.app accessibility generation label"
+                    if state.get("running_signal")
+                    else "Lovable.app renderer CPU"
+                    if state.get("cpu_running_signal")
+                    else "Lovable.app process + local storage/cache mtimes"
+                ),
+            },
+            open_action={"type": "app", "target": self.bundle_id},
+        )
+
+    def _app_status(self, running: bool, running_signal: bool, cpu_running_signal: bool, signal_ms: int) -> str:
+        current_ms = now_ms()
+        if running_signal or cpu_running_signal:
+            return "running"
+        if running:
+            return "recent"
+        if signal_ms and current_ms - signal_ms < LOVABLE_ACTIVITY_STALE_MS:
+            return "recent"
+        return "idle"
+
+    def _renderer_cpu_percent(self) -> float:
+        code, out, _ = run(["ps", "-axo", "pcpu=,command="], timeout=1.0)
+        if code != 0:
+            return 0.0
+        max_cpu = 0.0
+        for line in out.splitlines():
+            if "Lovable Helper (Renderer).app/Contents/MacOS/Lovable Helper (Renderer)" not in line:
+                continue
+            if "lovable-desktop" not in line:
+                continue
+            parts = line.strip().split(None, 1)
+            if not parts:
+                continue
+            try:
+                cpu = float(parts[0])
+            except ValueError:
+                continue
+            max_cpu = max(max_cpu, cpu)
+        return max_cpu
+
+    def _latest_app_activity(self) -> Tuple[str, int]:
+        best_path = ""
+        best_ms = 0
+        for pattern in self.app_activity_globs:
+            for path in glob.glob(pattern):
+                try:
+                    if not os.path.isfile(path):
+                        continue
+                    mtime_ms = int(os.path.getmtime(path) * 1000)
+                except OSError:
+                    continue
+                if mtime_ms > best_ms:
+                    best_ms = mtime_ms
+                    best_path = path
+        return best_path, best_ms
+
+    def _subtitle(self, state: Dict[str, Any]) -> str:
+        parts = [str(state.get("browser") or "Browser")]
+        parts.append("web" if state.get("frontmost") else "tab")
+        if state.get("running_signal"):
+            parts.append("generating")
+        elif state.get("title_basis"):
+            parts.append("project")
+        return join_parts(parts, " · ")
+
+    def _browser_states(self) -> List[Dict[str, Any]]:
+        now = now_ms()
+        if self._browser_cache_at and now - self._browser_cache_at < LOVABLE_BROWSER_POLL_MS:
+            return self._browser_cache
+
+        code, out, _ = run_osascript(self._browser_script(), timeout=2.5)
+        if code != 0 or not out.strip():
+            self._browser_cache = []
+            self._browser_cache_at = now
+            return []
+
+        states_by_url: Dict[str, Dict[str, Any]] = {}
+        front_process = ""
+        for raw_line in out.splitlines():
+            parts = raw_line.split("\t", 4)
+            if len(parts) < 5:
+                continue
+            kind, process_name, browser_name, tab_title, url = parts
+            url = url.strip()
+            if not self._is_lovable_url(url):
+                continue
+            frontmost = kind == "FRONT"
+            if frontmost:
+                front_process = process_name
+            state = {
+                "present": True,
+                "browser": browser_name.strip() or process_name.strip() or "Browser",
+                "process": process_name.strip(),
+                "url": url,
+                "tab_title": tab_title.strip(),
+                "frontmost": frontmost,
+                "updated_ms": now,
+                "running_signal": False,
+                "status_basis": f"{browser_name.strip() or process_name.strip()} Lovable tab",
+            }
+            existing = states_by_url.get(url)
+            if not existing or frontmost:
+                states_by_url[url] = state
+
+        states = list(states_by_url.values())
+        front_state = next((state for state in states if state.get("frontmost")), None)
+        labels: List[str] = []
+        if front_state and front_process:
+            labels = self._accessibility_labels(front_process)
+
+        for state in states:
+            state_labels = labels if state.get("frontmost") else []
+            title, basis = self._browser_title(str(state.get("tab_title") or ""), state_labels, str(state.get("url") or ""))
+            state["title"] = title
+            state["title_basis"] = basis
+            if state.get("frontmost"):
+                state["running_signal"] = self._running_signal(state_labels, str(state.get("tab_title") or ""))
+                if state_labels:
+                    state["status_basis"] = f"{state.get('browser')} Lovable accessibility labels"
+
+        states.sort(
+            key=lambda item: (
+                0 if item.get("frontmost") else 1,
+                0 if item.get("title_basis") else 1,
+                str(item.get("title") or ""),
+            )
+        )
+        self._browser_cache = states
+        self._browser_cache_at = now
+        return states
+
+    def _browser_script(self) -> str:
+        script = [
+            'set sep to ASCII character 9',
+            'set out to ""',
+            'tell application "System Events" to set runningNames to name of every process',
+            'if runningNames contains "Safari" then',
+            '  tell application "Safari"',
+            '    try',
+            '      set out to out & "FRONT" & sep & "Safari" & sep & "Safari" & sep & (name of current tab of front window as text) & sep & (URL of current tab of front window as text) & linefeed',
+            '    end try',
+            '    try',
+            '      repeat with w in windows',
+            '        repeat with t in tabs of w',
+            '          set out to out & "TAB" & sep & "Safari" & sep & "Safari" & sep & (name of t as text) & sep & (URL of t as text) & linefeed',
+            '        end repeat',
+            '      end repeat',
+            '    end try',
+            '  end tell',
+            'end if',
+        ]
+        for app_name, browser_name in GEMINI_CHROMIUM_BROWSERS:
+            script.extend(
+                [
+                    f'if runningNames contains "{app_name}" then',
+                    f'  tell application "{app_name}"',
+                    '    try',
+                    f'      set out to out & "FRONT" & sep & "{app_name}" & sep & "{browser_name}" & sep & (title of active tab of front window as text) & sep & (URL of active tab of front window as text) & linefeed',
+                    '    end try',
+                    '    try',
+                    '      repeat with w in windows',
+                    '        repeat with t in tabs of w',
+                    f'          set out to out & "TAB" & sep & "{app_name}" & sep & "{browser_name}" & sep & (title of t as text) & sep & (URL of t as text) & linefeed',
+                    '        end repeat',
+                    '      end repeat',
+                    '    end try',
+                    '  end tell',
+                    'end if',
+                ]
+            )
+        script.append("return out")
+        return "\n".join(script)
+
+    def _accessibility_labels(self, process_name: str) -> List[str]:
+        if not process_name:
+            return []
+        safe_process = process_name.replace('"', '\\"')
+        script = f'''
+set AppleScript's text item delimiters to " | "
+tell application "System Events"
+  if not (exists process "{safe_process}") then return ""
+  tell process "{safe_process}"
+    set labels to {{}}
+    try
+      set uiItems to entire contents of front window
+      repeat with el in uiItems
+        try
+          set n to name of el
+          if n is not missing value and n is not "" then set end of labels to (n as text)
+        end try
+        if (count of labels) > 160 then exit repeat
+      end repeat
+    end try
+    return labels as text
+  end tell
+end tell
+'''
+        code, out, _ = run_osascript(script, timeout=1.5)
+        if code != 0 or not out.strip():
+            return []
+        return [
+            item.strip()
+            for item in out.split(" | ")
+            if item.strip() and item.strip().lower() != "missing value"
+        ]
+
+    def _is_lovable_url(self, url: str) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower().split(":", 1)[0]
+        if not host:
+            return False
+        return any(host == domain or host.endswith(f".{domain}") for domain in LOVABLE_DOMAINS)
+
+    def _browser_title(self, tab_title: str, labels: List[str], url: str) -> Tuple[str, str]:
+        cleaned_tab = self._clean_title(tab_title)
+        if self._is_useful_title(cleaned_tab):
+            return cleaned_tab, "tab-title"
+        for label in labels:
+            cleaned = self._clean_title(label)
+            if self._is_useful_title(cleaned):
+                return cleaned, "accessibility"
+        path_label = self._url_path_label(url)
+        if path_label:
+            return path_label, "url-path"
+        return "Lovable", ""
+
+    def _clean_title(self, value: str) -> str:
+        text = re.sub(r"\s+", " ", value or "").strip()
+        text = re.sub(r"\s+[-–—|]\s+Lovable.*$", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^Lovable\s+[-–—|]\s+", "", text, flags=re.IGNORECASE)
+        return text.strip()
+
+    def _is_useful_title(self, value: str) -> bool:
+        text = re.sub(r"\s+", " ", value or "").strip()
+        if not text or len(text) > 96:
+            return False
+        low = text.lower()
+        generic = {
+            "lovable",
+            "lovable.dev",
+            "new project",
+            "projects",
+            "dashboard",
+            "sign in",
+            "log in",
+            "chat",
+            "preview",
+            "build",
+            "share",
+            "deploy",
+            "settings",
+            "templates",
+        }
+        if low in generic:
+            return False
+        if low.startswith(("http://", "https://")):
+            return False
+        if "ai app builder" in low or "build apps" in low:
+            return False
+        return True
+
+    def _url_path_label(self, url: str) -> str:
+        parsed = urllib.parse.urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if not parts:
+            return ""
+        if len(parts) >= 2 and parts[0] in {"projects", "project"}:
+            return f"Lovable · {parts[1][:8]}"
+        if parts[0] not in {"login", "signin", "auth"}:
+            return f"Lovable · {parts[0][:18]}"
+        return ""
+
+    def _running_signal(self, labels: List[str], tab_title: str) -> bool:
+        joined = " ".join([tab_title, *labels]).lower()
+        markers = [
+            "stop generating",
+            "stop generation",
+            "cancel generation",
+            "cancel request",
+            "generating",
+            "applying changes",
+            "making changes",
+            "working on",
+            "building your app",
+            "thinking",
+            "deploying",
+        ]
+        return any(marker in joined for marker in markers)
+
+
 def first_match(pattern: str, text: str) -> str:
     match = re.search(pattern, text)
     return match.group(1).strip() if match else ""
@@ -2369,6 +3440,7 @@ def compact_task(t: Task) -> Dict[str, Any]:
         "u": int(t.get("age_sec") or 0),
         "sub": t.get("subtitle", "")[:96],
         "us": compact_usage_label(usage)[:32],
+        "d": t.get("device_label", "")[:10],
     }
 
 
@@ -2472,9 +3544,26 @@ def html_page(title: str, body: str) -> bytes:
       font-size: 12px;
       line-height: 1.45;
     }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      font-size: 13px;
+    }}
+    th, td {{
+      padding: 8px 6px;
+      border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      color: color-mix(in srgb, CanvasText 62%, transparent);
+      font-weight: 600;
+    }}
     @media (max-width: 640px) {{
       .top {{ align-items: flex-start; flex-direction: column; }}
       dl {{ grid-template-columns: 1fr; gap: 4px 0; }}
+      table {{ font-size: 12px; }}
     }}
   </style>
 </head>
@@ -2572,28 +3661,297 @@ def render_task_list(tasks: List[Task]) -> bytes:
     return html_page("AI Tasks", body)
 
 
+def render_peers_page(snapshot: Dict[str, Any]) -> bytes:
+    peers = snapshot.get("peers") if isinstance(snapshot.get("peers"), list) else []
+    rows = []
+    for peer in peers:
+        if not isinstance(peer, dict):
+            continue
+        status = str(peer.get("status") or "")
+        status_color = {
+            "ok": "#16a34a",
+            "error": "#dc2626",
+            "discovered": "#d97706",
+        }.get(status, "currentColor")
+        rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(str(peer.get('label') or peer.get('name') or peer.get('id') or 'Peer'))}</strong>"
+            f"<br><span class=\"pill\">{html.escape(str(peer.get('id') or ''))}</span></td>"
+            f"<td><span style=\"color:{status_color}\">{html.escape(status)}</span>"
+            f"<br>{html.escape(str(peer.get('last_error') or ''))}</td>"
+            f"<td>{html.escape(str(peer.get('host') or ''))}:{html.escape(str(peer.get('port') or ''))}"
+            f"<br>{html.escape(str(peer.get('url') or ''))}</td>"
+            f"<td>{safe_int(peer.get('task_count'))} tasks"
+            f"<br>{safe_int(peer.get('active'))} active / {safe_int(peer.get('attention'))} alert</td>"
+            f"<td>{safe_int(peer.get('last_fetch_ms'))} ms"
+            f"<br>{html.escape(str(peer.get('last_success_at') or peer.get('last_fetch_at') or ''))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="5">No peers discovered yet.</td></tr>')
+
+    body = f"""
+<section class="top">
+  <div>
+    <h1>TaskHub Peers</h1>
+    <div class="meta">
+      <span class="pill">{html.escape(str(snapshot.get("device_label") or snapshot.get("device_name") or ""))}</span>
+      <span class="pill">{'enabled' if snapshot.get('enabled') else 'disabled'}</span>
+      <span class="pill">{len(peers)} peer(s)</span>
+    </div>
+  </div>
+  <div class="actions">
+    <a class="button secondary" href="/tasks">Tasks</a>
+    <a class="button secondary" href="/peers.json">JSON</a>
+  </div>
+</section>
+<h2>Discovery</h2>
+{kv_rows({
+    "Version": snapshot.get("version"),
+    "Device": f"{snapshot.get('device_name')} ({snapshot.get('device_id')})",
+    "Discovery port": snapshot.get("discovery_port"),
+    "Last discovery": snapshot.get("discovery_at"),
+    "Discovery duration": f"{safe_int(snapshot.get('discovery_duration_ms'))} ms",
+    "Discovery error": snapshot.get("discovery_error"),
+    "Remote task cache age": f"{safe_int(snapshot.get('cache_age_ms'))} ms" if snapshot.get("cache_age_ms") is not None else "",
+})}
+<h2>Peers</h2>
+<table>
+  <thead><tr><th>Device</th><th>Status</th><th>Endpoint</th><th>Tasks</th><th>Last Fetch</th></tr></thead>
+  <tbody>{''.join(rows)}</tbody>
+</table>
+"""
+    return html_page("TaskHub Peers", body)
+
+
+class PeerManager:
+    def __init__(self, token: str, http_port: int, discovery_port: int) -> None:
+        self.token = token
+        self.http_port = http_port
+        self.discovery_port = discovery_port
+        self.peers: Dict[str, Dict[str, Any]] = {}
+        self.tasks_cache: List[Task] = []
+        self.tasks_cache_at = 0
+        self.discovery_at = 0
+        self.discovery_error = ""
+        self.discovery_count = 0
+        self.discovery_duration_ms = 0
+
+    def remote_tasks(self) -> List[Task]:
+        if not PEER_ENABLED:
+            return []
+        current_ms = now_ms()
+        if self.tasks_cache and current_ms - self.tasks_cache_at < PEER_CACHE_MS:
+            return self.tasks_cache
+        if current_ms - self.discovery_at > PEER_DISCOVERY_MS:
+            self.discover()
+        tasks: List[Task] = []
+        for peer in list(self.peers.values())[:PEER_MAX]:
+            started = now_ms()
+            fetched, error = self._fetch_peer_tasks_result(peer)
+            peer["last_fetch_at"] = now_ms()
+            peer["last_fetch_ms"] = max(0, now_ms() - started)
+            if not error:
+                peer["last_seen_ms"] = current_ms
+                peer["last_success_at"] = now_ms()
+                peer["last_error"] = ""
+                peer["task_count"] = len(fetched)
+                peer["active"] = sum(1 for t in fetched if t.get("status") in {"running", "waiting", "failed"})
+                peer["attention"] = sum(1 for t in fetched if t.get("needs_attention") or t.get("status") == "waiting")
+                tasks.extend(fetched)
+            else:
+                peer["last_error"] = error
+                peer["last_error_at"] = now_ms()
+        self.tasks_cache = sorted(tasks, key=sort_key)
+        self.tasks_cache_at = current_ms
+        return self.tasks_cache
+
+    def discover(self) -> None:
+        started = now_ms()
+        self.discovery_at = started
+        self.discovery_error = ""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.settimeout(PEER_DISCOVERY_TIMEOUT_MS / 1000)
+        except OSError as exc:
+            self.discovery_error = str(exc)
+            return
+        try:
+            payload = {
+                "type": "sticks3.discover",
+                "device": DEVICE_ID,
+                "device_name": DEVICE_NAME,
+                "token": self.token,
+                "want": "taskhub-peers",
+            }
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            sock.sendto(body, ("255.255.255.255", self.discovery_port))
+            deadline = time.time() + PEER_DISCOVERY_TIMEOUT_MS / 1000
+            while time.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                except OSError:
+                    break
+                self._record_discovery(data, addr)
+        finally:
+            sock.close()
+            self.discovery_duration_ms = max(0, now_ms() - started)
+            self.discovery_count = len(self.peers)
+
+    def _record_discovery(self, data: bytes, addr: Tuple[str, int]) -> None:
+        try:
+            payload = json.loads(data.decode("utf-8", "ignore"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict) or payload.get("type") != "sticks3.hub":
+            return
+        peer_id = str(payload.get("device_id") or "")
+        if not peer_id or peer_id == DEVICE_ID:
+            return
+        port = safe_int(payload.get("port")) or DEFAULT_PORT
+        host = str(payload.get("host") or addr[0])
+        if port == self.http_port and host in {local_ip_hint(), "127.0.0.1", "::1"}:
+            return
+        url = str(payload.get("url") or f"http://{host}:{port}").rstrip("/")
+        self.peers[peer_id] = {
+            "id": peer_id,
+            "name": str(payload.get("device_name") or peer_id),
+            "label": str(payload.get("device_label") or short_device_label(str(payload.get("device_name") or peer_id))),
+            "host": host,
+            "port": port,
+            "url": url,
+            "version": payload.get("version"),
+            "discovered_at": now_ms(),
+            "last_discovery_from": addr[0],
+        }
+
+    def _fetch_peer_tasks(self, peer: Dict[str, Any]) -> List[Task]:
+        tasks, _ = self._fetch_peer_tasks_result(peer)
+        return tasks
+
+    def _fetch_peer_tasks_result(self, peer: Dict[str, Any]) -> Tuple[List[Task], str]:
+        url = f"{str(peer.get('url') or '').rstrip('/')}/tasks?scope=local&limit={MAX_TASKS}"
+        if not url.startswith(("http://", "https://")):
+            return [], "invalid peer url"
+        request = urllib.request.Request(url, headers={"X-Device-Token": self.token})
+        try:
+            with urllib.request.urlopen(request, timeout=PEER_HTTP_TIMEOUT_MS / 1000) as response:
+                status_code = getattr(response, "status", 200)
+                payload = json.loads(response.read().decode("utf-8", "ignore"))
+        except urllib.error.HTTPError as exc:
+            return [], f"http {exc.code}"
+        except (OSError, urllib.error.URLError) as exc:
+            return [], str(exc)
+        except json.JSONDecodeError as exc:
+            return [], f"bad json: {exc}"
+        if status_code >= 400:
+            return [], f"http {status_code}"
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return [], str(payload.get("error") if isinstance(payload, dict) else "bad response")
+        raw_tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
+        peer_id = str(peer.get("id") or "")
+        peer_name = str(peer.get("name") or peer_id)
+        out: List[Task] = []
+        for raw in raw_tasks:
+            if not isinstance(raw, dict):
+                continue
+            original_id = str(raw.get("id") or "")
+            if not original_id:
+                continue
+            item = dict(raw)
+            detail = dict(item.get("detail") if isinstance(item.get("detail"), dict) else {})
+            detail.update(
+                {
+                    "remote_task_id": original_id,
+                    "remote_hub_url": peer.get("url"),
+                    "remote_device_id": peer_id,
+                    "remote_device_name": peer_name,
+                }
+            )
+            item["detail"] = detail
+            item["id"] = stable_id("remote", f"{peer_id}:{original_id}")
+            item["origin_id"] = original_id
+            attach_device(item, device_id=peer_id, device_name=peer_name, origin="remote")
+            item["_open"] = {
+                "type": "remote",
+                "url": str(peer.get("url") or ""),
+                "task_id": original_id,
+                "token": self.token,
+            }
+            out.append(item)
+        return out, ""
+
+    def snapshot(self, refresh: bool = False) -> Dict[str, Any]:
+        if refresh or (PEER_ENABLED and now_ms() - self.discovery_at > PEER_DISCOVERY_MS):
+            self.discover()
+        peers = []
+        for peer in sorted(self.peers.values(), key=lambda item: str(item.get("name") or item.get("id") or "")):
+            last_error = str(peer.get("last_error") or "")
+            peers.append(
+                {
+                    "id": peer.get("id"),
+                    "name": peer.get("name"),
+                    "label": peer.get("label"),
+                    "host": peer.get("host"),
+                    "port": peer.get("port"),
+                    "url": peer.get("url"),
+                    "version": peer.get("version"),
+                    "status": "error" if last_error else ("ok" if peer.get("last_success_at") else "discovered"),
+                    "task_count": safe_int(peer.get("task_count")),
+                    "active": safe_int(peer.get("active")),
+                    "attention": safe_int(peer.get("attention")),
+                    "last_fetch_ms": safe_int(peer.get("last_fetch_ms")),
+                    "discovered_at": ms_to_iso(safe_int(peer.get("discovered_at"))),
+                    "last_fetch_at": ms_to_iso(safe_int(peer.get("last_fetch_at"))),
+                    "last_success_at": ms_to_iso(safe_int(peer.get("last_success_at"))),
+                    "last_error_at": ms_to_iso(safe_int(peer.get("last_error_at"))),
+                    "last_error": last_error,
+                }
+            )
+        return {
+            "enabled": PEER_ENABLED,
+            "version": TASK_HUB_VERSION,
+            "device_id": DEVICE_ID,
+            "device_name": DEVICE_NAME,
+            "device_label": short_device_label(DEVICE_NAME),
+            "discovery_port": self.discovery_port,
+            "discovery_at": ms_to_iso(self.discovery_at),
+            "discovery_count": self.discovery_count,
+            "discovery_duration_ms": self.discovery_duration_ms,
+            "discovery_error": self.discovery_error,
+            "cache_age_ms": max(0, now_ms() - self.tasks_cache_at) if self.tasks_cache_at else None,
+            "peers": peers,
+        }
+
+
 class Hub:
-    def __init__(self) -> None:
+    def __init__(self, token: str = DEFAULT_TOKEN, http_port: int = DEFAULT_PORT, discovery_port: int = DEFAULT_DISCOVERY_PORT) -> None:
         self.adapters = [
             OpenClawAdapter(),
             ClaudeAdapter(),
             CodexAdapter(),
             ManusAdapter(),
             PerplexityAdapter(),
+            GeminiAdapter(),
+            LovableAdapter(),
         ]
         self.cache: List[Task] = []
         self.cache_at = 0
         self.detail_base_url = "http://127.0.0.1:5577"
+        self.peer_manager = PeerManager(token, http_port, discovery_port)
 
-    def list_tasks(self) -> List[Task]:
-        if now_ms() - self.cache_at < TASK_CACHE_MS and self.cache:
+    def list_tasks(self, include_remote: bool = True) -> List[Task]:
+        if include_remote and now_ms() - self.cache_at < TASK_CACHE_MS and self.cache:
             return self.cache
 
         commands = ps_commands()
         tasks: List[Task] = []
         for adapter in self.adapters:
             try:
-                if isinstance(adapter, (ClaudeAdapter, CodexAdapter, ManusAdapter, PerplexityAdapter, AppAdapter)):
+                if isinstance(adapter, (ClaudeAdapter, CodexAdapter, ManusAdapter, PerplexityAdapter, GeminiAdapter, LovableAdapter, AppAdapter)):
                     tasks.extend(adapter.list_tasks(commands))
                 else:
                     tasks.extend(adapter.list_tasks())
@@ -2611,6 +3969,13 @@ class Hub:
 
         dedup: Dict[str, Task] = {}
         for item in tasks:
+            attach_device(item, device_id=DEVICE_ID, device_name=DEVICE_NAME, origin="local")
+            dedup[item["id"]] = item
+        local_tasks = sorted(dedup.values(), key=sort_key)
+        if not include_remote:
+            return local_tasks[:MAX_TASKS]
+
+        for item in self.peer_manager.remote_tasks():
             dedup[item["id"]] = item
         self.cache = sorted(dedup.values(), key=sort_key)[:MAX_TASKS]
         self.cache_at = now_ms()
@@ -2621,6 +3986,15 @@ class Hub:
             if item.get("id") == task_id:
                 return item
         return None
+
+    def peers_snapshot(self, refresh: bool = False) -> Dict[str, Any]:
+        return self.peer_manager.snapshot(refresh=refresh)
+
+    def lovable_debug_snapshot(self) -> Dict[str, Any]:
+        for adapter in self.adapters:
+            if isinstance(adapter, LovableAdapter):
+                return adapter.debug_snapshot(ps_commands())
+        return {"source": "Lovable", "error": "adapter not registered"}
 
     def open_task(self, task_id: str) -> Tuple[bool, str]:
         return self.open_native_task(task_id)
@@ -2642,19 +4016,47 @@ class Hub:
             return open_action({"type": "app", "target": "im.manus.desktop"})
         if task_id.startswith("perplexity-"):
             return open_action({"type": "app", "target": "ai.perplexity.macv3"})
+        if task_id.startswith("gemini-"):
+            return open_action({"type": "app", "target": "com.google.GeminiMacOS"})
+        if task_id == "lovable-app":
+            return open_action({"type": "app", "target": "dev.lovable.build"})
+        if task_id.startswith("lovable-"):
+            return open_action({"type": "url", "target": "https://lovable.dev/"})
         return False, "task not found"
 
 
 def open_action(action: Dict[str, str]) -> Tuple[bool, str]:
     kind = action.get("type")
     target = action.get("target")
-    if not kind or not target:
+    if not kind:
         return False, "no open action"
+    if kind in {"url", "app"} and not target:
+        return False, "no open target"
     try:
         if kind == "url":
             subprocess.Popen(["open", target])
         elif kind == "app":
             subprocess.Popen(["open", "-b", target])
+        elif kind == "remote":
+            task_id = action.get("task_id") or ""
+            base_url = (action.get("url") or "").rstrip("/")
+            token = action.get("token") or DEFAULT_TOKEN
+            if not task_id or not base_url:
+                return False, "remote action missing task_id or url"
+            encoded = urllib.parse.quote(task_id, safe="")
+            req = urllib.request.Request(
+                f"{base_url}/tasks/{encoded}/open-native",
+                method="POST",
+                headers={"X-Device-Token": token},
+            )
+            with urllib.request.urlopen(req, timeout=PEER_HTTP_TIMEOUT_MS / 1000) as response:
+                body = response.read().decode("utf-8", "ignore")
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict) and not payload.get("ok", True):
+                    return False, str(payload.get("message") or payload.get("error") or "remote open failed")
+            except json.JSONDecodeError:
+                pass
         else:
             return False, f"unsupported open action: {kind}"
         return True, "opened"
@@ -2707,8 +4109,12 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "status": "live",
+                    "version": TASK_HUB_VERSION,
                     "ip": local_ip_hint(),
                     "discovery_port": DEFAULT_DISCOVERY_PORT,
+                    "device_id": DEVICE_ID,
+                    "device_name": DEVICE_NAME,
+                    "device_label": short_device_label(DEVICE_NAME),
                 },
             )
             return
@@ -2752,6 +4158,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         qs = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/debug/lovable":
+            if not self.task_allowed():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, "debug": self.hub.lovable_debug_snapshot()})
+            return
+
+        if parsed.path in {"/peers", "/peers.json"}:
+            if not self.task_allowed():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            snapshot = self.hub.peers_snapshot(refresh=(qs.get("refresh") or ["0"])[0] in {"1", "true", "yes"})
+            if parsed.path == "/peers.json":
+                self.send_json(200, {"ok": True, **snapshot})
+            else:
+                self.send_html(200, render_peers_page(snapshot))
+            return
+
         if parsed.path == "/tasks" and self.is_loopback() and (
             not parsed.query or "text/html" in (self.headers.get("Accept") or "")
         ):
@@ -2767,9 +4191,11 @@ class Handler(BaseHTTPRequestHandler):
 
         limit = int((qs.get("limit") or ["8"])[0])
         fmt = (qs.get("format") or ["full"])[0]
-        tasks = self.hub.list_tasks()
+        scope = (qs.get("scope") or ["all"])[0].lower()
+        include_remote = scope not in {"local", "self"}
+        tasks = self.hub.list_tasks(include_remote=include_remote)
         active = sum(1 for t in tasks if t.get("status") in {"running", "waiting", "failed"})
-        attention = sum(1 for t in tasks if t.get("needs_attention"))
+        attention = sum(1 for t in tasks if t.get("needs_attention") or t.get("status") == "waiting")
         if fmt == "stick":
             payload = {
                 "ok": True,
@@ -2778,6 +4204,7 @@ class Handler(BaseHTTPRequestHandler):
                 "count": len(tasks),
                 "active": active,
                 "attention": attention,
+                "device": short_device_label(DEVICE_NAME),
                 "tasks": [compact_task(t) for t in tasks[: max(1, min(limit, 12))]],
             }
         else:
@@ -2785,6 +4212,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "generated_at": ms_to_iso(now_ms()),
                 "ip": local_ip_hint(),
+                "device_id": DEVICE_ID,
+                "device_name": DEVICE_NAME,
+                "device_label": short_device_label(DEVICE_NAME),
+                "scope": "all" if include_remote else "local",
                 "count": len(tasks),
                 "active": active,
                 "attention": attention,
@@ -2831,6 +4262,10 @@ class DiscoveryHandler(socketserver.BaseRequestHandler):
         response = {
             "ok": True,
             "type": "sticks3.hub",
+            "version": TASK_HUB_VERSION,
+            "device_id": DEVICE_ID,
+            "device_name": DEVICE_NAME,
+            "device_label": short_device_label(DEVICE_NAME),
             "host": host,
             "port": http_port,
             "url": f"http://{host}:{http_port}",
@@ -2863,13 +4298,15 @@ def main() -> int:
     parser.add_argument("--discovery-port", type=int, default=DEFAULT_DISCOVERY_PORT)
     args = parser.parse_args()
 
-    hub = Hub()
+    hub = Hub(token=args.token, http_port=args.port, discovery_port=args.discovery_port)
     hub.detail_base_url = f"http://127.0.0.1:{args.port}"
     Handler.hub = hub
     Handler.token = args.token
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     discovery = start_discovery(args.bind, args.discovery_port, args.port, args.token)
     print(f"Task Hub listening on http://{args.bind}:{args.port}")
+    print(f"Device: {DEVICE_NAME} ({DEVICE_ID})")
+    print(f"Peer aggregation: {'enabled' if PEER_ENABLED else 'disabled'}")
     print(f"LAN hint: http://{local_ip_hint()}:{args.port}/tasks?format=stick")
     print("Set TASK_HUB_TOKEN or pass --token to change the device token.")
     try:

@@ -1,66 +1,134 @@
 # TaskHub for StickS3
 
-Tiny hardware status dashboard for local AI agents on your Mac.
+A pocket hardware dashboard for AI agent work across your Macs.
 
-[![Release](https://img.shields.io/badge/release-v1.0.1-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.1.1-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
-[![Platform](https://img.shields.io/badge/platform-macOS-0f766e)](host)
+[![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
+[![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#privacy-and-security)
 [![License](https://img.shields.io/badge/license-MIT-374151)](LICENSE)
 
-TaskHub for StickS3 turns an M5StickS3 into a pocket-sized dashboard for the AI
-work happening on your Mac. A local Mac hub collects task metadata from tools
-such as Codex, Claude Code, OpenClaw, Manus, and Perplexity, then serves a
-compact task list to the StickS3 over your LAN.
+TaskHub for StickS3 turns an M5StickS3 into a tiny always-nearby status screen
+for AI coding agents, desktop AI apps, and browser-based agent tools. A local
+Mac Host reads task metadata from sources such as Codex, Claude Code, OpenClaw,
+Manus, Perplexity, Gemini, and Lovable, discovers other authorized TaskHub Hosts
+on the same LAN, then sends a compact task list to the StickS3 over Wi-Fi.
 
-The device shows what is running, what recently finished, token or turn usage
-when available, and can open the source app on your Mac with one button.
+The device shows which task is running, which one needs your input, what
+recently finished, and token or turn usage when the source exposes it. BtnA can
+open the source app on the Mac, BtnB switches tasks, and the firmware sleeps
+between refreshes so the small StickS3 battery remains usable.
+
+## Why It Exists
+
+AI agents are easy to start and easy to forget. TaskHub gives them a physical
+status surface:
+
+- See active AI work without switching windows.
+- Catch Codex or Claude Code prompts when they need a reply.
+- Track tasks across more than one Mac on the same Wi-Fi.
+- Keep task state local instead of sending agent metadata to a cloud service.
+- Use a small, inexpensive device instead of dedicating another monitor.
 
 ## Screens
 
-Pixel-accurate renders of what the StickS3 actually draws, at the device's
-native 240 × 135 resolution. Regenerate with `python3 docs/render_screens.py`.
+Pixel-accurate renders of what the StickS3 draws at its native 240x135
+resolution. Regenerate them with `python3 docs/render_screens.py`.
 
 <table>
   <tr>
-    <td align="center"><img src="docs/screen-run.png" width="320" alt="RUN screen"/><br/><sub><b>RUN</b> · active agent turn</sub></td>
-    <td align="center"><img src="docs/screen-wait.png" width="320" alt="WAIT screen"/><br/><sub><b>WAIT</b> · needs your input</sub></td>
+    <td align="center"><img src="docs/screen-boot.png" width="320" alt="Boot logo screen"/><br/><sub><b>BOOT</b> - Wi-Fi sync splash</sub></td>
+    <td align="center"><img src="docs/screen-wake.png" width="320" alt="Wake reconnect screen"/><br/><sub><b>WAKE</b> - reconnect after sleep</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/screen-fail.png" width="320" alt="FAIL screen"/><br/><sub><b>FAIL</b> · error or attention</sub></td>
-    <td align="center"><img src="docs/screen-done.png" width="320" alt="DONE screen"/><br/><sub><b>DONE</b> · finished task</sub></td>
+    <td align="center"><img src="docs/screen-run.png" width="320" alt="RUN screen"/><br/><sub><b>RUN</b> - active agent turn</sub></td>
+    <td align="center"><img src="docs/screen-wait.png" width="320" alt="WAIT screen"/><br/><sub><b>WAIT</b> - needs your input</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/screen-empty.png" width="320" alt="No tasks"/><br/><sub>No tasks · idle hub</sub></td>
-    <td align="center"><img src="docs/screen-error.png" width="320" alt="Hub unreachable"/><br/><sub>Hub unreachable · Wi-Fi lost</sub></td>
+    <td align="center"><img src="docs/screen-fail.png" width="320" alt="FAIL screen"/><br/><sub><b>FAIL</b> - error or attention</sub></td>
+    <td align="center"><img src="docs/screen-done.png" width="320" alt="DONE screen"/><br/><sub><b>DONE</b> - finished task</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screen-empty.png" width="320" alt="No tasks screen"/><br/><sub>No tasks - idle hub</sub></td>
+    <td align="center"><img src="docs/screen-error.png" width="320" alt="Hub unreachable screen"/><br/><sub>Hub unreachable - Wi-Fi lost</sub></td>
   </tr>
 </table>
 
-## What It Does
+## Current Release
 
-| Capability | Status |
-| --- | --- |
-| Local Mac hub with LaunchAgent installer | Ready |
-| Wi-Fi discovery from StickS3 to Mac | Ready |
-| Codex task, folder, turn, and token tracking | Ready |
-| Claude Code turn-state and token tracking | Ready |
-| OpenClaw local session/task tracking | Ready |
-| Manus local session metadata and usage counters | Ready |
-| Perplexity local activity indicator | Ready |
-| BtnA open source app on Mac | Ready |
-| BtnB task navigation and hold-to-refresh | Ready |
-| Deep sleep and periodic wake refresh | Ready |
+`v1.1.1` is ready for an early public release for developers and hardware
+makers. The core pipeline is working: Mac Host, StickS3 firmware, Wi-Fi
+discovery, compact task display, button actions, deep sleep, and LAN
+multi-device aggregation.
+
+Some AI apps expose rich local task logs; others expose only app activity or
+visible browser UI. TaskHub is explicit about that distinction so users know
+when a row is exact task tracking versus best-effort local signal detection.
+
+## Feature Matrix
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| StickS3 firmware | Ready | Native 240x135 UI, buttons, Wi-Fi discovery, deep sleep |
+| macOS Host | Ready | LaunchAgent installer, local HTTP API, UDP discovery |
+| Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
+| BtnA open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
+| WAIT attention mode | Ready | Keeps the display awake while a task needs user input |
+| Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
+| Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
+| Claude Code adapter | Detailed | Tracks transcript turn state, prompts, usage, resume process |
+| OpenClaw adapter | Detailed | Reads local task/session stores |
+| Manus adapter | Best effort | Reads local app storage and usage counters when available |
+| Perplexity adapter | Activity | Local app/browser activity; exact Perplexity Computer tasks are not guaranteed |
+| Gemini adapter | Activity | App/web activity and visible browser title when exposed |
+| Lovable adapter | Activity | App/browser activity, renderer CPU, visible generation controls |
+
+## Status Model
+
+TaskHub keeps the full task list on the Mac. The StickS3 applies a
+display-only filter so old rows disappear from the tiny screen without deleting
+anything from the computer.
+
+| Label | Color intent | Meaning | StickS3 visibility |
+| --- | --- | --- | --- |
+| `RUN` | Blue | Active task or active agent turn | Always visible |
+| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible and keeps screen awake |
+| `FAIL` | Red | Failed or needs attention | Always visible |
+| `DONE` | Green | Completed | Hidden after 10 minutes by default |
+| `REC` | White/gray | Recently active | Hidden after 1 hour by default |
+| `IDLE` | Dark gray | Source is idle | Hidden after 10 minutes by default |
+| `HIDDEN` | Gray/black | Display-only stale row | Not shown on device |
+
+```mermaid
+stateDiagram-v2
+  [*] --> RUN: active turn
+  [*] --> WAIT: prompt needs input
+  RUN --> REC: turn finished recently
+  WAIT --> RUN: work resumes
+  RUN --> FAIL: error or aborted
+  REC --> DONE: terminal state reported
+  DONE --> Hidden: older than 10 minutes
+  IDLE --> Hidden: older than 10 minutes
+  REC --> Hidden: older than 1 hour
+  FAIL --> [*]: stays visible
+  WAIT --> [*]: stays visible
+  RUN --> [*]: stays visible
+```
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph "Mac"
-    Hub["Task Hub\nLaunchAgent + HTTP API"]
+  subgraph "LAN Macs"
+    Host["TaskHub Host\nAggregator + HTTP API"]
+    Peer["Peer TaskHub Host\nscope=local"]
     Codex["Codex\nsessions + usage"]
     Claude["Claude Code\ntranscripts + resume process"]
     OpenClaw["OpenClaw\nlocal tasks + sessions"]
     Manus["Manus\nlocal app storage"]
-    Perplexity["Perplexity\nlocal app activity"]
+    Perplexity["Perplexity\nlocal app/browser activity"]
+    Gemini["Gemini\nlocal app/browser activity"]
+    Lovable["Lovable\napp + browser tabs"]
   end
 
   subgraph "M5StickS3"
@@ -70,108 +138,141 @@ flowchart LR
     Sleep["Deep sleep timer"]
   end
 
-  Codex --> Hub
-  Claude --> Hub
-  OpenClaw --> Hub
-  Manus --> Hub
-  Perplexity --> Hub
-  Hub -- "UDP discovery" --> Firmware
-  Firmware -- "GET /tasks?format=stick" --> Hub
-  Firmware -- "POST /tasks/:id/open" --> Hub
+  Peer <-->|"UDP discovery + token"| Host
+  Codex --> Host
+  Claude --> Host
+  OpenClaw --> Host
+  Manus --> Host
+  Perplexity --> Host
+  Gemini --> Host
+  Lovable --> Host
+  Host -- "UDP discovery response" --> Firmware
+  Firmware -- "GET /tasks?format=stick" --> Host
+  Firmware -- "POST /tasks/:id/open" --> Host
   Firmware --> Screen
   Buttons --> Firmware
   Firmware --> Sleep
 ```
 
-## Status Model
-
-The Mac hub keeps the full task list. The StickS3 applies a display-only filter
-so old tasks disappear from the tiny screen without deleting anything on your
-Mac.
-
-```mermaid
-stateDiagram-v2
-  [*] --> RUN: "active turn / running process"
-  [*] --> WAIT: "needs input or queued"
-  RUN --> REC: "turn finished recently"
-  WAIT --> RUN: "work resumes"
-  RUN --> FAIL: "error or aborted"
-  REC --> DONE: "terminal state reported"
-  DONE --> Hidden: "older than 10 minutes"
-  IDLE --> Hidden: "older than 10 minutes"
-  REC --> Hidden: "older than 1 hour"
-  FAIL --> [*]: "kept visible until resolved"
-  WAIT --> [*]: "kept visible"
-  RUN --> [*]: "kept visible"
-```
-
-Compact status labels:
-
-| Label | Meaning | StickS3 behavior |
-| --- | --- | --- |
-| `RUN` | Active task or active agent turn | Always visible |
-| `WAIT` | Waiting for input or queued | Always visible |
-| `FAIL` | Failed or needs attention | Always visible |
-| `REC` | Recently active | Hidden after 1 hour |
-| `DONE` | Completed | Hidden after 10 minutes |
-| `IDLE` | App/source idle | Hidden after 10 minutes |
-
-## Supported Sources
-
-| Source | Local signal used |
-| --- | --- |
-| Codex | Session index, session JSONL logs, token usage, active turn markers |
-| Claude Code | Local session metadata, transcript stop reasons, `claude --resume` process |
-| OpenClaw | Local task registry and session stores |
-| Manus | Local app storage, session timestamps, status codes, usage counters |
-| Perplexity | Local preference/cache activity signals |
-
-Perplexity does not expose a stable local task transcript, so TaskHub reports
-local activity rather than exact task titles.
-
-## Hardware
-
-- M5StickS3
-- macOS machine on the same Wi-Fi network
-- USB cable for the first firmware flash
-
 ## Quick Start
 
-Clone this repository, then install or repair the Mac hub:
+### 1. Install requirements
+
+- macOS
+- M5StickS3
+- Python 3
+- `arduino-cli`
+- ESP32 Arduino core
+- Arduino libraries: `M5Unified`, `ArduinoJson`
+- Optional: Node.js, used by the Host to read some local LevelDB app stores
+
+### 2. Install the Mac Host
 
 ```bash
+git clone https://github.com/sheepxux/Taskhub-for-StickS3.git
+cd Taskhub-for-StickS3
 ./host/install_task_hub.sh
 ```
 
-Configure the firmware:
+Check the Host:
 
 ```bash
-cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
+curl http://127.0.0.1:5577/health
 ```
 
-Edit `firmware/task_monitor/secrets.h` and set:
+The installer copies the Host to:
 
-- `WIFI_SSID`
-- `WIFI_PASSWORD`
-- `DEVICE_TOKEN`
+```text
+~/Library/Application Support/StickS3TaskHub
+```
 
-The `DEVICE_TOKEN` must match the token in:
+It also creates or reuses the device token at:
 
 ```text
 ~/Library/Application Support/StickS3TaskHub/token
 ```
 
-Build and flash the StickS3:
+### 3. Configure the firmware
 
 ```bash
-./firmware/flash_task_monitor.sh upload
+cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
 ```
 
-After flashing, the StickS3 discovers the Mac hub over UDP, fetches the compact
-task list, shows it briefly, then enters deep sleep. It wakes on button press or
-every `AUTO_WAKE_SECONDS`.
+Edit `firmware/task_monitor/secrets.h`:
 
-Default power profile:
+```cpp
+#define WIFI_SSID       "your-wifi-ssid"
+#define WIFI_PASSWORD   "your-wifi-password"
+#define DEVICE_TOKEN    "same-token-as-the-mac-host"
+```
+
+`TASK_HUB_HOST` is only a fallback. The firmware first tries UDP discovery on
+port `5578`, so the Mac IP can change.
+
+### 4. Flash the StickS3
+
+```bash
+./firmware/flash_task_monitor.sh all
+```
+
+After flashing, the StickS3 boots into the TaskHub logo screen, connects to
+Wi-Fi, discovers the Mac Host, fetches tasks, then enters deep sleep after the
+interactive timeout.
+
+## Controls
+
+| Control | Action |
+| --- | --- |
+| BtnA | Open the selected task's source app on the Mac |
+| BtnB | Select the next task |
+| BtnB hold | Refresh immediately |
+
+## Multi-Device Mode
+
+Install the Mac Host on every Mac you want to include and use the same token on
+each Host. Any TaskHub Host can act as the aggregator:
+
+- Hosts announce themselves over UDP port `5578`.
+- The aggregator fetches each peer's `/tasks?scope=local` list.
+- Compact StickS3 rows include a short device label, such as `Codex@MBP`.
+- BtnA on a remote task forwards the open request back to the Mac that owns it.
+
+Useful environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TASK_HUB_DEVICE_NAME` | macOS hostname | Human-readable device name |
+| `TASK_HUB_DEVICE_ID` | stable host hash | Stable LAN peer identity |
+| `TASK_HUB_ENABLE_PEERS` | `1` | Set to `0` to disable peer aggregation |
+| `TASK_HUB_PEER_DISCOVERY_MS` | `15000` | UDP peer discovery interval |
+| `TASK_HUB_PEER_CACHE_MS` | `5000` | Remote task cache duration |
+
+Diagnostics:
+
+```bash
+open http://127.0.0.1:5577/peers
+curl http://127.0.0.1:5577/peers.json?refresh=1
+```
+
+## Local API
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/health` | Host status, version, LAN identity |
+| `/tasks` | Full task list for the web/debug page |
+| `/tasks?format=stick` | Compact payload used by the StickS3 |
+| `/tasks?scope=local` | Local Mac tasks only, used by peer aggregation |
+| `/tasks/:id` | Local detail/debug page |
+| `/tasks/:id/open` | Open selected source from the StickS3 |
+| `/tasks/:id/open-native` | Host-to-host remote open forwarding |
+| `/peers` | Human-readable multi-device diagnostics |
+| `/peers.json` | Machine-readable peer status |
+| `/debug/lovable` | Lovable app/browser signal diagnostics |
+
+## Power Profile
+
+The firmware is battery-first by default. It wakes, fetches once, stays visible
+briefly, then sleeps again. Active and WAIT tasks refresh more often.
 
 | Setting | Default |
 | --- | --- |
@@ -185,44 +286,82 @@ Default power profile:
 | CPU clock | `POWER_SAVE_CPU_MHZ=80` |
 | Charge current | `CHARGE_CURRENT_MA=200` |
 
-## Controls
+For UI or network debugging, set `ENABLE_DEEP_SLEEP` to `0` in
+`firmware/task_monitor/secrets.h`. Re-enable it before normal use.
 
-| Control | Action |
+## Source Accuracy
+
+TaskHub uses local data only. Accuracy depends on what each source exposes on
+disk, through local process state, or through visible browser UI.
+
+| Source | What is usually available |
 | --- | --- |
-| BtnA | Open the selected task's source app on the Mac |
-| BtnB | Select the next task |
-| BtnB hold | Refresh immediately |
+| Codex | Task title, folder, turn state, token usage, running/wait status |
+| Claude Code | Transcript state, prompt/wait detection, usage, resume process |
+| OpenClaw | Local task registry, session title, task state |
+| Manus | Local session metadata, timestamps, status codes, usage counters |
+| Perplexity | App/browser activity; exact Perplexity Computer task names may be unavailable |
+| Gemini | App/browser activity; visible tab title when exposed by the browser |
+| Lovable | App/browser activity, project tabs, renderer CPU, visible generation controls |
 
-## Privacy
+If an app is open but not actively generating or executing, TaskHub should show
+`REC` or `IDLE`, not `RUN`.
 
-TaskHub is local-first by design.
+## Privacy And Security
 
-- The StickS3 talks only to your Mac hub on your LAN.
-- The hub does not upload task data to a cloud service.
-- Firmware secrets are stored in `secrets.h`, which is gitignored.
-- Auth tokens and message bodies are not returned by the StickS3 API.
-- Adapters read only the local metadata needed to derive task state.
+TaskHub is local-first.
 
-## Requirements
+- The StickS3 talks to your Mac Host on your LAN.
+- The Host does not upload task data to a cloud service.
+- Firmware Wi-Fi secrets live in `secrets.h`, which is gitignored.
+- The StickS3 API does not return auth tokens or message bodies.
+- LAN peers must use the same token to participate.
+- Do not expose port `5577` or `5578` directly to the public internet.
 
-- macOS
-- Python 3
-- `arduino-cli`
-- ESP32 Arduino core
-- M5Unified and ArduinoJson libraries
-- Node.js is optional but recommended for Manus local LevelDB parsing
+## Troubleshooting
 
-## Repository Layout
+| Problem | Check |
+| --- | --- |
+| StickS3 cannot find the Host | Confirm Mac and StickS3 are on the same Wi-Fi, then check `/health` |
+| `401` from the Host | Confirm `DEVICE_TOKEN` matches the Host token file |
+| No peer Macs show up | Open `/peers.json?refresh=1`, check token match and UDP port `5578` |
+| An app only shows `REC` | The app may expose activity but no active task signal |
+| Lovable running state looks wrong | Open `/debug/lovable` and inspect renderer CPU/browser basis |
+| Battery drains too quickly | Lower brightness, shorten timeouts, keep deep sleep enabled |
+| Browser task title is missing | Give the browser accessibility permission or keep the tab visible |
+
+## Development
+
+Useful checks before publishing a build:
+
+```bash
+python3 -m py_compile host/task_hub.py docs/render_screens.py
+python3 docs/render_screens.py
+./firmware/flash_task_monitor.sh compile
+```
+
+Repository layout:
 
 ```text
 firmware/task_monitor/   StickS3 firmware
-host/task_hub.py         Local Mac hub
+firmware/flash_task_monitor.sh
+host/task_hub.py         Local macOS Host
 host/install_task_hub.sh LaunchAgent installer/repair script
-host/README.md           Hub development and diagnostic notes
+host/README.md           Host diagnostics and adapter notes
+docs/                    Device screen renders
+CHANGELOG.md             Release notes
 ```
+
+## Roadmap
+
+- Signed or packaged Mac installer.
+- Adapter regression tests with recorded local metadata fixtures.
+- More detailed browser-task extraction for Gemini, Lovable, and Perplexity.
+- Optional physical alert accessory for WAIT/FAIL events.
+- Better first-run setup flow for non-developer users.
 
 ## Release
 
-Current release: `v1.0.1`.
+Current release: `v1.1.1`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
