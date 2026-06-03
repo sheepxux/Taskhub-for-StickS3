@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TaskHub Web Bridge</title>
+  <style>
+    body { font: 14px -apple-system, system-ui, sans-serif; margin: 18px; width: 320px; color: #111; }
+    h1 { font-size: 15px; margin: 0 0 12px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid #ccc; border-radius: 6px; }
+    button { margin-top: 14px; padding: 8px 14px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; }
+    .row { display: flex; gap: 8px; }
+    .row > div { flex: 1; }
+    #status { margin-top: 12px; font-size: 13px; min-height: 18px; }
+    .ok { color: #16a34a; } .err { color: #dc2626; } .muted { color: #6b7280; }
+    p.hint { color: #6b7280; font-size: 12px; margin-top: 16px; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <h1>TaskHub Web Bridge</h1>
+  <div class="row">
+    <div>
+      <label for="host">Host</label>
+      <input id="host" placeholder="127.0.0.1" />
+    </div>
+    <div style="max-width: 90px">
+      <label for="port">Port</label>
+      <input id="port" placeholder="5577" />
+    </div>
+  </div>
+  <label for="token">Device token</label>
+  <input id="token" placeholder="dev-token" />
+  <div class="row">
+    <button id="save">Save</button>
+    <button id="test" style="background:#0f766e">Test connection</button>
+  </div>
+  <div id="status" class="muted"></div>
+  <p class="hint">
+    The token must match the Host's token at
+    <code>~/Library/Application Support/StickS3TaskHub/token</code>.
+    This extension reads only the open Gemini / Lovable / Perplexity tab title
+    and sends it to your local Host — nothing leaves your machine.
+  </p>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -39,6 +39,19 @@ curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/peers.json'
 curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/debug/lovable'
 ```
 
+Push an external task (e.g. from the browser extension or any script):
+
+```bash
+curl -X POST -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/ingest' \
+  -d '{"source":"Gemini","title":"Refactor pricing page","status":"running","url":"https://gemini.google.com/app/abc"}'
+```
+
+`POST /ingest` accepts a single task object or `{"tasks":[...]}`. Only `source`
+and `title` are required; optional `id`, `status`, `subtitle`, `url`,
+`updated_ms`, `ttl_sec` (default 90s), `needs_attention`, `detail`, `usage`.
+Each pushed task expires after its TTL unless re-pushed, so it disappears on its
+own when the pusher stops. See `extension/` for the Chrome/Edge web bridge.
+
 Discovery check:
 
 ```bash
