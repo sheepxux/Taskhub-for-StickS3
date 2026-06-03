@@ -84,6 +84,24 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Perplexity adapter | Activity | Local app/browser activity; exact Perplexity Computer tasks are not guaranteed |
 | Gemini adapter | Activity | App/web activity and visible browser title when exposed |
 | Lovable adapter | Activity | App/browser activity, renderer CPU, visible generation controls |
+| Browser web bridge | Optional | `extension/` (Chrome/Edge) reads Gemini/Lovable/Perplexity tab titles and pushes them via `POST /ingest` |
+| External push API | Ready | `POST /ingest` accepts tasks from any local script; entries expire on a TTL |
+
+## Browser Web Bridge (optional)
+
+Browser-based AI tools keep task data on their servers, so the Host can only see
+them as "active". The optional Chrome/Edge extension in [`extension/`](extension)
+reads the open Gemini / Lovable / Perplexity tab's title and pushes it to the
+Host via `POST /ingest`, so those tasks show real titles on the StickS3. It is
+local-only (talks to `127.0.0.1`) and best-effort (page selectors fall back to
+the tab title). See [extension/README.md](extension/README.md) to load it.
+
+Any script can push too:
+
+```bash
+curl -X POST -H 'X-Device-Token: <token>' http://127.0.0.1:5577/ingest \
+  -d '{"source":"Manus","title":"Draft weekly report","status":"running","ttl_sec":120}'
+```
 
 ## Status Model
 
