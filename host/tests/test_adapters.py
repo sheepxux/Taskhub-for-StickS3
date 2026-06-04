@@ -57,7 +57,23 @@ class PureHelpers(unittest.TestCase):
         self.assertTrue(th.is_human_question("Should I proceed with the migration?"))
         self.assertTrue(th.is_human_question("Please confirm before I delete these files."))
         self.assertFalse(th.is_human_question("Running tests now."))
+        self.assertFalse(th.is_human_question("I went ahead and finished the task."))
         self.assertFalse(th.is_human_question(""))
+
+    def test_bounded_cache_evicts_lru(self):
+        cache = th.OrderedDict()
+        original_max = th.TRANSCRIPT_CACHE_MAX
+        th.TRANSCRIPT_CACHE_MAX = 2
+        try:
+            th.bounded_cache_set(cache, "a", {"_key": (1, 1)})
+            th.bounded_cache_set(cache, "b", {"_key": (1, 1)})
+            self.assertIsNotNone(th.bounded_cache_get(cache, "a", (1, 1)))
+            th.bounded_cache_set(cache, "c", {"_key": (1, 1)})
+            self.assertIn("a", cache)
+            self.assertIn("c", cache)
+            self.assertNotIn("b", cache)
+        finally:
+            th.TRANSCRIPT_CACHE_MAX = original_max
 
 
 class StatusMachines(unittest.TestCase):
@@ -121,6 +137,27 @@ class ClaudeTranscriptScan(unittest.TestCase):
             self.assertFalse(scan["active_turn"])
         finally:
             os.remove(path)
+
+    def test_stale_human_input_tool_is_cleared_by_later_end_turn(self):
+        path = write_jsonl([
+            {"type": "user", "timestamp": iso_now(-9000), "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "timestamp": iso_now(-8000), "message": {
+                "role": "assistant", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "name": "AskUserQuestion", "input": {}}],
+            }},
+            {"type": "assistant", "timestamp": iso_now(), "message": {
+                "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "All done. Tests pass."}],
+            }},
+        ])
+        try:
+            scan = th._scan_claude_transcript(path)
+            self.assertFalse(scan["active_turn"])
+            self.assertFalse(scan["waiting_for_user"])
+            self.assertEqual(scan["latest_stop_reason"], "end_turn")
+        finally:
+            os.remove(path)
+            th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
 
     def test_end_turn_statement_is_done_not_waiting(self):
         path = write_jsonl([

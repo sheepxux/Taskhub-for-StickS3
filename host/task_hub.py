@@ -25,9 +25,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -36,7 +38,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 Task = Dict[str, Any]
 
 DEFAULT_PORT = int(os.environ.get("TASK_HUB_PORT", "5577"))
-DEFAULT_BIND = os.environ.get("TASK_HUB_BIND", "0.0.0.0")
+DEFAULT_BIND = os.environ.get("TASK_HUB_BIND", "127.0.0.1")
 DEFAULT_TOKEN = os.environ.get("TASK_HUB_TOKEN", "dev-token")
 DEFAULT_DISCOVERY_PORT = int(os.environ.get("TASK_HUB_DISCOVERY_PORT", "5578"))
 TASK_HUB_VERSION = "1.1.1"
@@ -82,16 +84,49 @@ LOVABLE_DOMAINS = tuple(
     if part.strip()
 )
 LOVABLE_MAX_TABS = int(os.environ.get("TASK_HUB_LOVABLE_MAX_TABS", "3"))
+TRANSCRIPT_CACHE_MAX = int(os.environ.get("TASK_HUB_TRANSCRIPT_CACHE_MAX", "200"))
 
 # Memoise the expensive Claude transcript scans. Keyed by JSONL path, value is
 # the scan result tagged with (mtime, size); a cache hit means the file hasn't
 # changed since we last walked it, so we return the prior result instantly
 # instead of re-reading the entire transcript on every /tasks request. Hot for
 # users with many idle sessions on disk.
-_CLAUDE_TRANSCRIPT_CACHE: Dict[str, Dict[str, Any]] = {}
+_CLAUDE_TRANSCRIPT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # Same idea for Codex session rollouts; codex_usage_records() walks up to 80
 # *.jsonl files per /tasks request, so memoising makes idle sessions free.
-_CODEX_SESSION_CACHE: Dict[str, Dict[str, Any]] = {}
+_CODEX_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+# ThreadingHTTPServer serves /tasks from multiple threads, and the bounded-cache
+# helpers below mutate the OrderedDict in several steps (set → move_to_end →
+# popitem). Those sequences are not atomic, so guard every access with a shared
+# lock to keep a concurrent popitem from racing into KeyError/RuntimeError.
+_CACHE_LOCK = threading.Lock()
+
+
+def bounded_cache_get(
+    cache: "OrderedDict[str, Dict[str, Any]]",
+    key: str,
+    stamp: Tuple[int, int],
+) -> Optional[Dict[str, Any]]:
+    with _CACHE_LOCK:
+        cached = cache.get(key)
+        if cached and cached.get("_key") == stamp:
+            cache.move_to_end(key)
+            return cached
+        if cached:
+            cache.pop(key, None)
+        return None
+
+
+def bounded_cache_set(
+    cache: "OrderedDict[str, Dict[str, Any]]",
+    key: str,
+    value: Dict[str, Any],
+) -> None:
+    with _CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > TRANSCRIPT_CACHE_MAX:
+            cache.popitem(last=False)
 
 
 def ci_contains(needle: str, hay: str) -> bool:
@@ -369,8 +404,13 @@ def is_human_question(text: str) -> bool:
         "confirm before",
         "confirm this",
         "approve this",
-        "permission",
-        "approval",
+        "your permission",
+        "grant permission",
+        "need permission",
+        "needs permission",
+        "waiting for permission",
+        "approval required",
+        "requires approval",
         "should i",
         "would you like",
         "do you want me",
@@ -384,7 +424,7 @@ def is_human_question(text: str) -> bool:
         "what would you prefer",
         "which would you prefer",
         "shall i",
-        "go ahead",
+        "go ahead?",
         "continue?",
         "waiting for your",
         "need your confirmation",
@@ -512,8 +552,8 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
     except OSError:
         return None
     cache_key = (int(st.st_mtime * 1000), int(st.st_size))
-    cached = _CLAUDE_TRANSCRIPT_CACHE.get(path)
-    if cached and cached.get("_key") == cache_key:
+    cached = bounded_cache_get(_CLAUDE_TRANSCRIPT_CACHE, path, cache_key)
+    if cached:
         return cached
 
     fields = {
@@ -622,14 +662,18 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
         "latest_request_id": latest_request_id,
         "active_turn": active_turn,
         "waiting_for_user": (
-            is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
+            (
+                latest_human_input_request_ms > latest_terminal_ms
+                and is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
+            )
             or (
-                latest_non_human_tool_use_ms < latest_assistant_text_ms
+                latest_terminal_ms <= latest_assistant_text_ms
+                and latest_non_human_tool_use_ms < latest_assistant_text_ms
                 and is_waiting_for_human(latest_assistant_text_ms, latest_user_ms, latest_assistant_text)
             )
         ),
     }
-    _CLAUDE_TRANSCRIPT_CACHE[path] = scan
+    bounded_cache_set(_CLAUDE_TRANSCRIPT_CACHE, path, scan)
     return scan
 
 
@@ -661,8 +705,10 @@ def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> 
         "latest_event_ms": scan["latest_event_ms"],
         "latest_user_ms": scan["latest_user_ms"],
         "latest_assistant_ms": scan["latest_assistant_ms"],
+        "latest_assistant_text_ms": scan["latest_assistant_text_ms"],
         "latest_terminal_ms": scan["latest_terminal_ms"],
         "latest_human_input_request_ms": scan["latest_human_input_request_ms"],
+        "latest_non_human_tool_use_ms": scan["latest_non_human_tool_use_ms"],
         "latest_stop_reason": scan["latest_stop_reason"],
         "latest_request_id": scan["latest_request_id"],
         "active_turn": scan["active_turn"],
@@ -750,8 +796,8 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
     except OSError:
         return None
     cache_key = (int(st.st_mtime * 1000), int(st.st_size))
-    cached = _CODEX_SESSION_CACHE.get(path)
-    if cached and cached.get("_key") == cache_key:
+    cached = bounded_cache_get(_CODEX_SESSION_CACHE, path, cache_key)
+    if cached:
         return cached
 
     session_id = ""
@@ -864,7 +910,7 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
             )
         ),
     }
-    _CODEX_SESSION_CACHE[path] = scan
+    bounded_cache_set(_CODEX_SESSION_CACHE, path, scan)
     return scan
 
 
@@ -1031,21 +1077,23 @@ class OpenClawAdapter:
         rows: List[Dict[str, Any]] = []
         try:
             conn = sqlite3.connect(db_path, timeout=0.4)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA query_only = ON")
-            query = """
-                SELECT
-                  task_id, runtime, task_kind, source_id, requester_session_key,
-                  owner_key, scope_kind, child_session_key, parent_flow_id,
-                  parent_task_id, agent_id, run_id, label, status,
-                  delivery_status, notify_policy, created_at, started_at,
-                  ended_at, last_event_at, cleanup_after, terminal_outcome
-                FROM task_runs
-                ORDER BY COALESCE(last_event_at, ended_at, started_at, created_at) DESC
-                LIMIT 50
-            """
-            rows = [dict(row) for row in conn.execute(query)]
-            conn.close()
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only = ON")
+                query = """
+                    SELECT
+                      task_id, runtime, task_kind, source_id, requester_session_key,
+                      owner_key, scope_kind, child_session_key, parent_flow_id,
+                      parent_task_id, agent_id, run_id, label, status,
+                      delivery_status, notify_policy, created_at, started_at,
+                      ended_at, last_event_at, cleanup_after, terminal_outcome
+                    FROM task_runs
+                    ORDER BY COALESCE(last_event_at, ended_at, started_at, created_at) DESC
+                    LIMIT 50
+                """
+                rows = [dict(row) for row in conn.execute(query)]
+            finally:
+                conn.close()
         except (OSError, sqlite3.Error):
             return []
 
@@ -1365,6 +1413,10 @@ class ClaudeAdapter:
                         "turn_state": claude_turn_state(metrics),
                         "latest_stop_reason": metrics.get("latest_stop_reason"),
                         "latest_event_at": ms_to_iso(safe_int(metrics.get("latest_event_ms"))),
+                        "latest_terminal_at": ms_to_iso(safe_int(metrics.get("latest_terminal_ms"))),
+                        "latest_assistant_text_at": ms_to_iso(safe_int(metrics.get("latest_assistant_text_ms"))),
+                        "latest_human_input_request_at": ms_to_iso(safe_int(metrics.get("latest_human_input_request_ms"))),
+                        "latest_non_human_tool_use_at": ms_to_iso(safe_int(metrics.get("latest_non_human_tool_use_ms"))),
                         "transcript_found": bool(metrics.get("transcript_found")),
                     },
                     usage=usage,
@@ -1398,6 +1450,10 @@ class ClaudeAdapter:
                             "turn_state": claude_turn_state(metrics),
                             "latest_stop_reason": metrics.get("latest_stop_reason"),
                             "latest_event_at": ms_to_iso(safe_int(metrics.get("latest_event_ms"))),
+                            "latest_terminal_at": ms_to_iso(safe_int(metrics.get("latest_terminal_ms"))),
+                            "latest_assistant_text_at": ms_to_iso(safe_int(metrics.get("latest_assistant_text_ms"))),
+                            "latest_human_input_request_at": ms_to_iso(safe_int(metrics.get("latest_human_input_request_ms"))),
+                            "latest_non_human_tool_use_at": ms_to_iso(safe_int(metrics.get("latest_non_human_tool_use_ms"))),
                             "transcript_found": bool(metrics.get("transcript_found")),
                         },
                         usage=metrics.get("usage") or {},
@@ -4031,6 +4087,7 @@ class Hub:
                 else:
                     tasks.extend(adapter.list_tasks())
             except Exception as exc:
+                traceback.print_exc()
                 tasks.append(
                     task(
                         task_id=stable_id("adapter-error", adapter.source),
