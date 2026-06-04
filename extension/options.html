@@ -25,9 +25,14 @@
     </div>
     <div style="max-width: 90px">
       <label for="port">Port</label>
-      <input id="port" placeholder="5577" />
+      <input id="port" value="5577" readonly title="Fixed to 5577 to match the extension's host permissions." />
     </div>
   </div>
+  <p class="hint" style="margin-top: 6px">
+    Port is fixed to <code>5577</code> — the extension only has permission to
+    reach the Host on that port. Change <code>Host</code> only between
+    <code>127.0.0.1</code> and <code>localhost</code>.
+  </p>
   <label for="token">Device token</label>
   <input id="token" placeholder="dev-token" />
   <div class="row">

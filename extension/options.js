@@ -16,12 +16,23 @@ function setStatus(text, cls) {
   el.className = cls || "muted";
 }
 
+// Port is pinned to 5577 and Host to a loopback name: the extension's
+// host_permissions only cover http://127.0.0.1:5577 and http://localhost:5577,
+// so anything else would be silently blocked by MV3 at fetch time.
+const ALLOWED_HOSTS = new Set(["127.0.0.1", "localhost"]);
+const FIXED_PORT = 5577;
+
 async function save() {
-  const host = $("host").value.trim() || "127.0.0.1";
-  const port = parseInt($("port").value.trim(), 10) || 5577;
+  let host = $("host").value.trim() || "127.0.0.1";
+  if (!ALLOWED_HOSTS.has(host)) {
+    host = "127.0.0.1";
+    $("host").value = host;
+    setStatus("Host must be 127.0.0.1 or localhost — reset to 127.0.0.1.", "err");
+  }
+  $("port").value = String(FIXED_PORT);
   const token = $("token").value.trim() || "dev-token";
-  await chrome.storage.local.set({ host, port, token });
-  setStatus("Saved.", "ok");
+  await chrome.storage.local.set({ host, port: FIXED_PORT, token });
+  if ($("status").className !== "err") setStatus("Saved.", "ok");
 }
 
 async function test() {

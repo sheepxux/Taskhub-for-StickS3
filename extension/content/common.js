@@ -55,7 +55,7 @@
       ) {
         // must be actually visible
         const r = el.getBoundingClientRect && el.getBoundingClientRect();
-        if (!r || (r.width > 0 && r.height > 0)) return true;
+        if (r && r.width > 0 && r.height > 0) return true;
       }
     }
     return false;
