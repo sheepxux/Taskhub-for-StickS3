@@ -109,7 +109,8 @@ Power behavior:
 
 - The device wakes, fetches tasks, shows them briefly, then enters deep sleep.
 - It wakes every `AUTO_WAKE_SECONDS=600` by default, or every
-  `ACTIVE_WAKE_SECONDS=180` while active/attention tasks are visible.
+  `ACTIVE_WAKE_SECONDS=60` while active/attention tasks are visible, so a freshly
+  appeared `WAIT` is noticed within ~1 minute.
 - Below `LOW_BATTERY_THRESHOLD_PCT=30`, it drops brightness and wakes every
   `LOW_BATTERY_WAKE_SECONDS=900`.
 - Timer wakes stay interactive for `QUIET_TIMER_TIMEOUT_MS=3000`; button wakes

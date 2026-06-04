@@ -9,6 +9,8 @@ source.
 
 **Local-only:** the extension talks to `http://127.0.0.1:5577` (your Host) and
 nowhere else. It reads only the open tab's title and a "generating" indicator.
+The options page pins the port to `5577` and the Host to `127.0.0.1`/`localhost`
+to match the extension's scoped permissions — only the device token is editable.
 
 ## Install (load unpacked)
 
@@ -25,7 +27,7 @@ nowhere else. It reads only the open tab's title and a "generating" indicator.
 ## How it behaves
 
 - One task per open tab (`id = ext-<source>-<tabId>`); refreshing replaces it.
-- While a tab is open, a 20s heartbeat keeps the task alive (Host TTL is 45s).
+- While a tab is open, a 30s heartbeat keeps the task alive (Host TTL is 60s).
 - Close the tab → the heartbeat stops → the task ages out of the Host on its own.
 - Only the **foreground** tab reports, to avoid a wall of background tabs.
 - Status is `running` when a Stop/▢ generating control is visible, else `recent`.

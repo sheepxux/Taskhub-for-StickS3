@@ -13,14 +13,23 @@
 - `INSTALL.md` with full first-run, manual, multi-Mac, update, uninstall, and troubleshooting instructions.
 - `scripts/setup.sh` for conservative first-run setup, token sync, firmware secret generation, optional Arduino dependency install, compile, and upload.
 - `README.zh-CN.md` as a Chinese project landing page.
+- Edge-triggered StickS3 alert when a task first enters `WAIT`: wakes the screen, flashes amber, and beeps via the speaker (tunable/silenceable through `ALERT_*` defines). Fires once per empty→WAIT transition, persisted in RTC so a wait first seen on a timer wake still alerts.
 
 ### Changed
 
 - README now links to the Chinese version and the installation guide, and uses the setup helper in Quick Start.
+- Direct manual Host runs now bind to `127.0.0.1` by default; installer-managed LAN mode still passes `--bind 0.0.0.0` explicitly for StickS3 access.
+- StickS3 active-state wake cadence tightened from 180s to 60s, capping how long a freshly-appeared `WAIT` can go unnoticed while deep-sleeping (a WAIT almost always follows a running task). Battery-tunable via `ACTIVE_WAKE_SECONDS`.
 
 ### Fixed
 
+- Claude/Codex transcript memoisation now uses a bounded LRU cache instead of growing without eviction, guarded by a lock so concurrent `/tasks` threads can't race its eviction step.
 - Claude Code running-session detection was case-sensitive on `/Claude.app/` and missed the lowercase `claude.app` binary; now case-insensitive.
+- Claude Code `WAIT` detection now ignores stale human-input tool requests once a later terminal assistant event exists.
+- StickS3 clears stale `WAIT` rows after refresh failures instead of keeping an old yellow state indefinitely.
+- Extension local Host permissions are scoped to port `5577`, and visible Stop-button detection no longer treats missing layout boxes as visible.
+- Extension options now pin the port to `5577` (read-only) and restrict Host to `127.0.0.1`/`localhost`, matching the scoped permissions so a stray value can't be silently blocked at fetch time.
+- Adapter exceptions now print tracebacks to stderr before surfacing a failed task row.
 
 ### Performance
 

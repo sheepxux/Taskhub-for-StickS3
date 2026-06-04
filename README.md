@@ -4,6 +4,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 
 [简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
 
+[![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/badge/release-v1.1.1-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
@@ -76,6 +77,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnA open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
 | WAIT attention mode | Ready | Keeps the display awake while a task needs user input |
+| WAIT alert | Ready | Edge-triggered screen wake + amber flash + speaker beep when a task first needs input (`ALERT_*` tunable) |
 | Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
 | Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
 | Claude Code adapter | Detailed | Tracks transcript turn state, prompts, usage, resume process |
@@ -112,7 +114,7 @@ anything from the computer.
 | Label | Color intent | Meaning | StickS3 visibility |
 | --- | --- | --- | --- |
 | `RUN` | Blue | Active task or active agent turn | Always visible |
-| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible and keeps screen awake |
+| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible, keeps screen awake, and fires a one-shot alert (wake + flash + beep) on entry |
 | `FAIL` | Red | Failed or needs attention | Always visible |
 | `DONE` | Green | Completed | Hidden after 10 minutes by default |
 | `REC` | White/gray | Recently active | Hidden after 1 hour by default |
@@ -315,7 +317,7 @@ briefly, then sleeps again. Active and WAIT tasks refresh more often.
 | Setting | Default |
 | --- | --- |
 | Normal timer wake | `AUTO_WAKE_SECONDS=600` |
-| Active/attention timer wake | `ACTIVE_WAKE_SECONDS=180` |
+| Active/attention timer wake | `ACTIVE_WAKE_SECONDS=60` |
 | Low-battery timer wake | `LOW_BATTERY_WAKE_SECONDS=900` |
 | Timer-wake screen time | `QUIET_TIMER_TIMEOUT_MS=3000` |
 | Button-wake screen time | `INTERACTIVE_TIMEOUT_MS=10000` |
@@ -323,6 +325,23 @@ briefly, then sleeps again. Active and WAIT tasks refresh more often.
 | Low-battery brightness | `LOW_BATTERY_BRIGHTNESS=16` |
 | CPU clock | `POWER_SAVE_CPU_MHZ=80` |
 | Charge current | `CHARGE_CURRENT_MA=200` |
+
+A WAIT almost always follows a running task, so the device is usually deep-sleeping
+with an active task when one appears. `ACTIVE_WAKE_SECONDS=60` caps how long a new
+WAIT can go unnoticed to ~1 minute while staying battery-first; raise it to trade
+latency for battery life.
+
+The on-device WAIT alert is tunable in `firmware/task_monitor/secrets.h`:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ALERT_ON_WAIT` | `1` | Master switch for the WAIT alert |
+| `ALERT_BEEP` | `1` | Speaker beep on entry; set `0` for a silent screen-only alert |
+| `ALERT_BEEP_HZ` / `ALERT_BEEP_VOLUME` | `2600` / `160` | Beep tone and loudness |
+
+> Vibration: the M5StickS3 is not driven as a motor by the pinned M5Unified, so
+> `ALERT_VIBRATION` is a no-op on this board and stays off — the alert uses the
+> screen and speaker instead.
 
 For UI or network debugging, set `ENABLE_DEEP_SLEEP` to `0` in
 `firmware/task_monitor/secrets.h`. Re-enable it before normal use.
@@ -354,6 +373,8 @@ TaskHub is local-first.
 - Firmware Wi-Fi secrets live in `secrets.h`, which is gitignored.
 - The StickS3 API does not return auth tokens or message bodies.
 - LAN peers must use the same token to participate.
+- Host-to-device traffic uses plain HTTP on your LAN; run TaskHub only on a
+  trusted local network.
 - Do not expose port `5577` or `5578` directly to the public internet.
 
 ## Troubleshooting
@@ -373,10 +394,20 @@ TaskHub is local-first.
 Useful checks before publishing a build:
 
 ```bash
+python3 -m unittest discover -s host/tests   # host adapter regression suite
 python3 -m py_compile host/task_hub.py docs/render_screens.py
 python3 docs/render_screens.py
 ./firmware/flash_task_monitor.sh compile
 ```
+
+### Testing & CI
+
+The host logic ships with a dependency-free `unittest` suite in
+[`host/tests/`](host/tests) covering status derivation, WAIT detection,
+case-insensitive process matching, token accounting, LRU scan memoisation, and
+`/ingest` validation/expiry. [GitHub Actions](.github/workflows/ci.yml) runs the
+suite, byte-compiles the Host, and compiles the firmware against the ESP32 core
+on every push and pull request.
 
 Repository layout:
 
@@ -395,9 +426,9 @@ CHANGELOG.md             Release notes
 ## Roadmap
 
 - Signed or packaged Mac installer.
-- Adapter regression tests with recorded local metadata fixtures.
+- Recorded local-metadata fixtures to broaden the adapter regression suite.
 - More detailed browser-task extraction for Gemini, Lovable, and Perplexity.
-- Optional physical alert accessory for WAIT/FAIL events.
+- FAIL alert tone distinct from the WAIT alert, plus an optional external buzzer.
 - Better first-run setup flow for non-developer users.
 
 ## Release

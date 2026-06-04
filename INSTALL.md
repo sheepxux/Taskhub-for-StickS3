@@ -7,6 +7,10 @@ TaskHub has two parts:
 - **Mac Host**: a local macOS service that reads AI task state and exposes a LAN API.
 - **StickS3 firmware**: the M5StickS3 app that discovers the Host, shows task state, and sleeps between refreshes.
 
+Security note: Host-to-device traffic uses plain HTTP with a shared token. Use
+TaskHub only on a trusted local network, and do not expose ports `5577` or
+`5578` to the public internet.
+
 ## Requirements
 
 - macOS
