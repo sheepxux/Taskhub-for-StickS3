@@ -91,7 +91,12 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 #endif
 
 #if !defined(ACTIVE_WAKE_SECONDS)
-#define ACTIVE_WAKE_SECONDS 180
+// A WAIT almost always appears while a task is already running, so the device
+// is most likely deep-sleeping with active/attention tasks when one shows up.
+// 60s (was 180s) caps the worst-case "turned to WAIT" latency to ~1 min while
+// staying battery-first — active windows are bounded, so the 3x wake frequency
+// only applies briefly. Tune up for more battery, down for snappier alerts.
+#define ACTIVE_WAKE_SECONDS 60
 #endif
 
 #if !defined(LOW_BATTERY_WAKE_SECONDS)
@@ -146,6 +151,43 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 #define AUTO_REFRESH_INPUT_GUARD_MS 1000
 #endif
 
+// Edge-triggered alert when the task set first enters a WAIT (a session asking
+// for human input). Fires once per empty->WAIT transition, including when a
+// timer wake boots straight into a WAIT. Screen wake + flash always works; the
+// beep uses the StickS3 speaker (M5.Speaker). Vibration is left as a future
+// hook: the pinned M5Unified does NOT drive a motor on board_M5StickS3
+// (setVibration is a no-op there), so it stays off by default.
+#if !defined(ALERT_ON_WAIT)
+#define ALERT_ON_WAIT 1
+#endif
+#if !defined(ALERT_BEEP)
+#define ALERT_BEEP 1
+#endif
+#if !defined(ALERT_BEEP_HZ)
+#define ALERT_BEEP_HZ 2600
+#endif
+#if !defined(ALERT_BEEP_MS)
+#define ALERT_BEEP_MS 160
+#endif
+#if !defined(ALERT_BEEP_VOLUME)
+#define ALERT_BEEP_VOLUME 160
+#endif
+#if !defined(ALERT_FLASH_COUNT)
+#define ALERT_FLASH_COUNT 2
+#endif
+#if !defined(ALERT_FLASH_MS)
+#define ALERT_FLASH_MS 90
+#endif
+#if !defined(ALERT_VIBRATION)
+#define ALERT_VIBRATION 0
+#endif
+#if !defined(ALERT_VIBRATION_LEVEL)
+#define ALERT_VIBRATION_LEVEL 200
+#endif
+#if !defined(ALERT_VIBRATION_MS)
+#define ALERT_VIBRATION_MS 180
+#endif
+
 #if !defined(STICK_HIDE_DONE_AFTER_SEC)
 #define STICK_HIDE_DONE_AFTER_SEC 600
 #endif
@@ -172,6 +214,10 @@ static constexpr gpio_num_t PIN_BTN_B = GPIO_NUM_12;
 // single biggest awake-time win on a battery-bound device.
 RTC_DATA_ATTR static uint8_t  rtcCachedBssid[6] = {0};
 RTC_DATA_ATTR static int32_t  rtcCachedChannel = 0;
+// Tracks whether a WAIT was present at the last refresh, persisted across deep
+// sleep so the empty->WAIT edge alert fires once even when the transition is
+// first observed on a timer wake (rather than re-alerting every refresh).
+RTC_DATA_ATTR static bool     rtcWaitWasActive = false;
 RTC_DATA_ATTR static bool     rtcHasCachedBssid = false;
 
 struct AiTask {
@@ -526,6 +572,44 @@ static bool hasWaitingTasks() {
   return waitCount > 0;
 }
 
+static void flashScreen(int color) {
+  for (int i = 0; i < ALERT_FLASH_COUNT; i++) {
+    M5.Display.fillScreen(color);
+    delay(ALERT_FLASH_MS);
+    M5.Display.fillScreen(C_BG);
+    if (i + 1 < ALERT_FLASH_COUNT) delay(ALERT_FLASH_MS);
+  }
+}
+
+// Fired once on an empty->WAIT transition. Wakes/flashes the screen (always
+// reliable) and beeps via the speaker; caller repaints the list afterwards.
+static void alertNewWait() {
+  M5.Display.wakeup();
+  applyDisplayBrightness();
+#if ALERT_BEEP
+  M5.Speaker.setVolume(ALERT_BEEP_VOLUME);
+  M5.Speaker.tone(ALERT_BEEP_HZ, ALERT_BEEP_MS);  // non-blocking, plays via I2S
+#endif
+#if ALERT_VIBRATION
+  // No-op on board_M5StickS3 in the pinned M5Unified; kept as a future hook.
+  M5.Power.setVibration(ALERT_VIBRATION_LEVEL);
+  delay(ALERT_VIBRATION_MS);
+  M5.Power.setVibration(0);
+#endif
+  flashScreen(C_AMBER);
+}
+
+// Edge detector: alert only when the WAIT set goes from empty to non-empty.
+static void updateWaitAlert() {
+  bool waitActive = waitCount > 0;
+#if ALERT_ON_WAIT
+  if (waitActive && !rtcWaitWasActive) {
+    alertNewWait();
+  }
+#endif
+  rtcWaitWasActive = waitActive;
+}
+
 static uint32_t hideAfterSec(const String& status) {
   if (status == "run" || status == "wait" || status == "fail") return 0;
   if (status == "done") return STICK_HIDE_DONE_AFTER_SEC;
@@ -552,6 +636,15 @@ static int firstPriorityTask() {
     if (isPriorityTask(tasks[i])) return i;
   }
   return -1;
+}
+
+static void clearStaleWaitSnapshot() {
+  taskCount = 0;
+  selected = 0;
+  activeCount = 0;
+  attentionCount = 0;
+  waitCount = 0;
+  hiddenCount = 0;
 }
 
 static void updateBtnBEdge() {
@@ -852,8 +945,10 @@ static void drawList() {
 static bool fetchTasks() {
   lastError = "";
   String previousSelectedId = (taskCount > 0 && selected < taskCount) ? tasks[selected].id : "";
+  bool previousHadWait = waitCount > 0;
   if (!ensureWifi()) {
     lastError = "Wi-Fi failed";
+    if (previousHadWait) clearStaleWaitSnapshot();
     Serial.println("[task-monitor] fetch failed: wifi");
     return false;
   }
@@ -887,6 +982,7 @@ static bool fetchTasks() {
   if (code != 200) {
     lastError = String("HTTP ") + String(code);
     setBootStatus(lastError, C_RED);
+    if (previousHadWait) clearStaleWaitSnapshot();
     Serial.printf("[task-monitor] fetch failed: http=%d url=%s\n", code, url.c_str());
     if (requestOpen) http.end();
     return false;
@@ -900,6 +996,7 @@ static bool fetchTasks() {
   if (err) {
     lastError = "JSON error";
     setBootStatus(lastError, C_RED);
+    if (previousHadWait) clearStaleWaitSnapshot();
     Serial.printf("[task-monitor] fetch failed: json=%s\n", err.c_str());
     return false;
   }
@@ -1020,6 +1117,7 @@ static void refreshNow() {
   drawMessage("刷新中", apiBase(), C_AMBER);
   bool ok = fetchTasks();
   updateBattery();
+  updateWaitAlert();
   if (hasWaitingTasks()) {
     M5.Display.wakeup();
     applyDisplayBrightness();
@@ -1089,6 +1187,7 @@ void setup() {
 
   bool ok = fetchTasks();
   updateBattery();
+  updateWaitAlert();
 #if ENABLE_DEEP_SLEEP
   activeTimeoutMs = hasWaitingTasks() ? UINT32_MAX : ((wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS);
 #else
@@ -1124,6 +1223,7 @@ void loop() {
       millis() - lastInputAt > AUTO_REFRESH_INPUT_GUARD_MS) {
     bool ok = fetchTasks();
     updateBattery();
+    updateWaitAlert();
     if (hasWaitingTasks()) {
       M5.Display.wakeup();
       applyDisplayBrightness();
