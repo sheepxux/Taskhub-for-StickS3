@@ -240,6 +240,26 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 #define STICK_HIDE_UNKNOWN_AFTER_SEC 1800
 #endif
 
+// Voice mode: hold BtnB to record (M5.Mic -> PSRAM), release to POST the clip
+// to the Host's /voice endpoint, which transcribes it with whisper and pastes
+// the text into the selected task's app. Recording uses the speaker's I2S, so
+// we stop M5.Speaker while the mic runs and restore it afterwards.
+#if !defined(ENABLE_VOICE)
+#define ENABLE_VOICE 1
+#endif
+#if !defined(VOICE_SAMPLE_RATE)
+#define VOICE_SAMPLE_RATE 16000
+#endif
+#if !defined(VOICE_MAX_SECONDS)
+#define VOICE_MAX_SECONDS 20
+#endif
+#if !defined(VOICE_HTTP_TIMEOUT_MS)
+#define VOICE_HTTP_TIMEOUT_MS 20000
+#endif
+#define VOICE_MAX_SAMPLES ((uint32_t)VOICE_SAMPLE_RATE * VOICE_MAX_SECONDS)
+#define VOICE_WAV_HEADER 44
+#define VOICE_MIC_CHUNK 1600   // ~100ms at 16 kHz
+
 static constexpr gpio_num_t PIN_BTN_A = GPIO_NUM_11;
 static constexpr gpio_num_t PIN_BTN_B = GPIO_NUM_12;
 static constexpr size_t SERIAL_CONFIG_MAX = 768;
@@ -317,6 +337,14 @@ static bool btnBStablePressed = false;
 static bool btnBHoldFired = false;
 static bool btnBClickEvent = false;
 static bool btnBHoldEvent = false;
+
+// Voice mode state. voiceBuf is one PSRAM block: [44-byte WAV header][PCM16].
+static uint8_t* voiceBuf = nullptr;
+static int16_t* voicePcm = nullptr;       // = voiceBuf + 44, where samples land
+static uint32_t voiceSamples = 0;         // samples queued/recorded so far
+static bool voiceRecording = false;
+static uint32_t voiceStartMs = 0;
+static uint32_t voiceLastUiSec = 0;
 static uint32_t btnBLastChangeAt = 0;
 static uint32_t btnBPressedAt = 0;
 static bool bootScreenActive = false;
@@ -1516,6 +1544,131 @@ static void refreshNow() {
   (void)ok;
 }
 
+#if ENABLE_VOICE
+static void writeWavHeader(uint8_t* p, uint32_t pcmBytes) {
+  uint32_t chunk = 36 + pcmBytes;
+  uint32_t rate = VOICE_SAMPLE_RATE;
+  uint32_t byteRate = rate * 2;  // mono, 16-bit
+  memcpy(p, "RIFF", 4);
+  p[4] = chunk; p[5] = chunk >> 8; p[6] = chunk >> 16; p[7] = chunk >> 24;
+  memcpy(p + 8, "WAVEfmt ", 8);
+  p[16] = 16; p[17] = 0; p[18] = 0; p[19] = 0;   // fmt chunk size
+  p[20] = 1;  p[21] = 0;                          // PCM
+  p[22] = 1;  p[23] = 0;                          // mono
+  p[24] = rate; p[25] = rate >> 8; p[26] = rate >> 16; p[27] = rate >> 24;
+  p[28] = byteRate; p[29] = byteRate >> 8; p[30] = byteRate >> 16; p[31] = byteRate >> 24;
+  p[32] = 2;  p[33] = 0;                          // block align
+  p[34] = 16; p[35] = 0;                          // bits per sample
+  memcpy(p + 36, "data", 4);
+  p[40] = pcmBytes; p[41] = pcmBytes >> 8; p[42] = pcmBytes >> 16; p[43] = pcmBytes >> 24;
+}
+
+static void drawVoiceRecordingUI(uint32_t sec) {
+  M5.Display.fillScreen(C_BG);
+  int W = M5.Display.width();
+  int H = M5.Display.height();
+  M5.Display.fillCircle(W / 2, H * 30 / 100, 9, C_RED);
+  centerText("录音中", H * 52 / 100, C_RED, &fonts::efontCN_16);
+  centerText(String(sec) + "s · 松手发送", H * 74 / 100, C_GRAY, &fonts::efontCN_12);
+}
+
+// Keep the mic's DMA slots fed so capture is gapless while BtnB is held.
+static void pumpMic() {
+  while (M5.Mic.isRecording() < 2 && voiceSamples + VOICE_MIC_CHUNK <= VOICE_MAX_SAMPLES) {
+    if (!M5.Mic.record(voicePcm + voiceSamples, VOICE_MIC_CHUNK, VOICE_SAMPLE_RATE)) break;
+    voiceSamples += VOICE_MIC_CHUNK;
+  }
+}
+
+static void startVoiceRecording() {
+  if (!voiceBuf) {
+    drawMessage("语音不可用", "PSRAM 分配失败", C_RED);
+    delay(900); drawList(); return;
+  }
+  if (!ensureWifi()) {
+    drawMessage("语音失败", "Wi-Fi 未连接", C_RED);
+    delay(900); drawList(); return;
+  }
+  voiceSamples = 0;
+  M5.Speaker.end();                 // free the shared I2S for the mic
+  if (!M5.Mic.begin()) {
+    M5.Speaker.begin();
+    drawMessage("麦克风启动失败", "", C_RED);
+    delay(900); drawList(); return;
+  }
+  voiceRecording = true;
+  voiceStartMs = millis();
+  voiceLastUiSec = 999;             // force first UI draw
+  lastInputAt = millis();
+}
+
+static void stopAndSendVoice() {
+  voiceRecording = false;
+  uint32_t t0 = millis();
+  while (M5.Mic.isRecording() && millis() - t0 < 500) delay(5);  // drain queued chunks
+  M5.Mic.end();
+  M5.Speaker.begin();               // restore speaker for alert tones
+
+  uint32_t samples = voiceSamples;
+  if (samples < (uint32_t)VOICE_SAMPLE_RATE / 4) {   // < 0.25s
+    drawMessage("太短了", "按住 BtnB 说话", C_AMBER);
+    delay(900); drawList(); return;
+  }
+  uint32_t pcmBytes = samples * 2;
+  writeWavHeader(voiceBuf, pcmBytes);
+
+  drawMessage("转写中…", "", C_BLUE);
+  String tid = (taskCount > 0 && selected < taskCount) ? tasks[selected].id : "";
+  String url = apiBase() + "/voice";
+  if (tid.length()) url += "?task=" + urlEncode(tid);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("X-Device-Token", cfgDeviceToken);
+  http.addHeader("Content-Type", "audio/wav");
+  http.setTimeout(VOICE_HTTP_TIMEOUT_MS);
+  int code = http.POST(voiceBuf, VOICE_WAV_HEADER + pcmBytes);
+  String resp = (code > 0) ? http.getString() : "";
+  http.end();
+
+  if (code == 200) {
+    JsonDocument doc;
+    String text = "";
+    bool injected = false;
+    if (deserializeJson(doc, resp) == DeserializationError::Ok) {
+      text = String((const char*)(doc["text"] | ""));
+      injected = doc["injected"] | false;
+    }
+    if (text.length() == 0) {
+      drawMessage("没听清", "再试一次", C_AMBER);
+    } else {
+      drawMessage(injected ? "✓ 已输入" : "已转写", text, injected ? C_GREEN : C_AMBER);
+    }
+  } else {
+    drawMessage("语音失败", code > 0 ? String("HTTP ") + code : "无法连接", C_RED);
+  }
+  delay(1400);
+  drawList();
+}
+
+// Called every loop: while BtnB is held, keep recording and update the timer;
+// on release (or max length) stop and send.
+static void updateVoiceRecording() {
+  if (!voiceRecording) return;
+  lastInputAt = millis();
+  pumpMic();
+  uint32_t elapsed = millis() - voiceStartMs;
+  uint32_t sec = elapsed / 1000;
+  if (sec != voiceLastUiSec) {
+    voiceLastUiSec = sec;
+    drawVoiceRecordingUI(sec);
+  }
+  if (!btnBStablePressed || elapsed >= (uint32_t)VOICE_MAX_SECONDS * 1000) {
+    stopAndSendVoice();
+  }
+}
+#endif  // ENABLE_VOICE
+
 static void handleButtons() {
   // BtnA: click = next task (or refresh when the list is empty), hold = refresh.
   if (M5.BtnA.wasHold()) {
@@ -1531,12 +1684,19 @@ static void handleButtons() {
     }
   }
 
-  // BtnB: click = open the selected task on the Mac. (Hold is unused now.)
+  // BtnB: click = open the selected task on the Mac; hold = voice (hold-to-talk).
+  bool bHold = btnBHoldEvent;
   bool bClick = btnBClickEvent;
   btnBHoldEvent = false;
   btnBClickEvent = false;
 
-  if (bClick) {
+#if ENABLE_VOICE
+  if (bHold && !voiceRecording) {
+    startVoiceRecording();   // recording continues in updateVoiceRecording()
+  }
+#endif
+
+  if (bClick && !voiceRecording) {
     lastInputAt = millis();
     drawMessage("打开任务", taskCount ? tasks[selected].source : "no task", C_BLUE);
     bool ok = openSelectedTask();
@@ -1568,6 +1728,11 @@ void setup() {
   Serial.begin(115200);
   updateBattery();
   applyPowerProfile();
+#if ENABLE_VOICE
+  voiceBuf = (uint8_t*)ps_malloc(VOICE_WAV_HEADER + VOICE_MAX_SAMPLES * 2);
+  if (voiceBuf) voicePcm = (int16_t*)(voiceBuf + VOICE_WAV_HEADER);
+  else Serial.println("[task-monitor] voice: PSRAM alloc failed; hold-to-talk disabled");
+#endif
   if (digitalRead((int)PIN_BTN_A) == LOW && digitalRead((int)PIN_BTN_B) == LOW) {
     clearRuntimeConfig();
     rtcHasCachedBssid = false;
@@ -1637,6 +1802,13 @@ void loop() {
 
   updateBtnBEdge();
   handleButtons();
+#if ENABLE_VOICE
+  if (voiceRecording) {
+    updateVoiceRecording();   // pump mic + watch for release; owns the loop
+    delay(5);
+    return;
+  }
+#endif
   updateAutoRotate();
 
   static uint32_t lastBattAt = 0;
