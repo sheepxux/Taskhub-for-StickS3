@@ -77,7 +77,8 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnA open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
 | WAIT attention mode | Ready | Keeps the display awake while a task needs user input |
-| WAIT alert | Ready | Edge-triggered screen wake + amber flash + speaker beep when a task first needs input (`ALERT_*` tunable) |
+| WAIT alert | Ready | Edge-triggered screen wake + short double beep when a task first needs input (`ALERT_*` tunable) |
+| DONE alert | Ready | Edge-triggered softer rising chime when a running task finishes |
 | Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
 | Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
 | Claude Code adapter | Detailed | Tracks transcript turn state, prompts, usage, resume process |
@@ -114,9 +115,9 @@ anything from the computer.
 | Label | Color intent | Meaning | StickS3 visibility |
 | --- | --- | --- | --- |
 | `RUN` | Blue | Active task or active agent turn | Always visible |
-| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible, keeps screen awake, and fires a one-shot alert (wake + flash + beep) on entry |
+| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible, keeps screen awake, and fires a one-shot wake + double-beep alert on entry |
 | `FAIL` | Red | Failed or needs attention | Always visible |
-| `DONE` | Green | Completed | Hidden after 10 minutes by default |
+| `DONE` | Green | Completed | Hidden after 10 minutes by default; a running-to-finished edge plays a softer chime |
 | `REC` | White/gray | Recently active | Hidden after 1 hour by default |
 | `IDLE` | Dark gray | Source is idle | Hidden after 10 minutes by default |
 | `HIDDEN` | Gray/black | Display-only stale row | Not shown on device |
@@ -331,13 +332,15 @@ with an active task when one appears. `ACTIVE_WAKE_SECONDS=60` caps how long a n
 WAIT can go unnoticed to ~1 minute while staying battery-first; raise it to trade
 latency for battery life.
 
-The on-device WAIT alert is tunable in `firmware/task_monitor/secrets.h`:
+The on-device WAIT/DONE alerts are tunable in `firmware/task_monitor/secrets.h`:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `ALERT_ON_WAIT` | `1` | Master switch for the WAIT alert |
-| `ALERT_BEEP` | `1` | Speaker beep on entry; set `0` for a silent screen-only alert |
-| `ALERT_BEEP_HZ` / `ALERT_BEEP_VOLUME` | `2600` / `160` | Beep tone and loudness |
+| `ALERT_ON_DONE` | `1` | Master switch for the DONE chime |
+| `ALERT_BEEP` | `1` | Speaker beep/chime; set `0` for silent screen-only alerts |
+| `ALERT_WAIT_HZ` / `ALERT_DONE_HZ` | `2400` / `1500` | WAIT double-beep pitch and DONE base pitch |
+| `ALERT_BEEP_VOLUME` | `150` | Shared speaker loudness |
 
 > Vibration: the M5StickS3 is not driven as a motor by the pinned M5Unified, so
 > `ALERT_VIBRATION` is a no-op on this board and stays off — the alert uses the
@@ -415,6 +418,7 @@ Repository layout:
 firmware/task_monitor/   StickS3 firmware
 firmware/flash_task_monitor.sh
 host/task_hub.py         Local macOS Host
+host/taskhub_config.py   Host runtime configuration
 host/install_task_hub.sh LaunchAgent installer/repair script
 host/README.md           Host diagnostics and adapter notes
 scripts/setup.sh         First-run setup helper

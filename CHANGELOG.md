@@ -13,15 +13,22 @@
 - `INSTALL.md` with full first-run, manual, multi-Mac, update, uninstall, and troubleshooting instructions.
 - `scripts/setup.sh` for conservative first-run setup, token sync, firmware secret generation, optional Arduino dependency install, compile, and upload.
 - `README.zh-CN.md` as a Chinese project landing page.
-- Edge-triggered StickS3 alert when a task first enters `WAIT`: wakes the screen, flashes amber, and beeps via the speaker (tunable/silenceable through `ALERT_*` defines). Fires once per empty→WAIT transition, persisted in RTC so a wait first seen on a timer wake still alerts.
+- Edge-triggered StickS3 alert when a task first enters `WAIT`: wakes the screen and plays a short double beep via the speaker (tunable/silenceable through `ALERT_*` defines). Fires once per empty→WAIT transition, persisted in RTC so a wait first seen on a timer wake still alerts.
+- Edge-triggered StickS3 `DONE` chime when a running task finishes, using a softer rising tone.
 
 ### Changed
 
 - README now links to the Chinese version and the installation guide, and uses the setup helper in Quick Start.
 - Direct manual Host runs now bind to `127.0.0.1` by default; installer-managed LAN mode still passes `--bind 0.0.0.0` explicitly for StickS3 access.
 - StickS3 active-state wake cadence tightened from 180s to 60s, capping how long a freshly-appeared `WAIT` can go unnoticed while deep-sleeping (a WAIT almost always follows a running task). Battery-tunable via `ACTIVE_WAKE_SECONDS`.
+- Host runtime configuration moved into `host/taskhub_config.py`, reducing the size of the main Host entrypoint without changing its external API.
+- Host installer now copies `taskhub_*.py` helper modules alongside `task_hub.py`.
+- StickS3 alert defaults retuned for desk use: lower volume, shorter WAIT double beep, and softer DONE chime.
+- A completed Claude turn now reports as green `DONE` for a short window (`TASK_HUB_CLAUDE_DONE_WINDOW_MS`, default 5 min) before settling to `REC`, so "the turn just finished" is a distinct state the StickS3 can show and chime on.
 
 ### Fixed
+
+- `WAIT` is now driven only by an explicit, unanswered AskUserQuestion / `request_user_input` tool call. A turn that merely ends with question-like prose is treated as a completed turn (`DONE`) — the old text heuristic produced false WAITs on chatty endings. The model is: turn ends → `DONE`; an explicit pending question → `WAIT`; answering it clears the `WAIT`.
 
 - Claude/Codex transcript memoisation now uses a bounded LRU cache instead of growing without eviction, guarded by a lock so concurrent `/tasks` threads can't race its eviction step.
 - Claude Code running-session detection was case-sensitive on `/Claude.app/` and missed the lowercase `claude.app` binary; now case-insensitive.
