@@ -151,32 +151,31 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 #define AUTO_REFRESH_INPUT_GUARD_MS 1000
 #endif
 
-// Edge-triggered alert when the task set first enters a WAIT (a session asking
-// for human input). Fires once per empty->WAIT transition, including when a
-// timer wake boots straight into a WAIT. Screen wake + flash always works; the
-// beep uses the StickS3 speaker (M5.Speaker). Vibration is left as a future
+// Edge-triggered audible alerts, fired once per transition (including when a
+// timer wake first observes it). The screen wakes and shows the task; the WAIT
+// row renders amber on its own, so there is no full-screen flash.
+//   - WAIT: a session is asking for human input (two urgent high beeps).
+//   - DONE: a running task just finished, i.e. a turn completed (rising chime).
+// Beeps use the StickS3 speaker (M5.Speaker). Vibration is left as a future
 // hook: the pinned M5Unified does NOT drive a motor on board_M5StickS3
 // (setVibration is a no-op there), so it stays off by default.
 #if !defined(ALERT_ON_WAIT)
 #define ALERT_ON_WAIT 1
 #endif
+#if !defined(ALERT_ON_DONE)
+#define ALERT_ON_DONE 1
+#endif
 #if !defined(ALERT_BEEP)
 #define ALERT_BEEP 1
 #endif
-#if !defined(ALERT_BEEP_HZ)
-#define ALERT_BEEP_HZ 2600
+#if !defined(ALERT_WAIT_HZ)
+#define ALERT_WAIT_HZ 2400
 #endif
-#if !defined(ALERT_BEEP_MS)
-#define ALERT_BEEP_MS 160
+#if !defined(ALERT_DONE_HZ)
+#define ALERT_DONE_HZ 1500
 #endif
 #if !defined(ALERT_BEEP_VOLUME)
-#define ALERT_BEEP_VOLUME 160
-#endif
-#if !defined(ALERT_FLASH_COUNT)
-#define ALERT_FLASH_COUNT 2
-#endif
-#if !defined(ALERT_FLASH_MS)
-#define ALERT_FLASH_MS 90
+#define ALERT_BEEP_VOLUME 150
 #endif
 #if !defined(ALERT_VIBRATION)
 #define ALERT_VIBRATION 0
@@ -218,6 +217,10 @@ RTC_DATA_ATTR static int32_t  rtcCachedChannel = 0;
 // sleep so the empty->WAIT edge alert fires once even when the transition is
 // first observed on a timer wake (rather than re-alerting every refresh).
 RTC_DATA_ATTR static bool     rtcWaitWasActive = false;
+// Tracks whether a task was running at the last refresh, so a running->finished
+// transition (turn complete) can fire a one-shot DONE chime, persisted across
+// deep sleep like the WAIT edge above.
+RTC_DATA_ATTR static bool     rtcWasRunning = false;
 RTC_DATA_ATTR static bool     rtcHasCachedBssid = false;
 
 struct AiTask {
@@ -238,6 +241,7 @@ static int selected = 0;
 static int activeCount = 0;
 static int attentionCount = 0;
 static int waitCount = 0;
+static int runCount = 0;   // tasks with status "run" (used to detect turn completion)
 static int totalCount = 0;
 static int hiddenCount = 0;
 static int battPct = 100;
@@ -572,42 +576,65 @@ static bool hasWaitingTasks() {
   return waitCount > 0;
 }
 
-static void flashScreen(int color) {
-  for (int i = 0; i < ALERT_FLASH_COUNT; i++) {
-    M5.Display.fillScreen(color);
-    delay(ALERT_FLASH_MS);
-    M5.Display.fillScreen(C_BG);
-    if (i + 1 < ALERT_FLASH_COUNT) delay(ALERT_FLASH_MS);
-  }
+// Play two sequential tones on the speaker. tone() is non-blocking, so the
+// delays keep each note audible before the next; alerts are rare (edge-only),
+// so the brief block is fine. ensureSpeakerReady() guarantees the I2S amp is up.
+static void alertBeep2(int hz1, int ms1, int gap, int hz2, int ms2) {
+#if ALERT_BEEP
+  M5.Speaker.begin();                 // idempotent; re-arms the amp after sleep
+  M5.Speaker.setVolume(ALERT_BEEP_VOLUME);
+  M5.Speaker.tone(hz1, ms1);
+  delay(ms1 + gap);
+  M5.Speaker.tone(hz2, ms2);
+  delay(ms2 + 20);
+  M5.Speaker.stop();
+#else
+  (void)hz1; (void)ms1; (void)gap; (void)hz2; (void)ms2;
+#endif
 }
 
-// Fired once on an empty->WAIT transition. Wakes/flashes the screen (always
-// reliable) and beeps via the speaker; caller repaints the list afterwards.
-static void alertNewWait() {
-  M5.Display.wakeup();
-  applyDisplayBrightness();
-#if ALERT_BEEP
-  M5.Speaker.setVolume(ALERT_BEEP_VOLUME);
-  M5.Speaker.tone(ALERT_BEEP_HZ, ALERT_BEEP_MS);  // non-blocking, plays via I2S
-#endif
+static void alertVibrateHook() {
 #if ALERT_VIBRATION
   // No-op on board_M5StickS3 in the pinned M5Unified; kept as a future hook.
   M5.Power.setVibration(ALERT_VIBRATION_LEVEL);
   delay(ALERT_VIBRATION_MS);
   M5.Power.setVibration(0);
 #endif
-  flashScreen(C_AMBER);
 }
 
-// Edge detector: alert only when the WAIT set goes from empty to non-empty.
-static void updateWaitAlert() {
+// WAIT entry: two urgent same-pitch beeps. Caller repaints the amber row.
+static void alertWait() {
+  M5.Display.wakeup();
+  applyDisplayBrightness();
+  alertBeep2(ALERT_WAIT_HZ, 90, 55, ALERT_WAIT_HZ, 120);
+  alertVibrateHook();
+}
+
+// Turn complete (a running task finished): a gentler rising two-note chime.
+static void alertDone() {
+  M5.Display.wakeup();
+  applyDisplayBrightness();
+  alertBeep2(ALERT_DONE_HZ, 80, 50, ALERT_DONE_HZ + 500, 140);
+  alertVibrateHook();
+}
+
+// Edge detector for both alerts. WAIT fires on empty->WAIT; DONE fires when a
+// running task disappears with nothing now waiting (a turn just finished).
+static void updateAlerts() {
   bool waitActive = waitCount > 0;
+  bool running = runCount > 0;
 #if ALERT_ON_WAIT
   if (waitActive && !rtcWaitWasActive) {
-    alertNewWait();
+    alertWait();
+  }
+#endif
+#if ALERT_ON_DONE
+  if (rtcWasRunning && !running && !waitActive && taskCount > 0) {
+    alertDone();
   }
 #endif
   rtcWaitWasActive = waitActive;
+  rtcWasRunning = running;
 }
 
 static uint32_t hideAfterSec(const String& status) {
@@ -644,6 +671,7 @@ static void clearStaleWaitSnapshot() {
   activeCount = 0;
   attentionCount = 0;
   waitCount = 0;
+  runCount = 0;
   hiddenCount = 0;
 }
 
@@ -1007,6 +1035,7 @@ static bool fetchTasks() {
   taskCount = 0;
   hiddenCount = 0;
   waitCount = 0;
+  runCount = 0;
 
   JsonArray arr = doc["tasks"].as<JsonArray>();
   for (JsonObject o : arr) {
@@ -1028,6 +1057,7 @@ static bool fetchTasks() {
     t.usage = o["us"].as<String>();
     t.device = o["d"].as<String>();
     if (t.status == "wait") waitCount++;
+    if (t.status == "run") runCount++;
   }
   Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d wifi=%s ip=%s\n",
                 taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount,
@@ -1117,7 +1147,7 @@ static void refreshNow() {
   drawMessage("刷新中", apiBase(), C_AMBER);
   bool ok = fetchTasks();
   updateBattery();
-  updateWaitAlert();
+  updateAlerts();
   if (hasWaitingTasks()) {
     M5.Display.wakeup();
     applyDisplayBrightness();
@@ -1187,7 +1217,7 @@ void setup() {
 
   bool ok = fetchTasks();
   updateBattery();
-  updateWaitAlert();
+  updateAlerts();
 #if ENABLE_DEEP_SLEEP
   activeTimeoutMs = hasWaitingTasks() ? UINT32_MAX : ((wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS);
 #else
@@ -1223,7 +1253,7 @@ void loop() {
       millis() - lastInputAt > AUTO_REFRESH_INPUT_GUARD_MS) {
     bool ok = fetchTasks();
     updateBattery();
-    updateWaitAlert();
+    updateAlerts();
     if (hasWaitingTasks()) {
       M5.Display.wakeup();
       applyDisplayBrightness();
