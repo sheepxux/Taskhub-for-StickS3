@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v1.2.1 — 2026-06-05
+
+### Changed
+
+- Swapped the StickS3 button layout: **BtnB** opens the selected task's source app; **BtnA** cycles to the next task, and **hold BtnA** refreshes now.
+
 ## v1.2.0 — 2026-06-05
 
 On-device WAIT/DONE alerts, a clearer turn-completion state model, the browser
@@ -29,7 +35,6 @@ web bridge + `POST /ingest`, a host config split, and a regression suite with CI
 - Host runtime configuration moved into `host/taskhub_config.py`, reducing the size of the main Host entrypoint without changing its external API.
 - Host installer now copies `taskhub_*.py` helper modules alongside `task_hub.py`.
 - StickS3 alert defaults retuned for desk use: lower volume, shorter WAIT double beep, and softer DONE chime.
-- Swapped the StickS3 button layout: **BtnB** opens the selected task's source app; **BtnA** cycles to the next task, and **hold BtnA** refreshes now.
 - A completed Claude turn now reports as green `DONE` for a short window (`TASK_HUB_CLAUDE_DONE_WINDOW_MS`, default 5 min) before settling to `REC`, so "the turn just finished" is a distinct state the StickS3 can show and chime on.
 
 ### Fixed

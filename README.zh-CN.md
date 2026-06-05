@@ -5,7 +5,7 @@
 [English](README.md) | 简体中文 | [安装说明](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v1.2.0-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.2.1-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#隐私与安全)
@@ -57,7 +57,7 @@ TaskHub 的目标是给这些后台任务一个实体状态面板：
 
 ## 当前版本
 
-当前版本是 `v1.2.0`，适合作为开发者和 maker 的早期公开版本使用。
+当前版本是 `v1.2.1`，适合作为开发者和 maker 的早期公开版本使用。
 
 已经完成的核心链路包括：Mac Host、StickS3 固件、Wi-Fi 发现、精简任务显示、
 按钮操作、深度睡眠、多 Mac 局域网聚合，以及多设备诊断页面。
@@ -358,6 +358,6 @@ extension/               Chrome/Edge Web Bridge
 
 ## Release
 
-当前版本：`v1.2.0`。
+当前版本：`v1.2.1`。
 
 更新记录见 [CHANGELOG.md](CHANGELOG.md)。
