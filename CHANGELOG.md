@@ -14,6 +14,13 @@
   binary.
 - `scripts/setup.sh --provision` wires Host install + USB device provisioning
   into the normal setup helper.
+- Voice mode (host side): `POST /voice` transcribes a short audio clip with
+  local whisper.cpp (`large-v3-turbo`, Mandarin + English) and pastes the text
+  into a target app via the clipboard. Deterministic window targeting with
+  `?task=<id>` / `?app=<bundle>` / `?source=<name>` (Claude, Codex, Manus,
+  Perplexity), optional `?enter=1` to send. New `host/taskhub_voice.py`,
+  `host/run_whisper_server.sh`, and `host/install_whisper_server.sh` (resident
+  whisper-server LaunchAgent). Device hold-to-talk firmware still to come.
 
 ### Changed
 

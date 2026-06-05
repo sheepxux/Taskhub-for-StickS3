@@ -74,6 +74,11 @@ from taskhub_config import (
     TRANSCRIPT_CACHE_MAX,
 )
 
+try:
+    import taskhub_voice  # voice mode: whisper transcription + paste injection
+except Exception:  # optional — host still runs without it
+    taskhub_voice = None
+
 
 Task = Dict[str, Any]
 
@@ -4366,6 +4371,46 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ok, message, accepted = self.hub.ingest(payload)
             self.send_json(200 if ok else 400, {"ok": ok, "accepted": accepted, "message": message})
+            return
+
+        if parsed.path == "/voice":
+            if not self.authorized():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if taskhub_voice is None:
+                self.send_json(503, {"ok": False, "error": "voice module unavailable"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > taskhub_voice.MAX_AUDIO_BYTES:
+                self.send_json(400, {"ok": False, "error": "missing or oversized audio"})
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            inject = (qs.get("inject", ["1"])[0]).lower() not in {"0", "false", "no"}
+            press_enter = (qs.get("enter", ["0"])[0]).lower() in {"1", "true", "yes"}
+            # Target a specific app so the text lands in the window you opened
+            # (e.g. Claude), not whatever is frontmost. `app` is an explicit
+            # bundle id; `task` resolves the selected task's open-app.
+            activate_bundle = (qs.get("app", [""])[0]).strip()
+            target_task = (qs.get("task", [""])[0]).strip()
+            if not activate_bundle and target_task:
+                for item in self.hub.list_tasks():
+                    if item.get("id") == target_task:
+                        opn = item.get("_open") or {}
+                        if opn.get("type") == "app" and opn.get("target"):
+                            activate_bundle = str(opn["target"])
+                        break
+            if not activate_bundle:
+                activate_bundle = taskhub_voice.bundle_for_source(qs.get("source", [""])[0])
+            audio = self.rfile.read(length)
+            try:
+                result = taskhub_voice.handle_voice(
+                    audio, inject=inject, press_enter=press_enter, activate_bundle=activate_bundle or None
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                self.send_json(500, {"ok": False, "error": str(exc)[:200]})
+                return
+            self.send_json(200 if result.get("ok") else 400, result)
             return
 
         match = re.fullmatch(r"/tasks/([^/]+)/(open|open-native)", parsed.path)
