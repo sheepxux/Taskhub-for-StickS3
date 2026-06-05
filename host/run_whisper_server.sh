@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-MODEL="${WHISPER_MODEL:-./models/ggml-large-v3-turbo.bin}"
+MODEL="${WHISPER_MODEL:-./models/ggml-large-v3-turbo-q5_0.bin}"
 HOST="${WHISPER_HOST:-127.0.0.1}"
 PORT="${WHISPER_PORT:-8080}"
 THREADS="${WHISPER_THREADS:-4}"

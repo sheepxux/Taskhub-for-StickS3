@@ -9,7 +9,7 @@ PLIST="$HOME/Library/LaunchAgents/com.sticks3.whisper.plist"
 LABEL="com.sticks3.whisper"
 
 WHISPER_BIN="${WHISPER_BIN:-$(command -v whisper-server 2>/dev/null || echo /opt/homebrew/bin/whisper-server)}"
-MODEL="${WHISPER_MODEL:-$ROOT/host/models/ggml-large-v3-turbo.bin}"
+MODEL="${WHISPER_MODEL:-$ROOT/host/models/ggml-large-v3-turbo-q5_0.bin}"
 HOST="${WHISPER_HOST:-127.0.0.1}"
 PORT="${WHISPER_PORT:-8080}"
 THREADS="${WHISPER_THREADS:-4}"
