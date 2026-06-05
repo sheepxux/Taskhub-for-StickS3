@@ -340,6 +340,37 @@ Keep deep sleep enabled for normal use. Lower these values in
 #define INTERACTIVE_TIMEOUT_MS 10000
 ```
 
+## Voice Mode (optional)
+
+Hold **BtnB** on the StickS3 to dictate (Mandarin/English) into the app of the
+selected task. Transcription is local (whisper.cpp); audio never leaves the LAN.
+
+1. Install whisper.cpp and a model, then start the resident server:
+
+   ```bash
+   brew install whisper-cpp
+   mkdir -p host/models && curl -L -o host/models/ggml-large-v3-turbo-q5_0.bin \
+     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+   ./host/install_whisper_server.sh
+   ```
+
+2. Grant the Host **Accessibility** permission: System Settings → Privacy &
+   Security → Accessibility → enable the app that runs the Host (so it can paste
+   into other apps).
+
+3. Test from the Mac without the device:
+
+   ```bash
+   say -v Tingting "你好，这是语音测试" -o /tmp/v.wav --data-format=LEI16@16000
+   TOKEN=$(cat "$HOME/Library/Application Support/StickS3TaskHub/token")
+   curl -s -X POST -H "X-Device-Token: $TOKEN" --data-binary @/tmp/v.wav \
+     'http://127.0.0.1:5577/voice?inject=0'
+   ```
+
+Then on the device: short-press BtnB to open a task's app, hold BtnB to talk,
+release to type the text in. Tunables: `TASK_HUB_WHISPER_MODEL`,
+`TASK_HUB_WHISPER_LANGUAGE`, and `?enter=1` on `/voice` to auto-send.
+
 ## Updating
 
 Pull the latest code:

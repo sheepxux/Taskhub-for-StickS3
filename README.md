@@ -5,7 +5,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 [简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v1.3.0-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v2.0.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#privacy-and-security)
@@ -59,7 +59,7 @@ resolution. Regenerate them with `python3 docs/render_screens.py`.
 
 ## Current Release
 
-`v1.3.0` is ready for an early public release for developers and hardware
+`v2.0.0` is ready for an early public release for developers and hardware
 makers. The core pipeline is working: Mac Host, StickS3 firmware, Wi-Fi
 discovery, compact task display, button actions, deep sleep, and LAN
 multi-device aggregation.
@@ -82,6 +82,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | DONE alert | Ready | Edge-triggered softer rising chime when a running task finishes |
 | Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
 | Auto-rotation | Ready | IMU gravity rotates the screen to match how it's held; portrait shows a multi-task list (`ROTATE_*` tunable) |
+| Voice input | Ready | Hold BtnB to dictate (Mandarin/English) → local whisper.cpp → text typed into the selected task's app (`POST /voice`) |
 | Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
 | Claude Code adapter | Detailed | Tracks transcript turn state, prompts, usage, resume process |
 | OpenClaw adapter | Detailed | Reads local task/session stores |
@@ -107,6 +108,34 @@ Any script can push too:
 curl -X POST -H 'X-Device-Token: <token>' http://127.0.0.1:5577/ingest \
   -d '{"source":"Manus","title":"Draft weekly report","status":"running","ttl_sec":120}'
 ```
+
+## Voice Mode
+
+Hold **BtnB** on the StickS3 to dictate into the AI app you're working with —
+Mandarin or English, transcribed locally and typed straight into the chat box.
+
+1. Short-press BtnB to open a task's app (brings e.g. Claude to the front).
+2. **Hold BtnB** and speak; release to send.
+3. The clip is POSTed to `POST /voice`, transcribed by a resident whisper.cpp
+   server (`large-v3-turbo-q5_0`, Simplified Chinese + English), and pasted into
+   the task's app. `?task=<id>` targets that app deterministically, so the text
+   lands in the window you opened — not whatever is frontmost.
+
+Everything stays local — the audio never leaves your machine/LAN.
+
+One-time setup:
+
+```bash
+brew install whisper-cpp
+mkdir -p host/models && curl -L -o host/models/ggml-large-v3-turbo-q5_0.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+./host/install_whisper_server.sh   # resident whisper-server LaunchAgent on :8080
+```
+
+Grant the Host **Accessibility** permission (System Settings → Privacy & Security →
+Accessibility) so it can paste into other apps. Tunables: `TASK_HUB_WHISPER_MODEL`,
+`TASK_HUB_WHISPER_LANGUAGE` (`auto`/`zh`/`en`), and `?enter=1` on `/voice` to
+auto-send. Targeting works for Claude, Codex, Manus, and Perplexity desktop apps.
 
 ## Status Model
 
@@ -294,6 +323,7 @@ interactive timeout.
 | Control | Action |
 | --- | --- |
 | BtnB | Open the selected task's source app on the Mac |
+| BtnB hold | Voice input — hold to talk, release to dictate into the task's app |
 | BtnA | Select the next task |
 | BtnA hold | Refresh immediately |
 
@@ -335,6 +365,7 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 | `/tasks/:id` | Local detail/debug page |
 | `/tasks/:id/open` | Open selected source from the StickS3 |
 | `/tasks/:id/open-native` | Host-to-host remote open forwarding |
+| `/voice` | Transcribe a posted audio clip and paste it into a target app (voice mode) |
 | `/peers` | Human-readable multi-device diagnostics |
 | `/peers.json` | Machine-readable peer status |
 | `/debug/lovable` | Lovable app/browser signal diagnostics |
@@ -466,6 +497,6 @@ CHANGELOG.md             Release notes
 
 ## Release
 
-Current release: `v1.3.0`.
+Current release: `v2.0.0`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.

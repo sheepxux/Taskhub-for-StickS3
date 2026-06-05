@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v2.0.0 — 2026-06-05
+
+Major update: **voice mode** — hold-to-talk on the StickS3 transcribes Mandarin
+or English with local whisper and types it into the AI app you opened — plus the
+M5Burner public-firmware provisioning path.
+
 ### Added
 
 - M5Burner/public firmware provisioning path: `TASKHUB_PUBLIC_BUILD=1` ignores
@@ -14,13 +20,15 @@
   binary.
 - `scripts/setup.sh --provision` wires Host install + USB device provisioning
   into the normal setup helper.
-- Voice mode (host side): `POST /voice` transcribes a short audio clip with
-  local whisper.cpp (`large-v3-turbo`, Mandarin + English) and pastes the text
-  into a target app via the clipboard. Deterministic window targeting with
-  `?task=<id>` / `?app=<bundle>` / `?source=<name>` (Claude, Codex, Manus,
-  Perplexity), optional `?enter=1` to send. New `host/taskhub_voice.py`,
-  `host/run_whisper_server.sh`, and `host/install_whisper_server.sh` (resident
-  whisper-server LaunchAgent). Device hold-to-talk firmware still to come.
+- **Voice mode**: hold **BtnB** on the StickS3 to record (M5.Mic → PSRAM, 16 kHz),
+  release to POST the clip to the Host's `POST /voice`, which transcribes it with
+  local whisper.cpp (`large-v3-turbo-q5_0`, Mandarin + English, Simplified
+  output) and pastes the text into the app the task belongs to. Deterministic
+  window targeting (`?task=<id>` resolves the task's app; `?app=<bundle>` /
+  `?source=<name>` for Claude, Codex, Manus, Perplexity), optional `?enter=1` to
+  auto-send. New `host/taskhub_voice.py`, `host/run_whisper_server.sh`, and
+  `host/install_whisper_server.sh` (resident whisper-server LaunchAgent). Audio
+  and transcription stay on the LAN / local machine.
 
 ### Changed
 
