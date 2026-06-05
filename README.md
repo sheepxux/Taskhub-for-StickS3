@@ -18,8 +18,8 @@ Manus, Perplexity, Gemini, and Lovable, discovers other authorized TaskHub Hosts
 on the same LAN, then sends a compact task list to the StickS3 over Wi-Fi.
 
 The device shows which task is running, which one needs your input, what
-recently finished, and token or turn usage when the source exposes it. BtnA can
-open the source app on the Mac, BtnB switches tasks, and the firmware sleeps
+recently finished, and token or turn usage when the source exposes it. BtnB can
+open the source app on the Mac, BtnA switches tasks, and the firmware sleeps
 between refreshes so the small StickS3 battery remains usable.
 
 ## Why It Exists
@@ -75,7 +75,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | StickS3 firmware | Ready | Native 240x135 UI, buttons, Wi-Fi discovery, deep sleep |
 | macOS Host | Ready | LaunchAgent installer, local HTTP API, UDP discovery |
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
-| BtnA open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
+| BtnB open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
 | WAIT attention mode | Ready | Keeps the display awake while a task needs user input |
 | WAIT alert | Ready | Edge-triggered screen wake + short double beep when a task first needs input (`ALERT_*` tunable) |
 | DONE alert | Ready | Edge-triggered softer rising chime when a running task finishes |
@@ -264,9 +264,9 @@ interactive timeout.
 
 | Control | Action |
 | --- | --- |
-| BtnA | Open the selected task's source app on the Mac |
-| BtnB | Select the next task |
-| BtnB hold | Refresh immediately |
+| BtnB | Open the selected task's source app on the Mac |
+| BtnA | Select the next task |
+| BtnA hold | Refresh immediately |
 
 ## Multi-Device Mode
 
@@ -276,7 +276,7 @@ each Host. Any TaskHub Host can act as the aggregator:
 - Hosts announce themselves over UDP port `5578`.
 - The aggregator fetches each peer's `/tasks?scope=local` list.
 - Compact StickS3 rows include a short device label, such as `Codex@MBP`.
-- BtnA on a remote task forwards the open request back to the Mac that owns it.
+- BtnB on a remote task forwards the open request back to the Mac that owns it.
 
 Useful environment variables:
 

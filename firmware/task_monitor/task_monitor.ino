@@ -4,9 +4,9 @@
  * Battery-first workflow:
  *   wake -> Wi-Fi -> GET /tasks?format=stick -> show compact list -> sleep.
  *
- * BtnA: open the selected task on the Mac through Task Hub.
- * BtnB: next task.
- * BtnB hold: refresh now.
+ * BtnB: open the selected task on the Mac through Task Hub.
+ * BtnA: next task.
+ * BtnA hold: refresh now.
  *
  * The StickS3 does not scrape AI apps. The Mac-side Task Hub owns collection
  * and open actions. This keeps the device small, wireless, and low power.
@@ -917,7 +917,7 @@ static void drawList() {
                56, lastError.length() ? C_RED : C_GRAY, &fonts::efontCN_16);
     centerText(lastError.length() ? lastError : (allHidden ? String(hiddenCount) + " hidden · 会自动刷新" : "会定时自动刷新"),
                88, C_GRAY, &fonts::efontCN_12);
-    centerText("BtnB 刷新", 122, C_GRAY, &fonts::efontCN_12);
+    centerText("BtnA 刷新", 122, C_GRAY, &fonts::efontCN_12);
     return;
   }
 
@@ -1165,23 +1165,10 @@ static void refreshNow() {
 }
 
 static void handleButtons() {
-  if (M5.BtnA.wasClicked()) {
-    lastInputAt = millis();
-    drawMessage("打开任务", taskCount ? tasks[selected].source : "no task", C_BLUE);
-    bool ok = openSelectedTask();
-    drawMessage(ok ? "已发送打开请求" : "打开失败", ok ? "Mac 会切到对应 App" : lastError, ok ? C_GREEN : C_RED);
-    delay(900);
-    drawList();
-  }
-
-  bool bHold = btnBHoldEvent;
-  bool bClick = btnBClickEvent;
-  btnBHoldEvent = false;
-  btnBClickEvent = false;
-
-  if (bHold) {
+  // BtnA: click = next task (or refresh when the list is empty), hold = refresh.
+  if (M5.BtnA.wasHold()) {
     refreshNow();
-  } else if (bClick) {
+  } else if (M5.BtnA.wasClicked()) {
     lastInputAt = millis();
     if (taskCount > 0) {
       lastManualSelectAt = millis();
@@ -1190,6 +1177,20 @@ static void handleButtons() {
     } else {
       refreshNow();
     }
+  }
+
+  // BtnB: click = open the selected task on the Mac. (Hold is unused now.)
+  bool bClick = btnBClickEvent;
+  btnBHoldEvent = false;
+  btnBClickEvent = false;
+
+  if (bClick) {
+    lastInputAt = millis();
+    drawMessage("打开任务", taskCount ? tasks[selected].source : "no task", C_BLUE);
+    bool ok = openSelectedTask();
+    drawMessage(ok ? "已发送打开请求" : "打开失败", ok ? "Mac 会切到对应 App" : lastError, ok ? C_GREEN : C_RED);
+    delay(900);
+    drawList();
   }
 }
 
