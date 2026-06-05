@@ -5,7 +5,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 [简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v1.2.1-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.3.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#privacy-and-security)
@@ -59,7 +59,7 @@ resolution. Regenerate them with `python3 docs/render_screens.py`.
 
 ## Current Release
 
-`v1.2.1` is ready for an early public release for developers and hardware
+`v1.3.0` is ready for an early public release for developers and hardware
 makers. The core pipeline is working: Mac Host, StickS3 firmware, Wi-Fi
 discovery, compact task display, button actions, deep sleep, and LAN
 multi-device aggregation.
@@ -80,6 +80,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | WAIT alert | Ready | Edge-triggered screen wake + short double beep when a task first needs input (`ALERT_*` tunable) |
 | DONE alert | Ready | Edge-triggered softer rising chime when a running task finishes |
 | Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
+| Auto-rotation | Ready | IMU gravity rotates the screen to match how it's held; portrait shows a multi-task list (`ROTATE_*` tunable) |
 | Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
 | Claude Code adapter | Detailed | Tracks transcript turn state, prompts, usage, resume process |
 | OpenClaw adapter | Detailed | Reads local task/session stores |
@@ -437,6 +438,6 @@ CHANGELOG.md             Release notes
 
 ## Release
 
-Current release: `v1.2.1`.
+Current release: `v1.3.0`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.

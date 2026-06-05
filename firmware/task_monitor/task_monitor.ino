@@ -187,6 +187,42 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 #define ALERT_VIBRATION_MS 180
 #endif
 
+// Auto-rotate the display to match how the StickS3 is held, using the IMU's
+// gravity vector. Only meaningful while awake (deep sleep powers the screen
+// down). ROT_* map the dominant in-plane gravity axis to a display rotation;
+// if an orientation comes out upside-down or 90° off on the real device, swap
+// the matching ROT_* value. Set ROTATE_DEBUG 1 to show live ax/ay + rotation.
+#if !defined(ENABLE_AUTO_ROTATE)
+#define ENABLE_AUTO_ROTATE 1
+#endif
+#if !defined(ROTATE_POLL_MS)
+#define ROTATE_POLL_MS 150
+#endif
+#if !defined(ROTATE_STABLE_MS)
+#define ROTATE_STABLE_MS 350
+#endif
+#if !defined(ROTATE_DEADZONE_G)
+#define ROTATE_DEADZONE_G 0.40f
+#endif
+// On this StickS3 the X axis dominates in PORTRAIT and Y in LANDSCAPE, so the
+// X-dominant case maps to portrait (0/2) and Y-dominant to landscape (1/3).
+// If an orientation is upside-down, swap the POS/NEG value within its pair.
+#if !defined(ROT_X_POS)
+#define ROT_X_POS 2   // gravity toward +X -> portrait
+#endif
+#if !defined(ROT_X_NEG)
+#define ROT_X_NEG 0   // gravity toward -X -> portrait flipped
+#endif
+#if !defined(ROT_Y_POS)
+#define ROT_Y_POS 1   // gravity toward +Y -> landscape
+#endif
+#if !defined(ROT_Y_NEG)
+#define ROT_Y_NEG 3   // gravity toward -Y -> landscape flipped
+#endif
+#if !defined(ROTATE_DEBUG)
+#define ROTATE_DEBUG 0
+#endif
+
 #if !defined(STICK_HIDE_DONE_AFTER_SEC)
 #define STICK_HIDE_DONE_AFTER_SEC 600
 #endif
@@ -242,6 +278,10 @@ static int activeCount = 0;
 static int attentionCount = 0;
 static int waitCount = 0;
 static int runCount = 0;   // tasks with status "run" (used to detect turn completion)
+static int displayRotation = 1;       // currently applied M5.Display rotation
+static int pendingRotation = 1;       // candidate rotation awaiting the stability window
+static uint32_t pendingRotationSince = 0;
+static uint32_t lastRotatePollAt = 0;
 static int totalCount = 0;
 static int hiddenCount = 0;
 static int battPct = 100;
@@ -862,8 +902,9 @@ static void drawWakeSyncScreen(const String& status) {
   bootStatusText = "";
   M5.Display.fillScreen(C_BG);
   topBar();
-  centerText("连接 Wi-Fi", 56, C_BLUE, &fonts::efontCN_16);
-  centerText("同步任务状态", 84, C_GRAY, &fonts::efontCN_12);
+  int H = M5.Display.height();
+  centerText("连接 Wi-Fi", H * 42 / 100, C_BLUE, &fonts::efontCN_16);
+  centerText("同步任务状态", H * 62 / 100, C_GRAY, &fonts::efontCN_12);
   setBootStatus(status, C_GRAY);
 }
 
@@ -903,8 +944,64 @@ static void centerText(const String& text, int y, int color, const lgfx::IFont* 
 static void drawMessage(const String& line1, const String& line2, int color) {
   M5.Display.fillScreen(C_BG);
   topBar();
-  centerText(line1, 58, color, &fonts::efontCN_16);
-  centerText(line2, 88, C_GRAY, &fonts::efontCN_12);
+  int H = M5.Display.height();
+  centerText(line1, H * 43 / 100, color, &fonts::efontCN_16);
+  centerText(line2, H * 65 / 100, C_GRAY, &fonts::efontCN_12);
+}
+
+// Portrait layout: a compact vertical list of several tasks, making use of the
+// tall screen instead of stretching the single landscape card.
+static void drawPortraitList() {
+  int W = M5.Display.width();
+  int top = 22;
+  int bottom = M5.Display.height() - 13;
+  int rowH = 40;
+  int maxRows = (bottom - top) / rowH;
+  if (maxRows < 1) maxRows = 1;
+  int start = 0;
+  if (selected >= maxRows) start = selected - maxRows + 1;
+
+  for (int i = 0; i < maxRows; i++) {
+    int idx = start + i;
+    if (idx >= taskCount) break;
+    AiTask& t = tasks[idx];
+    int col = statusColor(t.status);
+    bool sel = (idx == selected);
+    int cy = top + i * rowH;
+    int ch = rowH - 4;
+    int bg = sel ? C_CARD : C_BG;
+
+    M5.Display.fillRoundRect(3, cy, W - 6, ch, 5, bg);
+    if (sel) M5.Display.drawRoundRect(3, cy, W - 6, ch, 5, C_GRAY);
+    M5.Display.fillRoundRect(3, cy, 6, ch, 5, col);
+
+    String src = t.source;
+    if (t.device.length()) src += "@" + t.device;
+    String srcFit = fitText(src, &fonts::Font0, W - 41 - 6);
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(col, bg);
+    M5.Display.drawString(statusLabel(t.status), 13, cy + 5);
+    M5.Display.setTextColor(C_GRAY, bg);
+    M5.Display.drawString(srcFit, 41, cy + 5);
+
+    String title = t.title.length() ? t.title : t.source;
+    String titleFit = fitText(title, &fonts::efontCN_12, W - 17);
+    M5.Display.setFont(&fonts::efontCN_12);
+    M5.Display.setTextColor(C_WHITE, bg);
+    M5.Display.drawString(titleFit, 13, cy + 20);
+  }
+
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextDatum(bottom_left);
+  M5.Display.setTextColor(C_GRAY, C_BG);
+  String f = String(selected + 1) + "/" + String(taskCount);
+  if (waitCount > 0) f += " " + String(waitCount) + "w";
+  if (hiddenCount > 0) f += " +" + String(hiddenCount);
+  M5.Display.drawString(f, 5, M5.Display.height() - 2);
+  M5.Display.setTextDatum(bottom_right);
+  M5.Display.setTextColor(C_GRAY, C_BG);
+  M5.Display.drawString("A", W - 5, M5.Display.height() - 2);
 }
 
 static void drawList() {
@@ -912,16 +1009,23 @@ static void drawList() {
   topBar();
 
   if (taskCount == 0) {
+    int H = M5.Display.height();
     bool allHidden = !lastError.length() && hiddenCount > 0;
     centerText(lastError.length() ? "无法读取任务" : (allHidden ? "旧任务已隐藏" : "暂无任务"),
-               56, lastError.length() ? C_RED : C_GRAY, &fonts::efontCN_16);
+               H * 42 / 100, lastError.length() ? C_RED : C_GRAY, &fonts::efontCN_16);
     centerText(lastError.length() ? lastError : (allHidden ? String(hiddenCount) + " hidden · 会自动刷新" : "会定时自动刷新"),
-               88, C_GRAY, &fonts::efontCN_12);
-    centerText("BtnA 刷新", 122, C_GRAY, &fonts::efontCN_12);
+               H * 65 / 100, C_GRAY, &fonts::efontCN_12);
+    centerText("BtnA 刷新", H * 90 / 100, C_GRAY, &fonts::efontCN_12);
     return;
   }
 
   if (selected >= taskCount) selected = 0;
+
+  if (M5.Display.height() > M5.Display.width()) {
+    drawPortraitList();
+    return;
+  }
+
   AiTask& t = tasks[selected];
   int col = statusColor(t.status);
   int screenW = M5.Display.width();
@@ -968,6 +1072,47 @@ static void drawList() {
   M5.Display.setTextColor(C_GRAY, C_BG);
   String footerRight = String(selected + 1) + "/" + String(taskCount) + " A";
   M5.Display.drawString(footerRight, screenW - 6, screenH - 3);
+}
+
+// Map the IMU gravity vector to a display rotation. Returns the current
+// rotation when the device is near-flat (gravity mostly on Z), so a stick lying
+// on a desk doesn't flip-flop.
+static int rotationFromAccel() {
+  float ax = 0, ay = 0, az = 0;
+  if (!M5.Imu.getAccel(&ax, &ay, &az)) return displayRotation;
+  if (fabsf(ax) < ROTATE_DEADZONE_G && fabsf(ay) < ROTATE_DEADZONE_G) return displayRotation;
+#if ROTATE_DEBUG
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(C_AMBER, C_BG);
+  char dbg[28];
+  snprintf(dbg, sizeof(dbg), "x%+.1f y%+.1f r%d", ax, ay, displayRotation);
+  M5.Display.drawString(dbg, 2, M5.Display.height() - 10);
+#endif
+  if (fabsf(ax) > fabsf(ay)) return (ax > 0) ? ROT_X_POS : ROT_X_NEG;
+  return (ay > 0) ? ROT_Y_POS : ROT_Y_NEG;
+}
+
+// Poll the IMU (throttled) and apply a new rotation once it has held steady for
+// ROTATE_STABLE_MS, then repaint. No-op when auto-rotate is off or no IMU.
+static void updateAutoRotate() {
+#if ENABLE_AUTO_ROTATE
+  if (!M5.Imu.isEnabled()) return;
+  uint32_t now = millis();
+  if (now - lastRotatePollAt < ROTATE_POLL_MS) return;
+  lastRotatePollAt = now;
+  M5.Imu.update();
+  int want = rotationFromAccel();
+  if (want != pendingRotation) {
+    pendingRotation = want;
+    pendingRotationSince = now;
+  }
+  if (pendingRotation != displayRotation && now - pendingRotationSince >= ROTATE_STABLE_MS) {
+    displayRotation = pendingRotation;
+    M5.Display.setRotation(displayRotation);
+    drawList();
+  }
+#endif
 }
 
 static bool fetchTasks() {
@@ -1198,6 +1343,17 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(1);
+  displayRotation = 1;
+  pendingRotation = 1;
+#if ENABLE_AUTO_ROTATE
+  if (M5.Imu.isEnabled()) {
+    M5.Imu.update();
+    int r0 = rotationFromAccel();
+    displayRotation = r0;
+    pendingRotation = r0;
+    M5.Display.setRotation(r0);
+  }
+#endif
   pinMode((int)PIN_BTN_B, INPUT_PULLUP);
   M5.BtnA.setHoldThresh(350);
   M5.BtnB.setHoldThresh(600);
@@ -1238,6 +1394,7 @@ void loop() {
   M5.update();
   updateBtnBEdge();
   handleButtons();
+  updateAutoRotate();
 
   static uint32_t lastBattAt = 0;
   if (millis() - lastBattAt > 2000) {

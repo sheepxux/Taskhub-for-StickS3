@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.3.0 — 2026-06-05
+
+### Added
+
+- IMU-based **auto-rotation**: the StickS3 reads its gravity vector and rotates the display to match how it's held (landscape ↔ portrait, all four ways), with a stability window to avoid flicker and a deadzone when lying flat. Tunable via `ENABLE_AUTO_ROTATE` / `ROTATE_*` / `ROT_*` defines; only active while the screen is awake.
+- **Portrait multi-task list**: in portrait the screen shows a compact vertical list of several tasks (status bar + source + title per row) instead of stretching the single landscape card. Hint/boot screens now position text proportionally so they read well in both orientations.
+
 ## v1.2.1 — 2026-06-05
 
 ### Changed
