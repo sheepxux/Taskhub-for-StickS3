@@ -12,6 +12,10 @@ mkdir -p "$APP_DIR" "$HOME/Library/LaunchAgents"
 
 cp "$ROOT/host/task_hub.py" "$APP_DIR/task_hub.py"
 chmod +x "$APP_DIR/task_hub.py"
+for helper in "$ROOT"/host/taskhub_*.py; do
+  [ -f "$helper" ] || continue
+  cp "$helper" "$APP_DIR/$(basename "$helper")"
+done
 
 if [ ! -s "$TOKEN_FILE" ]; then
   TOKEN=""

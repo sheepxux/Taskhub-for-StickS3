@@ -19,7 +19,7 @@ jobs:
       - name: Run adapter regression tests
         run: python3 -m unittest discover -s host/tests -v
       - name: Byte-compile host
-        run: python3 -m py_compile host/task_hub.py
+        run: python3 -m py_compile host/task_hub.py host/taskhub_config.py
 
   firmware-build:
     name: Firmware compile

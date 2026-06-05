@@ -90,6 +90,26 @@ class StatusMachines(unittest.TestCase):
         m = {"latest_event_ms": old, "active_turn": False}
         self.assertEqual(th.claude_status(m, None, process_running=False), "idle")
 
+    def test_claude_status_done_in_window_after_terminal_turn(self):
+        now = th.now_ms()
+        m = {
+            "latest_event_ms": now,
+            "active_turn": False,
+            "latest_terminal_ms": now,
+            "latest_stop_reason": "end_turn",
+        }
+        self.assertEqual(th.claude_status(m, None, process_running=False), "done")
+
+    def test_claude_status_recent_after_done_window_elapses(self):
+        past = th.now_ms() - th.CLAUDE_DONE_WINDOW_MS - 1000
+        m = {
+            "latest_event_ms": past,
+            "active_turn": False,
+            "latest_terminal_ms": past,
+            "latest_stop_reason": "end_turn",
+        }
+        self.assertEqual(th.claude_status(m, None, process_running=False), "recent")
+
     def test_claude_turn_state(self):
         self.assertEqual(th.claude_turn_state({"waiting_for_user": True}), "wait")
         self.assertEqual(th.claude_turn_state({"active_turn": True, "latest_stop_reason": "tool_use"}), "tool")
@@ -123,7 +143,9 @@ class ClaudeTranscriptScan(unittest.TestCase):
         finally:
             os.remove(path)
 
-    def test_assistant_question_is_waiting(self):
+    def test_text_question_at_turn_end_is_done_not_waiting(self):
+        # A turn that ends with question-like prose (but no AskUserQuestion tool)
+        # is a completed turn, not a WAIT — WAIT is reserved for explicit asks.
         path = write_jsonl([
             {"type": "user", "timestamp": iso_now(-5000), "message": {"role": "user", "content": "help"}},
             {"type": "assistant", "timestamp": iso_now(), "message": {
@@ -133,10 +155,26 @@ class ClaudeTranscriptScan(unittest.TestCase):
         ])
         try:
             scan = th._scan_claude_transcript(path)
-            self.assertTrue(scan["waiting_for_user"])
+            self.assertFalse(scan["waiting_for_user"])
             self.assertFalse(scan["active_turn"])
         finally:
             os.remove(path)
+
+    def test_pending_ask_user_question_is_waiting(self):
+        # An unanswered AskUserQuestion tool call (no later terminal) is a WAIT.
+        path = write_jsonl([
+            {"type": "user", "timestamp": iso_now(-5000), "message": {"role": "user", "content": "help"}},
+            {"type": "assistant", "timestamp": iso_now(), "message": {
+                "role": "assistant", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "name": "AskUserQuestion", "input": {}}],
+            }},
+        ])
+        try:
+            scan = th._scan_claude_transcript(path)
+            self.assertTrue(scan["waiting_for_user"])
+        finally:
+            os.remove(path)
+            th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
 
     def test_stale_human_input_tool_is_cleared_by_later_end_turn(self):
         path = write_jsonl([
@@ -204,7 +242,8 @@ class CodexSessionScan(unittest.TestCase):
             os.remove(path)
             th._CODEX_SESSION_CACHE.pop(path, None)
 
-    def test_completed_turn_then_question_is_waiting(self):
+    def test_completed_turn_then_text_question_is_not_waiting(self):
+        # Prose question after a completed turn is DONE, not WAIT (no explicit ask).
         path = write_jsonl([
             {"type": "session_meta", "timestamp": iso_now(-9000), "payload": {"id": "s2", "cwd": "/x"}},
             {"type": "event_msg", "timestamp": iso_now(-8000), "payload": {"type": "user_message", "message": "go"}},
@@ -215,6 +254,20 @@ class CodexSessionScan(unittest.TestCase):
         try:
             scan = th._scan_codex_session(path)
             self.assertEqual(scan["latest_turn_id"], scan["latest_completed_turn_id"])  # not active
+            self.assertFalse(scan["waiting_for_user"])
+        finally:
+            os.remove(path)
+            th._CODEX_SESSION_CACHE.pop(path, None)
+
+    def test_pending_request_user_input_is_waiting(self):
+        # An explicit request_user_input function call (unanswered) is a WAIT.
+        path = write_jsonl([
+            {"type": "session_meta", "timestamp": iso_now(-9000), "payload": {"id": "s4", "cwd": "/x"}},
+            {"type": "event_msg", "timestamp": iso_now(-8000), "payload": {"type": "user_message", "message": "go"}},
+            {"type": "response_item", "timestamp": iso_now(), "payload": {"type": "function_call", "name": "request_user_input"}},
+        ])
+        try:
+            scan = th._scan_codex_session(path)
             self.assertTrue(scan["waiting_for_user"])
         finally:
             os.remove(path)

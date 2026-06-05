@@ -34,57 +34,48 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from taskhub_config import (
+    ACTIVE_MINUTES,
+    CLAUDE_DONE_WINDOW_MS,
+    CLAUDE_HUMAN_INPUT_TOOLS,
+    CLAUDE_RUNNING_STALE_MS,
+    CLAUDE_TERMINAL_STOP_REASONS,
+    CODEX_HUMAN_INPUT_FUNCTIONS,
+    CODEX_RUNNING_STALE_MS,
+    DEFAULT_BIND,
+    DEFAULT_DISCOVERY_PORT,
+    DEFAULT_PORT,
+    DEFAULT_TOKEN,
+    DEVICE_ID,
+    DEVICE_NAME,
+    GEMINI_ACTIVITY_STALE_MS,
+    GEMINI_BROWSER_POLL_MS,
+    LOVABLE_ACTIVITY_STALE_MS,
+    LOVABLE_BROWSER_POLL_MS,
+    LOVABLE_DOMAINS,
+    LOVABLE_MAX_TABS,
+    LOVABLE_RENDERER_RUN_CPU,
+    MANUS_MAX_SESSIONS,
+    MANUS_RUNNING_STALE_MS,
+    MANUS_TERMINAL_STATUS_CODES,
+    MAX_TASKS,
+    OPENCLAW_RUNNING_STALE_MS,
+    PEER_CACHE_MS,
+    PEER_DISCOVERY_MS,
+    PEER_DISCOVERY_TIMEOUT_MS,
+    PEER_ENABLED,
+    PEER_HTTP_TIMEOUT_MS,
+    PEER_MAX,
+    PERPLEXITY_COMPUTER_RUNNING_STALE_MS,
+    PERPLEXITY_RUNNING_STALE_MS,
+    QUESTION_WAITING_STALE_MS,
+    TASK_CACHE_MS,
+    TASK_HUB_VERSION,
+    TRANSCRIPT_CACHE_MAX,
+)
+
 
 Task = Dict[str, Any]
-
-DEFAULT_PORT = int(os.environ.get("TASK_HUB_PORT", "5577"))
-DEFAULT_BIND = os.environ.get("TASK_HUB_BIND", "127.0.0.1")
-DEFAULT_TOKEN = os.environ.get("TASK_HUB_TOKEN", "dev-token")
-DEFAULT_DISCOVERY_PORT = int(os.environ.get("TASK_HUB_DISCOVERY_PORT", "5578"))
-TASK_HUB_VERSION = "1.1.1"
-DEVICE_NAME = os.environ.get("TASK_HUB_DEVICE_NAME") or socket.gethostname().split(".")[0] or "TaskHub"
-DEVICE_ID = os.environ.get("TASK_HUB_DEVICE_ID") or (
-    "host-" + hashlib.sha1(f"{socket.gethostname()}:{os.path.expanduser('~')}".encode("utf-8", "ignore")).hexdigest()[:12]
-)
-PEER_ENABLED = os.environ.get("TASK_HUB_ENABLE_PEERS", "1").lower() not in {"0", "false", "no", "off"}
-PEER_DISCOVERY_MS = int(os.environ.get("TASK_HUB_PEER_DISCOVERY_MS", "15000"))
-PEER_CACHE_MS = int(os.environ.get("TASK_HUB_PEER_CACHE_MS", "5000"))
-PEER_DISCOVERY_TIMEOUT_MS = int(os.environ.get("TASK_HUB_PEER_DISCOVERY_TIMEOUT_MS", "350"))
-PEER_HTTP_TIMEOUT_MS = int(os.environ.get("TASK_HUB_PEER_HTTP_TIMEOUT_MS", "1200"))
-PEER_MAX = int(os.environ.get("TASK_HUB_PEER_MAX", "8"))
-MAX_TASKS = int(os.environ.get("TASK_HUB_MAX_TASKS", "40"))
-ACTIVE_MINUTES = int(os.environ.get("TASK_HUB_ACTIVE_MINUTES", "1440"))
-TASK_CACHE_MS = int(os.environ.get("TASK_HUB_CACHE_MS", "3000"))
-CODEX_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CODEX_RUNNING_STALE_MS", "900000"))
-QUESTION_WAITING_STALE_MS = int(os.environ.get("TASK_HUB_QUESTION_WAITING_STALE_MS", "3600000"))
-# 90s default (was 15min): with process detection now reliable, the time-based
-# fallback only needs to cover the brief gap between a turn finishing and the
-# JSONL flushing its terminal stop_reason. Long-running turns stay marked as
-# running via process detection, so this short window doesn't false-negative.
-CLAUDE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLAUDE_RUNNING_STALE_MS", "90000"))
-CLAUDE_TERMINAL_STOP_REASONS = {"end_turn", "stop_sequence", "max_tokens"}
-CLAUDE_HUMAN_INPUT_TOOLS = {"AskUserQuestion"}
-CODEX_HUMAN_INPUT_FUNCTIONS = {"request_user_input"}
-OPENCLAW_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_OPENCLAW_RUNNING_STALE_MS", "1800000"))
-MANUS_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_MANUS_RUNNING_STALE_MS", "900000"))
-MANUS_MAX_SESSIONS = int(os.environ.get("TASK_HUB_MANUS_MAX_SESSIONS", "3"))
-MANUS_TERMINAL_STATUS_CODES = {5, 7}
-PERPLEXITY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_PERPLEXITY_RUNNING_STALE_MS", "30000"))
-PERPLEXITY_COMPUTER_RUNNING_STALE_MS = int(
-    os.environ.get("TASK_HUB_PERPLEXITY_COMPUTER_RUNNING_STALE_MS", "3600000")
-)
-GEMINI_ACTIVITY_STALE_MS = int(os.environ.get("TASK_HUB_GEMINI_ACTIVITY_STALE_MS", str(ACTIVE_MINUTES * 60 * 1000)))
-GEMINI_BROWSER_POLL_MS = int(os.environ.get("TASK_HUB_GEMINI_BROWSER_POLL_MS", "10000"))
-LOVABLE_BROWSER_POLL_MS = int(os.environ.get("TASK_HUB_LOVABLE_BROWSER_POLL_MS", "10000"))
-LOVABLE_ACTIVITY_STALE_MS = int(os.environ.get("TASK_HUB_LOVABLE_ACTIVITY_STALE_MS", str(ACTIVE_MINUTES * 60 * 1000)))
-LOVABLE_RENDERER_RUN_CPU = float(os.environ.get("TASK_HUB_LOVABLE_RENDERER_RUN_CPU", "8.0"))
-LOVABLE_DOMAINS = tuple(
-    part.strip().lower()
-    for part in os.environ.get("TASK_HUB_LOVABLE_DOMAINS", "lovable.dev").split(",")
-    if part.strip()
-)
-LOVABLE_MAX_TABS = int(os.environ.get("TASK_HUB_LOVABLE_MAX_TABS", "3"))
-TRANSCRIPT_CACHE_MAX = int(os.environ.get("TASK_HUB_TRANSCRIPT_CACHE_MAX", "200"))
 
 # Memoise the expensive Claude transcript scans. Keyed by JSONL path, value is
 # the scan result tagged with (mtime, size); a cache hit means the file hasn't
@@ -464,14 +455,6 @@ def is_human_question(text: str) -> bool:
     return any(marker in tail for marker in prompt_markers)
 
 
-def is_waiting_for_human(latest_assistant_ms: int, latest_user_ms: int, latest_text: str) -> bool:
-    if not latest_assistant_ms or latest_assistant_ms <= latest_user_ms:
-        return False
-    if now_ms() - latest_assistant_ms > QUESTION_WAITING_STALE_MS:
-        return False
-    return is_human_question(latest_text)
-
-
 def is_unanswered_human_input_request(request_ms: int, latest_user_ms: int) -> bool:
     if not request_ms or request_ms <= latest_user_ms:
         return False
@@ -661,16 +644,13 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
         "latest_stop_reason": latest_stop_reason,
         "latest_request_id": latest_request_id,
         "active_turn": active_turn,
+        # WAIT means "the user must answer something", which is only true for an
+        # explicit, unanswered AskUserQuestion tool request. A turn that merely
+        # ends with question-like prose is a completed turn (DONE), not a WAIT —
+        # the old text heuristic produced false WAITs on chatty endings.
         "waiting_for_user": (
-            (
-                latest_human_input_request_ms > latest_terminal_ms
-                and is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
-            )
-            or (
-                latest_terminal_ms <= latest_assistant_text_ms
-                and latest_non_human_tool_use_ms < latest_assistant_text_ms
-                and is_waiting_for_human(latest_assistant_text_ms, latest_user_ms, latest_assistant_text)
-            )
+            latest_human_input_request_ms > latest_terminal_ms
+            and is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
         ),
     }
     bounded_cache_set(_CLAUDE_TRANSCRIPT_CACHE, path, scan)
@@ -729,6 +709,15 @@ def claude_status(metrics: Dict[str, Any], updated_ms: Optional[int], process_ru
             return "running"
         if latest and now_ms() - latest < CLAUDE_RUNNING_STALE_MS:
             return "running"
+    else:
+        # Turn just ended with a terminal stop_reason -> brief green DONE window.
+        terminal_ms = safe_int(metrics.get("latest_terminal_ms"))
+        if (
+            terminal_ms
+            and str(metrics.get("latest_stop_reason")) in CLAUDE_TERMINAL_STOP_REASONS
+            and now_ms() - terminal_ms < CLAUDE_DONE_WINDOW_MS
+        ):
+            return "done"
     if latest and now_ms() - latest < ACTIVE_MINUTES * 60 * 1000:
         return "recent"
     return "recent" if process_running else "idle"
@@ -902,12 +891,11 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
         "latest_agent_message_ms": latest_agent_message_ms,
         "latest_tool_call_ms": latest_tool_call_ms,
         "latest_human_input_request_ms": latest_human_input_request_ms,
-        "waiting_for_user": (
-            is_unanswered_human_input_request(latest_human_input_request_ms, latest_user_ms)
-            or (
-                latest_tool_call_ms < latest_agent_message_ms
-                and is_waiting_for_human(latest_agent_message_ms, latest_user_ms, latest_agent_message_text)
-            )
+        # Mirror the Claude model: WAIT only for an explicit, unanswered
+        # request_user_input call — a turn ending with a question in prose is a
+        # completed turn (DONE), not a WAIT.
+        "waiting_for_user": is_unanswered_human_input_request(
+            latest_human_input_request_ms, latest_user_ms
         ),
     }
     bounded_cache_set(_CODEX_SESSION_CACHE, path, scan)

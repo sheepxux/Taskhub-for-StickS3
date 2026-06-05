@@ -2,7 +2,7 @@
 
 Regression tests for the accuracy-critical parsing in `host/task_hub.py`:
 status derivation, WAIT detection, case-insensitive process matching, token
-accounting, and the transcript/session scan memoisation.
+accounting, transcript/session scan memoisation, and the external ingest API.
 
 Pure stdlib (`unittest`), no third-party dependencies.
 
