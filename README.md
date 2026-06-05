@@ -73,6 +73,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Area | Status | Notes |
 | --- | --- | --- |
 | StickS3 firmware | Ready | Native 240x135 UI, buttons, Wi-Fi discovery, deep sleep |
+| M5Burner public firmware | Ready | Builds without local secrets; first use is configured over USB into device NVS |
 | macOS Host | Ready | LaunchAgent installer, local HTTP API, UDP discovery |
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnB open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
@@ -182,6 +183,14 @@ flowchart LR
 
 For the full installation guide, see [INSTALL.md](INSTALL.md).
 
+There are two supported install paths:
+
+- **Developer/source flash**: clone the repo, create `secrets.h`, compile, and
+  upload from Arduino CLI.
+- **M5Burner/public firmware**: burn the public firmware, install the Mac Host,
+  then run USB provisioning once to store Wi-Fi and the shared token on the
+  StickS3.
+
 ### 1. Install requirements
 
 - macOS
@@ -234,7 +243,26 @@ To compile and upload while the StickS3 is plugged in:
 ./scripts/setup.sh --deps --upload
 ```
 
-### 3. Configure the firmware manually
+### 3. M5Burner / public firmware setup
+
+The M5Burner build does **not** compile `secrets.h` into the binary. After
+burning it, the StickS3 shows `USB Setup` until you provision it:
+
+```bash
+./scripts/setup.sh --skip-firmware --provision
+```
+
+That installs or repairs the Mac Host, reads the Host token, prompts for Wi-Fi
+if needed, and sends the config to the StickS3 over USB. The firmware saves it
+to NVS and restarts.
+
+Build a public firmware artifact set for M5Burner publishing with:
+
+```bash
+./firmware/build_m5burner_public.sh
+```
+
+### 4. Configure the firmware manually
 
 ```bash
 cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
@@ -251,7 +279,7 @@ Edit `firmware/task_monitor/secrets.h`:
 `TASK_HUB_HOST` is only a fallback. The firmware first tries UDP discovery on
 port `5578`, so the Mac IP can change.
 
-### 4. Flash the StickS3
+### 5. Flash the StickS3
 
 ```bash
 ./firmware/flash_task_monitor.sh all

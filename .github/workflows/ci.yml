@@ -45,3 +45,10 @@ jobs:
           arduino-cli compile \
             -b "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=custom,PSRAM=opi" \
             firmware/task_monitor
+      - name: Compile public M5Burner firmware
+        run: |
+          arduino-cli compile \
+            -b "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=custom,PSRAM=opi" \
+            --build-property "compiler.cpp.extra_flags=-DTASKHUB_PUBLIC_BUILD=1 -ffile-prefix-map=$GITHUB_WORKSPACE=/workspace -fmacro-prefix-map=$GITHUB_WORKSPACE=/workspace -fdebug-prefix-map=$GITHUB_WORKSPACE=/workspace" \
+            --build-property "compiler.c.extra_flags=-ffile-prefix-map=$GITHUB_WORKSPACE=/workspace -fmacro-prefix-map=$GITHUB_WORKSPACE=/workspace -fdebug-prefix-map=$GITHUB_WORKSPACE=/workspace" \
+            firmware/task_monitor

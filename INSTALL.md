@@ -48,6 +48,54 @@ By default this will:
 It will **not** install Arduino dependencies or flash the device unless you ask
 for that explicitly.
 
+## M5Burner / Public Firmware Setup
+
+M5Burner should use the public firmware build, not a binary compiled from your
+local `secrets.h`.
+
+Build public artifacts:
+
+```bash
+./firmware/build_m5burner_public.sh
+```
+
+This compiles with `TASKHUB_PUBLIC_BUILD=1`, which ignores
+`firmware/task_monitor/secrets.h` even if it exists. The resulting firmware has
+no Wi-Fi password or Host token baked in. On first boot it shows `USB Setup`.
+
+After burning the public firmware, plug the StickS3 into the Mac and run:
+
+```bash
+./scripts/setup.sh --skip-firmware --provision
+```
+
+The helper will:
+
+- install or repair the macOS Host
+- read the Host token from `~/Library/Application Support/StickS3TaskHub/token`
+- auto-detect the StickS3 USB serial port
+- auto-detect the Mac LAN IP as the fallback Host address
+- prompt for Wi-Fi values when needed
+- send one JSON config line over USB serial
+- store the config in StickS3 NVS and restart the device
+
+Non-interactive provisioning:
+
+```bash
+TASKHUB_WIFI_SSID="My WiFi" \
+TASKHUB_WIFI_PASSWORD="wifi-password" \
+./scripts/setup.sh --skip-firmware --provision --non-interactive
+```
+
+Reset the runtime config on a plugged-in StickS3:
+
+```bash
+./scripts/provision_sticks3.sh --reset
+```
+
+You can also clear runtime config by holding both StickS3 buttons during boot.
+On public builds that returns the device to the `USB Setup` screen.
+
 ## One-Pass Setup With Firmware Compile
 
 If `arduino-cli` is already installed:

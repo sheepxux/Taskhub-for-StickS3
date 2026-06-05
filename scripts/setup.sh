@@ -19,6 +19,7 @@ DO_FIRMWARE=1
 DO_DEPS=0
 DO_COMPILE=0
 DO_UPLOAD=0
+DO_PROVISION=0
 NON_INTERACTIVE=0
 
 WIFI_SSID="${TASKHUB_WIFI_SSID:-}"
@@ -47,6 +48,7 @@ Options:
   --deps                   Install Arduino ESP32 core and required libraries
   --compile                Compile the StickS3 firmware after setup
   --upload                 Compile and upload the StickS3 firmware
+  --provision              Configure an already-flashed StickS3 over USB
   --wifi-ssid VALUE        Set WIFI_SSID in firmware secrets
   --wifi-password VALUE    Set WIFI_PASSWORD in firmware secrets
   --token VALUE            Set the shared Host/firmware device token
@@ -104,6 +106,9 @@ while [ "$#" -gt 0 ]; do
     --upload)
       DO_UPLOAD=1
       DO_COMPILE=1
+      ;;
+    --provision)
+      DO_PROVISION=1
       ;;
     --wifi-ssid)
       [ "$#" -ge 2 ] || fail "--wifi-ssid requires a value"
@@ -330,6 +335,15 @@ if [ "$DO_COMPILE" -eq 1 ]; then
   else
     "$ROOT/firmware/flash_task_monitor.sh" compile
   fi
+fi
+
+if [ "$DO_PROVISION" -eq 1 ]; then
+  args=(--skip-host --device-id "$DEVICE_ID")
+  [ "$NON_INTERACTIVE" -eq 1 ] && args+=(--non-interactive)
+  [ -n "$WIFI_SSID" ] && args+=(--wifi-ssid "$WIFI_SSID")
+  [ -n "$WIFI_PASSWORD" ] && args+=(--wifi-password "$WIFI_PASSWORD")
+  [ -n "$DEVICE_TOKEN" ] && args+=(--token "$DEVICE_TOKEN")
+  "$ROOT/scripts/provision_sticks3.sh" "${args[@]}"
 fi
 
 print_summary

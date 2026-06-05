@@ -17,16 +17,17 @@
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <esp_sleep.h>
 #include <esp_wifi.h>           // for esp_wifi_set_ps (deeper modem sleep than WiFi.setSleep default)
 #include <esp32-hal-cpu.h>
 #include <driver/rtc_io.h>
 #include <string.h>             // memcpy for BSSID cache
 
-#if __has_include("secrets.h")
+#if !defined(TASKHUB_PUBLIC_BUILD) && __has_include("secrets.h")
 #include "secrets.h"
 #else
-#warning "Using placeholder Wi-Fi/Task Hub config. Copy secrets.h.example to secrets.h."
+#warning "Using runtime provisioning / placeholder Wi-Fi config. Configure over USB before normal use."
 #define WIFI_SSID       "your-wifi-ssid"
 #define WIFI_PASSWORD   "your-wifi-password"
 #define TASK_HUB_HOST   "192.168.1.100"
@@ -241,6 +242,10 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 
 static constexpr gpio_num_t PIN_BTN_A = GPIO_NUM_11;
 static constexpr gpio_num_t PIN_BTN_B = GPIO_NUM_12;
+static constexpr size_t SERIAL_CONFIG_MAX = 768;
+static const char* CONFIG_NAMESPACE = "taskhub";
+static const char* PLACEHOLDER_WIFI_SSID = "your-wifi-ssid";
+static const char* PLACEHOLDER_WIFI_PASSWORD = "your-wifi-password";
 
 // Persisted across deep sleep in RTC slow memory (~8KB available, free).
 // After a successful join we stash the AP's BSSID + channel; on the next wake
@@ -296,6 +301,16 @@ static uint32_t activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
 static String hubHost;
 static int hubPort = TASK_HUB_PORT;
 static bool hubDiscovered = false;
+static String cfgWifiSsid;
+static String cfgWifiPassword;
+static String cfgHubHost;
+static int cfgHubPort = TASK_HUB_PORT;
+static String cfgDeviceId;
+static String cfgDeviceToken;
+static bool cfgReady = false;
+static bool setupMode = false;
+static String serialConfigLine;
+static uint32_t lastSetupStatusAt = 0;
 static String lastError;
 static bool btnBReadingPressed = false;
 static bool btnBStablePressed = false;
@@ -310,6 +325,166 @@ static String bootStatusText;
 static void setBootStatus(const String& text, int color);
 static void topBar();
 static void centerText(const String& text, int y, int color, const lgfx::IFont* font);
+static void drawSetupScreen(const String& status);
+static void handleSerialConfig();
+static void sendSerialConfigStatus(const char* type, bool ok, const char* message);
+
+static bool isPlaceholder(const String& value, const char* placeholder) {
+  return !value.length() || value == placeholder;
+}
+
+static bool loadRuntimeConfig() {
+  bool fromNvs = false;
+  Preferences prefs;
+  if (prefs.begin(CONFIG_NAMESPACE, true)) {
+    fromNvs = prefs.getBool("configured", false);
+    if (fromNvs) {
+      cfgWifiSsid = prefs.getString("ssid", "");
+      cfgWifiPassword = prefs.getString("password", "");
+      cfgHubHost = prefs.getString("host", "");
+      cfgHubPort = prefs.getInt("port", TASK_HUB_PORT);
+      cfgDeviceId = prefs.getString("device_id", DEVICE_ID);
+      cfgDeviceToken = prefs.getString("token", "");
+    }
+    prefs.end();
+  }
+
+  if (!fromNvs) {
+    cfgWifiSsid = String(WIFI_SSID);
+    cfgWifiPassword = String(WIFI_PASSWORD);
+    cfgHubHost = String(TASK_HUB_HOST);
+    cfgHubPort = TASK_HUB_PORT;
+    cfgDeviceId = String(DEVICE_ID);
+    cfgDeviceToken = String(DEVICE_TOKEN);
+  }
+
+  if (!cfgHubHost.length()) cfgHubHost = String(TASK_HUB_HOST);
+  if (cfgHubPort <= 0) cfgHubPort = TASK_HUB_PORT;
+  if (!cfgDeviceId.length()) cfgDeviceId = String(DEVICE_ID);
+
+  bool ssidOk = !isPlaceholder(cfgWifiSsid, PLACEHOLDER_WIFI_SSID);
+  bool passwordOk = fromNvs || cfgWifiPassword != PLACEHOLDER_WIFI_PASSWORD;
+  bool tokenOk = cfgDeviceToken.length() > 0;
+  cfgReady = ssidOk && passwordOk && tokenOk && cfgHubPort > 0;
+  return cfgReady;
+}
+
+static bool saveRuntimeConfig(const String& ssid, const String& password, const String& host,
+                              int port, const String& deviceId, const String& token) {
+  if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) return false;
+  if (!token.length()) return false;
+
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NAMESPACE, false)) return false;
+  prefs.putString("ssid", ssid);
+  prefs.putString("password", password);
+  prefs.putString("host", host.length() ? host : String(TASK_HUB_HOST));
+  prefs.putInt("port", port > 0 ? port : TASK_HUB_PORT);
+  prefs.putString("device_id", deviceId.length() ? deviceId : String(DEVICE_ID));
+  prefs.putString("token", token);
+  prefs.putBool("configured", true);
+  prefs.end();
+
+  loadRuntimeConfig();
+  return cfgReady;
+}
+
+static void clearRuntimeConfig() {
+  Preferences prefs;
+  if (prefs.begin(CONFIG_NAMESPACE, false)) {
+    prefs.clear();
+    prefs.end();
+  }
+  loadRuntimeConfig();
+}
+
+static void sendSerialConfigStatus(const char* type, bool ok, const char* message) {
+  JsonDocument doc;
+  doc["type"] = type;
+  doc["ok"] = ok;
+  doc["configured"] = cfgReady;
+  doc["message"] = message;
+  doc["ssid"] = cfgReady ? cfgWifiSsid : "";
+  doc["host"] = cfgHubHost;
+  doc["port"] = cfgHubPort;
+  doc["device_id"] = cfgDeviceId;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+static void handleSerialConfigLine(String line) {
+  line.trim();
+  if (!line.length() || line[0] != '{') return;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    sendSerialConfigStatus("taskhub.error", false, err.c_str());
+    return;
+  }
+
+  String cmd = doc["cmd"].as<String>();
+  if (cmd == "taskhub.status" || cmd == "status") {
+    sendSerialConfigStatus("taskhub.status", true, cfgReady ? "configured" : "setup required");
+    return;
+  }
+
+  if (cmd == "taskhub.reset" || cmd == "reset") {
+    clearRuntimeConfig();
+    sendSerialConfigStatus("taskhub.reset", true, "configuration cleared");
+    delay(250);
+    ESP.restart();
+    return;
+  }
+
+  if (cmd != "taskhub.configure" && cmd != "configure") {
+    sendSerialConfigStatus("taskhub.error", false, "unknown command");
+    return;
+  }
+
+  String ssid = doc["ssid"].as<String>();
+  String password = doc["password"].as<String>();
+  String host = doc["host"].as<String>();
+  int port = doc["port"] | TASK_HUB_PORT;
+  String deviceId = doc["device_id"].as<String>();
+  if (!deviceId.length()) deviceId = doc["device"].as<String>();
+  String token = doc["token"].as<String>();
+
+  if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) {
+    sendSerialConfigStatus("taskhub.error", false, "ssid required");
+    return;
+  }
+  if (!token.length()) {
+    sendSerialConfigStatus("taskhub.error", false, "token required");
+    return;
+  }
+
+  bool saved = saveRuntimeConfig(ssid, password, host, port, deviceId, token);
+  sendSerialConfigStatus(saved ? "taskhub.configured" : "taskhub.error", saved,
+                         saved ? "saved; restarting" : "save failed");
+  if (saved) {
+    delay(400);
+    ESP.restart();
+  }
+}
+
+static void handleSerialConfig() {
+  while (Serial.available() > 0) {
+    char ch = (char)Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      handleSerialConfigLine(serialConfigLine);
+      serialConfigLine = "";
+      continue;
+    }
+    if (serialConfigLine.length() < SERIAL_CONFIG_MAX) {
+      serialConfigLine += ch;
+    } else {
+      serialConfigLine = "";
+      sendSerialConfigStatus("taskhub.error", false, "line too long");
+    }
+  }
+}
 
 static bool lowBatteryMode() {
   return battPct >= 0 && battPct <= LOW_BATTERY_THRESHOLD_PCT;
@@ -347,8 +522,11 @@ static uint32_t nextWakeSeconds() {
 }
 
 static String apiBase() {
-  String host = hubHost.length() ? hubHost : String(TASK_HUB_HOST);
-  return String("http://") + host + ":" + String(hubPort);
+  String host = hubHost.length() ? hubHost : cfgHubHost;
+  if (!host.length()) host = String(TASK_HUB_HOST);
+  int port = hubPort > 0 ? hubPort : cfgHubPort;
+  if (port <= 0) port = TASK_HUB_PORT;
+  return String("http://") + host + ":" + String(port);
 }
 
 static uint32_t awakeRefreshMs() {
@@ -378,6 +556,13 @@ static String urlEncode(const String& s) {
 // back to a full scan. Picks the deepest modem-sleep level once associated so
 // the brief idle awake window also draws less current.
 static bool ensureWifi() {
+  if (!cfgReady) {
+    wifiOk = false;
+    lastError = "Setup required";
+    setBootStatus("setup required", C_AMBER);
+    return false;
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
     setBootStatus("wifi ok", C_GREEN);
@@ -393,13 +578,14 @@ static bool ensureWifi() {
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < budgetMs) {
       M5.update();
+      handleSerialConfig();
       delay(50);
     }
   };
 
   if (rtcHasCachedBssid && rtcCachedChannel > 0) {
     // Fast path: aim at the known AP. Most wakes land here, in well under 1s.
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, rtcCachedChannel, rtcCachedBssid);
+    WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str(), rtcCachedChannel, rtcCachedBssid);
     waitForJoin(2500);                      // generous enough for a slow router
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.disconnect(false, false);        // hint stale — fall through to scan
@@ -407,7 +593,7 @@ static bool ensureWifi() {
     }
   }
   if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
     waitForJoin(WIFI_TIMEOUT_MS);
   }
 
@@ -447,8 +633,8 @@ static bool discoverHub(bool force) {
 
   JsonDocument req;
   req["type"] = "sticks3.discover";
-  req["device"] = DEVICE_ID;
-  req["token"] = DEVICE_TOKEN;
+  req["device"] = cfgDeviceId;
+  req["token"] = cfgDeviceToken;
   String packet;
   serializeJson(req, packet);
 
@@ -478,7 +664,7 @@ static bool discoverHub(bool force) {
     if (!(bool)(resp["ok"] | false)) continue;
 
     String host = resp["host"].as<String>();
-    int port = resp["port"] | TASK_HUB_PORT;
+    int port = resp["port"] | cfgHubPort;
     if (!host.length()) host = udp.remoteIP().toString();
     if (!host.length() || port <= 0) continue;
 
@@ -908,6 +1094,27 @@ static void drawWakeSyncScreen(const String& status) {
   setBootStatus(status, C_GRAY);
 }
 
+static void drawSetupScreen(const String& status) {
+  bootScreenActive = true;
+  bootStatusText = "";
+  M5.Display.fillScreen(C_BG);
+  int scale = 2;
+  int iconW = 24 * scale;
+  int iconH = 22 * scale;
+  int iconX = (M5.Display.width() - iconW) / 2;
+  int iconY = 8;
+  drawTaskHubMark(iconX, iconY, scale, C_BLUE);
+
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setFont(&fonts::efontCN_16);
+  M5.Display.setTextColor(C_BLUE, C_BG);
+  M5.Display.drawString("USB Setup", M5.Display.width() / 2, iconY + iconH + 17);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextColor(C_GRAY, C_BG);
+  M5.Display.drawString("Run scripts/provision_sticks3.sh", M5.Display.width() / 2, iconY + iconH + 34);
+  setBootStatus(status, C_AMBER);
+}
+
 static void setBootStatus(const String& text, int color) {
   if (!bootScreenActive || text == bootStatusText) return;
   bootStatusText = text;
@@ -1137,7 +1344,7 @@ static bool fetchTasks() {
   http.begin(url);
   requestOpen = true;
   http.setTimeout(HTTP_TIMEOUT_MS);
-  http.addHeader("X-Device-Token", DEVICE_TOKEN);
+  http.addHeader("X-Device-Token", cfgDeviceToken);
   code = http.GET();
   if (code != 200) {
     http.end();
@@ -1147,7 +1354,7 @@ static bool fetchTasks() {
       http.begin(url);
       requestOpen = true;
       http.setTimeout(HTTP_TIMEOUT_MS);
-      http.addHeader("X-Device-Token", DEVICE_TOKEN);
+      http.addHeader("X-Device-Token", cfgDeviceToken);
       code = http.GET();
     }
   }
@@ -1236,7 +1443,7 @@ static bool openSelectedTask() {
   http.begin(url);
   bool requestOpen = true;
   http.setTimeout(HTTP_TIMEOUT_MS);
-  http.addHeader("X-Device-Token", DEVICE_TOKEN);
+  http.addHeader("X-Device-Token", cfgDeviceToken);
   int code = http.POST("");
   if (code != 200) {
     http.end();
@@ -1246,7 +1453,7 @@ static bool openSelectedTask() {
       http.begin(url);
       requestOpen = true;
       http.setTimeout(HTTP_TIMEOUT_MS);
-      http.addHeader("X-Device-Token", DEVICE_TOKEN);
+      http.addHeader("X-Device-Token", cfgDeviceToken);
       code = http.POST("");
     }
   }
@@ -1354,18 +1561,37 @@ void setup() {
     M5.Display.setRotation(r0);
   }
 #endif
+  pinMode((int)PIN_BTN_A, INPUT_PULLUP);
   pinMode((int)PIN_BTN_B, INPUT_PULLUP);
   M5.BtnA.setHoldThresh(350);
   M5.BtnB.setHoldThresh(600);
   Serial.begin(115200);
   updateBattery();
   applyPowerProfile();
-  hubHost = String(TASK_HUB_HOST);
-  hubPort = TASK_HUB_PORT;
+  if (digitalRead((int)PIN_BTN_A) == LOW && digitalRead((int)PIN_BTN_B) == LOW) {
+    clearRuntimeConfig();
+    rtcHasCachedBssid = false;
+    Serial.println("[task-monitor] runtime config cleared by boot buttons");
+  } else {
+    loadRuntimeConfig();
+  }
+  hubHost = cfgHubHost;
+  hubPort = cfgHubPort;
 
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   wokeByTimer = wakeCause == ESP_SLEEP_WAKEUP_TIMER;
   wokeFromSleep = wakeCause == ESP_SLEEP_WAKEUP_TIMER || wakeCause == ESP_SLEEP_WAKEUP_EXT1;
+
+  if (!cfgReady) {
+    setupMode = true;
+    drawSetupScreen("waiting for USB config");
+    sendSerialConfigStatus("taskhub.status", true, "setup required");
+    activeTimeoutMs = UINT32_MAX;
+    lastInputAt = millis();
+    Serial.println("[task-monitor] setup required: waiting for serial provisioning");
+    return;
+  }
+
   if (wokeFromSleep) {
     drawWakeSyncScreen("wifi...");
   } else {
@@ -1392,6 +1618,23 @@ void setup() {
 
 void loop() {
   M5.update();
+  handleSerialConfig();
+
+  if (setupMode) {
+    static uint32_t lastSetupBattAt = 0;
+    if (millis() - lastSetupBattAt > 2000) {
+      lastSetupBattAt = millis();
+      updateBattery();
+    }
+    if (millis() - lastSetupStatusAt > 3000) {
+      lastSetupStatusAt = millis();
+      sendSerialConfigStatus("taskhub.status", true, "setup required");
+      setBootStatus("waiting for USB config", C_AMBER);
+    }
+    delay(25);
+    return;
+  }
+
   updateBtnBEdge();
   handleButtons();
   updateAutoRotate();

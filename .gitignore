@@ -26,6 +26,7 @@ firmware/voice_recorder/secrets.h
 # arduino-cli build artifacts
 firmware/task_monitor/build/
 firmware/voice_recorder/build/
+dist/
 
 # Editor/IDE
 .vscode/

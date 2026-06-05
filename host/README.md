@@ -26,7 +26,7 @@ Or run it with the local firmware token from `secrets.h`:
 For a detached local test session:
 
 ```bash
-screen -dmS sticks3_taskhub /bin/sh -lc 'cd /path/to/Taskhub-for-StickS3 && ./host/run_task_hub.sh >> .run/task_hub.log 2>&1'
+screen -dmS sticks3_taskhub /bin/sh -lc 'cd "$PWD" && ./host/run_task_hub.sh >> .run/task_hub.log 2>&1'
 ```
 
 Useful checks:

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+
+- M5Burner/public firmware provisioning path: `TASKHUB_PUBLIC_BUILD=1` ignores
+  local `secrets.h`, boots into `USB Setup`, accepts a one-line USB serial JSON
+  config, stores Wi-Fi/Host/token in NVS, and restarts into normal operation.
+- `scripts/provision_sticks3.sh` configures a public-build StickS3 over USB
+  using the installed Mac Host token and auto-detected LAN IP.
+- `firmware/build_m5burner_public.sh` builds a public artifact set without
+  compiling private Wi-Fi credentials, tokens, or local build paths into the
+  binary.
+- `scripts/setup.sh --provision` wires Host install + USB device provisioning
+  into the normal setup helper.
+
+### Changed
+
+- CI now compiles both the normal firmware path and the public M5Burner path.
+
 ## v1.3.0 — 2026-06-05
 
 ### Added
