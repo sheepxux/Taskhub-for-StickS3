@@ -5,7 +5,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 [简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v1.1.1-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.2.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#privacy-and-security)
@@ -59,7 +59,7 @@ resolution. Regenerate them with `python3 docs/render_screens.py`.
 
 ## Current Release
 
-`v1.1.1` is ready for an early public release for developers and hardware
+`v1.2.0` is ready for an early public release for developers and hardware
 makers. The core pipeline is working: Mac Host, StickS3 firmware, Wi-Fi
 discovery, compact task display, button actions, deep sleep, and LAN
 multi-device aggregation.
@@ -437,6 +437,6 @@ CHANGELOG.md             Release notes
 
 ## Release
 
-Current release: `v1.1.1`.
+Current release: `v1.2.0`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.

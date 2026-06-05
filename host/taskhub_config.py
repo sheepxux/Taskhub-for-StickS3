@@ -15,7 +15,7 @@ DEFAULT_PORT = int(os.environ.get("TASK_HUB_PORT", "5577"))
 DEFAULT_BIND = os.environ.get("TASK_HUB_BIND", "127.0.0.1")
 DEFAULT_TOKEN = os.environ.get("TASK_HUB_TOKEN", "dev-token")
 DEFAULT_DISCOVERY_PORT = int(os.environ.get("TASK_HUB_DISCOVERY_PORT", "5578"))
-TASK_HUB_VERSION = "1.1.1"
+TASK_HUB_VERSION = "1.2.0"
 
 DEVICE_NAME = os.environ.get("TASK_HUB_DEVICE_NAME") or socket.gethostname().split(".")[0] or "TaskHub"
 DEVICE_ID = os.environ.get("TASK_HUB_DEVICE_ID") or (

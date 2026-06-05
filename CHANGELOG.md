@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v1.2.0 — 2026-06-05
+
+On-device WAIT/DONE alerts, a clearer turn-completion state model, the browser
+web bridge + `POST /ingest`, a host config split, and a regression suite with CI.
+
 ### Added
 
 - `POST /ingest` endpoint: push external tasks (single or batch) into the Host; each expires after a per-task TTL so closed sources age out on their own. Backed by a thread-safe `ExternalTaskAdapter`.
