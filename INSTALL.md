@@ -79,11 +79,19 @@ The helper will:
 - send one JSON config line over USB serial
 - store the config in StickS3 NVS and restart the device
 
+The on-device UI defaults to English. Add `--lang zh` to the provisioning
+command if you want Chinese fixed UI text:
+
+```bash
+./scripts/setup.sh --skip-firmware --provision --lang zh
+```
+
 Non-interactive provisioning:
 
 ```bash
 TASKHUB_WIFI_SSID="My WiFi" \
 TASKHUB_WIFI_PASSWORD="wifi-password" \
+TASKHUB_LANG="en" \
 ./scripts/setup.sh --skip-firmware --provision --non-interactive
 ```
 
@@ -124,6 +132,7 @@ For scripted setup, pass values through environment variables:
 TASKHUB_WIFI_SSID="My WiFi" \
 TASKHUB_WIFI_PASSWORD="wifi-password" \
 TASKHUB_DEVICE_ID="sticks3-task-01" \
+TASKHUB_LANG="en" \
 ./scripts/setup.sh --non-interactive
 ```
 
@@ -133,7 +142,8 @@ You can also pass command-line flags:
 ./scripts/setup.sh \
   --wifi-ssid "My WiFi" \
   --wifi-password "wifi-password" \
-  --device-id "sticks3-task-01"
+  --device-id "sticks3-task-01" \
+  --lang en
 ```
 
 Avoid putting real Wi-Fi passwords in shell history on shared machines.

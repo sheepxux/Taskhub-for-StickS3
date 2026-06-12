@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- StickS3 firmware UI language setting: fixed device text defaults to English
+  and can be switched to Chinese with `TASKHUB_LANG=zh`, `--lang zh`, or USB
+  provisioning payload field `lang`.
+
+### Fixed
+
+- Claude Code local-agent sessions created by newer Claude builds are now read
+  from their per-session `.claude/projects` transcript root, restoring
+  RUN/WAIT/DONE instead of falling back to REC.
+
 ## v2.0.0 — 2026-06-05
 
 Major update: **voice mode** — hold-to-talk on the StickS3 transcribes Mandarin

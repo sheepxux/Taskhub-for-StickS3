@@ -285,6 +285,13 @@ That installs or repairs the Mac Host, reads the Host token, prompts for Wi-Fi
 if needed, and sends the config to the StickS3 over USB. The firmware saves it
 to NVS and restarts.
 
+The device UI defaults to English. To switch fixed UI text to Chinese during
+USB provisioning:
+
+```bash
+./scripts/setup.sh --skip-firmware --provision --lang zh
+```
+
 Build a public firmware artifact set for M5Burner publishing with:
 
 ```bash
@@ -303,6 +310,7 @@ Edit `firmware/task_monitor/secrets.h`:
 #define WIFI_SSID       "your-wifi-ssid"
 #define WIFI_PASSWORD   "your-wifi-password"
 #define DEVICE_TOKEN    "same-token-as-the-mac-host"
+#define TASKHUB_LANG    "en"  // or "zh"
 ```
 
 `TASK_HUB_HOST` is only a fallback. The firmware first tries UDP discovery on

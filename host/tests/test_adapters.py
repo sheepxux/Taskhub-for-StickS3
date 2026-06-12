@@ -81,6 +81,9 @@ class StatusMachines(unittest.TestCase):
         m = {"latest_event_ms": th.now_ms(), "active_turn": True}
         self.assertEqual(th.claude_status(m, None, process_running=True), "running")
 
+    def test_claude_status_running_when_process_has_no_transcript_yet(self):
+        self.assertEqual(th.claude_status({}, None, process_running=True), "running")
+
     def test_claude_status_waiting_wins(self):
         m = {"latest_event_ms": th.now_ms(), "active_turn": True, "waiting_for_user": True}
         self.assertEqual(th.claude_status(m, None, process_running=True), "waiting")
@@ -225,6 +228,31 @@ class ClaudeTranscriptScan(unittest.TestCase):
         finally:
             os.remove(path)
             th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
+
+    def test_local_agent_transcript_root_is_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_id = "local-agent-session"
+            root = os.path.join(tmp, ".claude", "projects", "project")
+            os.makedirs(root)
+            path = os.path.join(root, f"{session_id}.jsonl")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "type": "assistant",
+                    "timestamp": iso_now(),
+                    "message": {
+                        "role": "assistant",
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Bash"}],
+                        "usage": {"input_tokens": 7, "output_tokens": 3},
+                    },
+                }) + "\n")
+            try:
+                metrics = th.claude_session_metrics(session_id, transcript_roots=[os.path.join(tmp, ".claude", "projects")])
+                self.assertTrue(metrics["transcript_found"])
+                self.assertTrue(metrics["active_turn"])
+                self.assertEqual(metrics["usage"]["total_tokens"], 10)
+            finally:
+                th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
 
 
 class CodexSessionScan(unittest.TestCase):

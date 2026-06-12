@@ -34,6 +34,7 @@
 #define TASK_HUB_PORT   5577
 #define DEVICE_ID       "sticks3-task-01"
 #define DEVICE_TOKEN    "dev-token"
+#define TASKHUB_LANG    "en"
 #define AUTO_WAKE_SECONDS 600
 #endif
 
@@ -43,6 +44,10 @@
 
 #if !defined(TASK_HUB_PORT) && defined(SERVER_PORT)
 #define TASK_HUB_PORT SERVER_PORT
+#endif
+
+#if !defined(TASKHUB_LANG)
+#define TASKHUB_LANG "en"
 #endif
 
 #if !defined(AUTO_WAKE_SECONDS)
@@ -327,6 +332,7 @@ static String cfgHubHost;
 static int cfgHubPort = TASK_HUB_PORT;
 static String cfgDeviceId;
 static String cfgDeviceToken;
+static String cfgLang;
 static bool cfgReady = false;
 static bool setupMode = false;
 static String serialConfigLine;
@@ -361,6 +367,13 @@ static bool isPlaceholder(const String& value, const char* placeholder) {
   return !value.length() || value == placeholder;
 }
 
+static String normalizeLang(String lang) {
+  lang.trim();
+  lang.toLowerCase();
+  if (lang.startsWith("zh")) return "zh";
+  return "en";
+}
+
 static bool loadRuntimeConfig() {
   bool fromNvs = false;
   Preferences prefs;
@@ -373,6 +386,7 @@ static bool loadRuntimeConfig() {
       cfgHubPort = prefs.getInt("port", TASK_HUB_PORT);
       cfgDeviceId = prefs.getString("device_id", DEVICE_ID);
       cfgDeviceToken = prefs.getString("token", "");
+      cfgLang = normalizeLang(prefs.getString("lang", TASKHUB_LANG));
     }
     prefs.end();
   }
@@ -384,8 +398,10 @@ static bool loadRuntimeConfig() {
     cfgHubPort = TASK_HUB_PORT;
     cfgDeviceId = String(DEVICE_ID);
     cfgDeviceToken = String(DEVICE_TOKEN);
+    cfgLang = normalizeLang(String(TASKHUB_LANG));
   }
 
+  if (!cfgLang.length()) cfgLang = "en";
   if (!cfgHubHost.length()) cfgHubHost = String(TASK_HUB_HOST);
   if (cfgHubPort <= 0) cfgHubPort = TASK_HUB_PORT;
   if (!cfgDeviceId.length()) cfgDeviceId = String(DEVICE_ID);
@@ -398,7 +414,8 @@ static bool loadRuntimeConfig() {
 }
 
 static bool saveRuntimeConfig(const String& ssid, const String& password, const String& host,
-                              int port, const String& deviceId, const String& token) {
+                              int port, const String& deviceId, const String& token,
+                              const String& lang) {
   if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) return false;
   if (!token.length()) return false;
 
@@ -410,6 +427,7 @@ static bool saveRuntimeConfig(const String& ssid, const String& password, const 
   prefs.putInt("port", port > 0 ? port : TASK_HUB_PORT);
   prefs.putString("device_id", deviceId.length() ? deviceId : String(DEVICE_ID));
   prefs.putString("token", token);
+  prefs.putString("lang", normalizeLang(lang));
   prefs.putBool("configured", true);
   prefs.end();
 
@@ -436,6 +454,7 @@ static void sendSerialConfigStatus(const char* type, bool ok, const char* messag
   doc["host"] = cfgHubHost;
   doc["port"] = cfgHubPort;
   doc["device_id"] = cfgDeviceId;
+  doc["lang"] = cfgLang;
   serializeJson(doc, Serial);
   Serial.println();
 }
@@ -477,6 +496,9 @@ static void handleSerialConfigLine(String line) {
   String deviceId = doc["device_id"].as<String>();
   if (!deviceId.length()) deviceId = doc["device"].as<String>();
   String token = doc["token"].as<String>();
+  String lang = doc["lang"].as<String>();
+  if (!lang.length()) lang = doc["language"].as<String>();
+  if (!lang.length()) lang = cfgLang.length() ? cfgLang : String(TASKHUB_LANG);
 
   if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) {
     sendSerialConfigStatus("taskhub.error", false, "ssid required");
@@ -487,7 +509,7 @@ static void handleSerialConfigLine(String line) {
     return;
   }
 
-  bool saved = saveRuntimeConfig(ssid, password, host, port, deviceId, token);
+  bool saved = saveRuntimeConfig(ssid, password, host, port, deviceId, token, lang);
   sendSerialConfigStatus(saved ? "taskhub.configured" : "taskhub.error", saved,
                          saved ? "saved; restarting" : "save failed");
   if (saved) {
@@ -580,24 +602,32 @@ static String urlEncode(const String& s) {
   return out;
 }
 
+static bool uiZh() {
+  return cfgLang == "zh";
+}
+
+static const char* uiText(const char* en, const char* zh) {
+  return uiZh() ? zh : en;
+}
+
 // Connect with the cached BSSID/channel hint if we have one; on failure fall
 // back to a full scan. Picks the deepest modem-sleep level once associated so
 // the brief idle awake window also draws less current.
 static bool ensureWifi() {
   if (!cfgReady) {
     wifiOk = false;
-    lastError = "Setup required";
-    setBootStatus("setup required", C_AMBER);
+    lastError = uiText("Setup required", "需要配置");
+    setBootStatus(uiText("setup required", "需要配置"), C_AMBER);
     return false;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
-    setBootStatus("wifi ok", C_GREEN);
+    setBootStatus(uiText("wifi ok", "Wi-Fi 已连接"), C_GREEN);
     return true;
   }
 
-  setBootStatus("wifi...", C_BLUE);
+  setBootStatus(uiText("wifi...", "Wi-Fi..."), C_BLUE);
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setSleep(true);
@@ -627,7 +657,7 @@ static bool ensureWifi() {
 
   wifiOk = WiFi.status() == WL_CONNECTED;
   if (wifiOk) {
-    setBootStatus("wifi ok", C_GREEN);
+    setBootStatus(uiText("wifi ok", "Wi-Fi 已连接"), C_GREEN);
     // Cache for next wake.
     const uint8_t* bssid = WiFi.BSSID();
     if (bssid) {
@@ -640,7 +670,7 @@ static bool ensureWifi() {
     // mA off the awake-idle window.
     esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   } else {
-    setBootStatus("wifi failed", C_RED);
+    setBootStatus(uiText("wifi failed", "Wi-Fi 失败"), C_RED);
   }
   return wifiOk;
 }
@@ -651,7 +681,7 @@ static bool discoverHub(bool force) {
     return true;
   }
 
-  setBootStatus("hub...", C_BLUE);
+  setBootStatus(uiText("hub...", "Host..."), C_BLUE);
   lastDiscoveryAt = millis();
   WiFiUDP udp;
   if (!udp.begin(0)) {
@@ -700,14 +730,14 @@ static bool discoverHub(bool force) {
     hubPort = port;
     hubDiscovered = true;
     Serial.printf("[task-monitor] discovery ok host=%s port=%d\n", hubHost.c_str(), hubPort);
-    setBootStatus("hub ok", C_GREEN);
+    setBootStatus(uiText("hub ok", "Host 已连接"), C_GREEN);
     udp.stop();
     return true;
   }
 
   udp.stop();
   Serial.printf("[task-monitor] discovery fallback host=%s port=%d\n", hubHost.c_str(), hubPort);
-  setBootStatus("hub fallback", C_AMBER);
+  setBootStatus(uiText("hub fallback", "Host fallback"), C_AMBER);
   return false;
 }
 
@@ -1117,8 +1147,8 @@ static void drawWakeSyncScreen(const String& status) {
   M5.Display.fillScreen(C_BG);
   topBar();
   int H = M5.Display.height();
-  centerText("连接 Wi-Fi", H * 42 / 100, C_BLUE, &fonts::efontCN_16);
-  centerText("同步任务状态", H * 62 / 100, C_GRAY, &fonts::efontCN_12);
+  centerText(uiText("Connecting Wi-Fi", "连接 Wi-Fi"), H * 42 / 100, C_BLUE, &fonts::efontCN_16);
+  centerText(uiText("Syncing tasks", "同步任务状态"), H * 62 / 100, C_GRAY, &fonts::efontCN_12);
   setBootStatus(status, C_GRAY);
 }
 
@@ -1246,11 +1276,15 @@ static void drawList() {
   if (taskCount == 0) {
     int H = M5.Display.height();
     bool allHidden = !lastError.length() && hiddenCount > 0;
-    centerText(lastError.length() ? "无法读取任务" : (allHidden ? "旧任务已隐藏" : "暂无任务"),
+    centerText(lastError.length() ? uiText("Cannot read tasks", "无法读取任务")
+                                  : (allHidden ? uiText("Old tasks hidden", "旧任务已隐藏")
+                                               : uiText("No tasks", "暂无任务")),
                H * 42 / 100, lastError.length() ? C_RED : C_GRAY, &fonts::efontCN_16);
-    centerText(lastError.length() ? lastError : (allHidden ? String(hiddenCount) + " hidden · 会自动刷新" : "会定时自动刷新"),
+    centerText(lastError.length() ? lastError
+                                  : (allHidden ? String(hiddenCount) + uiText(" hidden · auto refresh", " hidden · 会自动刷新")
+                                               : uiText("Auto refresh", "会定时自动刷新")),
                H * 65 / 100, C_GRAY, &fonts::efontCN_12);
-    centerText("BtnA 刷新", H * 90 / 100, C_GRAY, &fonts::efontCN_12);
+    centerText(uiText("BtnA refresh", "BtnA 刷新"), H * 90 / 100, C_GRAY, &fonts::efontCN_12);
     return;
   }
 
@@ -1355,7 +1389,7 @@ static bool fetchTasks() {
   String previousSelectedId = (taskCount > 0 && selected < taskCount) ? tasks[selected].id : "";
   bool previousHadWait = waitCount > 0;
   if (!ensureWifi()) {
-    lastError = "Wi-Fi failed";
+    lastError = uiText("Wi-Fi failed", "Wi-Fi 失败");
     if (previousHadWait) clearStaleWaitSnapshot();
     Serial.println("[task-monitor] fetch failed: wifi");
     return false;
@@ -1368,7 +1402,7 @@ static bool fetchTasks() {
   bool requestOpen = false;
   HTTPClient http;
   String url = apiBase() + "/tasks?format=stick&limit=" + String(MAX_TASKS);
-  setBootStatus("sync...", C_BLUE);
+  setBootStatus(uiText("sync...", "同步..."), C_BLUE);
   http.begin(url);
   requestOpen = true;
   http.setTimeout(HTTP_TIMEOUT_MS);
@@ -1402,7 +1436,7 @@ static bool fetchTasks() {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
-    lastError = "JSON error";
+    lastError = uiText("JSON error", "JSON 错误");
     setBootStatus(lastError, C_RED);
     if (previousHadWait) clearStaleWaitSnapshot();
     Serial.printf("[task-monitor] fetch failed: json=%s\n", err.c_str());
@@ -1442,7 +1476,7 @@ static bool fetchTasks() {
   Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d wifi=%s ip=%s\n",
                 taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount,
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  setBootStatus("ready", C_GREEN);
+  setBootStatus(uiText("ready", "就绪"), C_GREEN);
   if (taskCount == 0) {
     selected = 0;
   } else if (lastManualSelectAt != 0 && millis() - lastManualSelectAt < MANUAL_SELECTION_HOLD_MS) {
@@ -1459,7 +1493,7 @@ static bool fetchTasks() {
 static bool openSelectedTask() {
   if (taskCount == 0 || selected >= taskCount) return false;
   if (!ensureWifi()) {
-    lastError = "Wi-Fi failed";
+    lastError = uiText("Wi-Fi failed", "Wi-Fi 失败");
     return false;
   }
   AiTask& t = tasks[selected];
@@ -1501,7 +1535,7 @@ static void enterDeepSleep() {
 #if ENABLE_DEEP_SLEEP
   uint32_t wakeSeconds = nextWakeSeconds();
   M5.Display.fillScreen(C_BG);
-  centerText(String("sleep ") + String(wakeSeconds / 60) + "m", M5.Display.height() / 2, C_GRAY, &fonts::Font0);
+  centerText(String(uiText("sleep ", "休眠 ")) + String(wakeSeconds / 60) + "m", M5.Display.height() / 2, C_GRAY, &fonts::Font0);
   delay(120);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -1524,7 +1558,7 @@ static void enterDeepSleep() {
 }
 
 static void refreshNow() {
-  drawMessage("刷新中", apiBase(), C_AMBER);
+  drawMessage(uiText("Refreshing", "刷新中"), apiBase(), C_AMBER);
   bool ok = fetchTasks();
   updateBattery();
   updateAlerts();
@@ -1568,8 +1602,8 @@ static void drawVoiceRecordingUI(uint32_t sec) {
   int W = M5.Display.width();
   int H = M5.Display.height();
   M5.Display.fillCircle(W / 2, H * 30 / 100, 9, C_RED);
-  centerText("录音中", H * 52 / 100, C_RED, &fonts::efontCN_16);
-  centerText(String(sec) + "s · 松手发送", H * 74 / 100, C_GRAY, &fonts::efontCN_12);
+  centerText(uiText("Recording", "录音中"), H * 52 / 100, C_RED, &fonts::efontCN_16);
+  centerText(String(sec) + uiText("s · release to send", "s · 松手发送"), H * 74 / 100, C_GRAY, &fonts::efontCN_12);
 }
 
 // Keep the mic's DMA slots fed so capture is gapless while BtnB is held.
@@ -1582,18 +1616,18 @@ static void pumpMic() {
 
 static void startVoiceRecording() {
   if (!voiceBuf) {
-    drawMessage("语音不可用", "PSRAM 分配失败", C_RED);
+    drawMessage(uiText("Voice unavailable", "语音不可用"), uiText("PSRAM alloc failed", "PSRAM 分配失败"), C_RED);
     delay(900); drawList(); return;
   }
   if (!ensureWifi()) {
-    drawMessage("语音失败", "Wi-Fi 未连接", C_RED);
+    drawMessage(uiText("Voice failed", "语音失败"), uiText("Wi-Fi offline", "Wi-Fi 未连接"), C_RED);
     delay(900); drawList(); return;
   }
   voiceSamples = 0;
   M5.Speaker.end();                 // free the shared I2S for the mic
   if (!M5.Mic.begin()) {
     M5.Speaker.begin();
-    drawMessage("麦克风启动失败", "", C_RED);
+    drawMessage(uiText("Mic start failed", "麦克风启动失败"), "", C_RED);
     delay(900); drawList(); return;
   }
   voiceRecording = true;
@@ -1611,13 +1645,13 @@ static void stopAndSendVoice() {
 
   uint32_t samples = voiceSamples;
   if (samples < (uint32_t)VOICE_SAMPLE_RATE / 4) {   // < 0.25s
-    drawMessage("太短了", "按住 BtnB 说话", C_AMBER);
+    drawMessage(uiText("Too short", "太短了"), uiText("Hold BtnB to talk", "按住 BtnB 说话"), C_AMBER);
     delay(900); drawList(); return;
   }
   uint32_t pcmBytes = samples * 2;
   writeWavHeader(voiceBuf, pcmBytes);
 
-  drawMessage("转写中…", "", C_BLUE);
+  drawMessage(uiText("Transcribing...", "转写中..."), "", C_BLUE);
   String tid = (taskCount > 0 && selected < taskCount) ? tasks[selected].id : "";
   String url = apiBase() + "/voice";
   if (tid.length()) url += "?task=" + urlEncode(tid);
@@ -1640,12 +1674,12 @@ static void stopAndSendVoice() {
       injected = doc["injected"] | false;
     }
     if (text.length() == 0) {
-      drawMessage("没听清", "再试一次", C_AMBER);
+      drawMessage(uiText("No speech heard", "没听清"), uiText("Try again", "再试一次"), C_AMBER);
     } else {
-      drawMessage(injected ? "✓ 已输入" : "已转写", text, injected ? C_GREEN : C_AMBER);
+      drawMessage(injected ? uiText("Typed", "已输入") : uiText("Transcribed", "已转写"), text, injected ? C_GREEN : C_AMBER);
     }
   } else {
-    drawMessage("语音失败", code > 0 ? String("HTTP ") + code : "无法连接", C_RED);
+    drawMessage(uiText("Voice failed", "语音失败"), code > 0 ? String("HTTP ") + code : uiText("Cannot connect", "无法连接"), C_RED);
   }
   delay(1400);
   drawList();
@@ -1698,9 +1732,11 @@ static void handleButtons() {
 
   if (bClick && !voiceRecording) {
     lastInputAt = millis();
-    drawMessage("打开任务", taskCount ? tasks[selected].source : "no task", C_BLUE);
+    drawMessage(uiText("Opening task", "打开任务"), taskCount ? tasks[selected].source : uiText("no task", "无任务"), C_BLUE);
     bool ok = openSelectedTask();
-    drawMessage(ok ? "已发送打开请求" : "打开失败", ok ? "Mac 会切到对应 App" : lastError, ok ? C_GREEN : C_RED);
+    drawMessage(ok ? uiText("Open request sent", "已发送打开请求") : uiText("Open failed", "打开失败"),
+                ok ? uiText("Mac switches app", "Mac 会切到对应 App") : lastError,
+                ok ? C_GREEN : C_RED);
     delay(900);
     drawList();
   }

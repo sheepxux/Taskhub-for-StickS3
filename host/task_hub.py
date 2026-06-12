@@ -519,11 +519,17 @@ def total_tokens_from_usage(usage: Dict[str, Any], fields: List[str]) -> int:
     return sum(safe_int(usage.get(field)) for field in fields)
 
 
-def claude_transcript_path(cli_session_id: str) -> str:
+def claude_transcript_path(cli_session_id: str, roots: Optional[List[str]] = None) -> str:
     if not cli_session_id:
         return ""
-    pattern = os.path.expanduser(f"~/.claude/projects/**/{cli_session_id}.jsonl")
-    paths = glob.glob(pattern, recursive=True)
+    search_roots = list(roots or [])
+    search_roots.append(os.path.expanduser("~/.claude/projects"))
+    paths: List[str] = []
+    for root in search_roots:
+        if not root:
+            continue
+        pattern = os.path.join(os.path.expanduser(root), "**", f"{cli_session_id}.jsonl")
+        paths.extend(glob.glob(pattern, recursive=True))
     if not paths:
         return ""
     return max(paths, key=os.path.getmtime)
@@ -662,8 +668,12 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
     return scan
 
 
-def claude_session_metrics(cli_session_id: str, completed_turns: Any = None) -> Dict[str, Any]:
-    path = claude_transcript_path(cli_session_id)
+def claude_session_metrics(
+    cli_session_id: str,
+    completed_turns: Any = None,
+    transcript_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    path = claude_transcript_path(cli_session_id, transcript_roots)
     turns = safe_int(completed_turns)
     if not path:
         return {"usage": build_usage(turns=turns), "turns": turns}
@@ -709,6 +719,8 @@ def claude_status(metrics: Dict[str, Any], updated_ms: Optional[int], process_ru
     latest = safe_int(metrics.get("latest_event_ms") or updated_ms)
     if metrics.get("waiting_for_user"):
         return "waiting"
+    if process_running and not metrics.get("transcript_found"):
+        return "running"
     if metrics.get("active_turn"):
         if process_running:
             return "running"
@@ -1372,7 +1384,16 @@ class ClaudeAdapter:
             # only ever open the few transcripts that could still be relevant.
             if not is_running and updated and updated < cutoff:
                 continue
-            metrics = claude_session_metrics(cli_session_id, item.get("completedTurns"))
+            local_transcript_roots: List[str] = []
+            local_session_dir = os.path.splitext(path)[0]
+            local_projects_dir = os.path.join(local_session_dir, ".claude", "projects")
+            if os.path.isdir(local_projects_dir):
+                local_transcript_roots.append(local_projects_dir)
+            metrics = claude_session_metrics(
+                cli_session_id,
+                item.get("completedTurns"),
+                transcript_roots=local_transcript_roots,
+            )
             transcript_updated = safe_int(metrics.get("latest_event_ms"))
             if transcript_updated and (not updated or transcript_updated > updated):
                 updated = transcript_updated

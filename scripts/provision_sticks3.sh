@@ -11,6 +11,7 @@ WIFI_SSID="${TASKHUB_WIFI_SSID:-}"
 WIFI_PASSWORD="${TASKHUB_WIFI_PASSWORD:-}"
 DEVICE_ID="${TASKHUB_DEVICE_ID:-sticks3-task-01}"
 DEVICE_TOKEN="${TASKHUB_DEVICE_TOKEN:-}"
+TASKHUB_LANG="${TASKHUB_LANG:-en}"
 HOST="${TASKHUB_HOST:-}"
 HOST_PORT="${TASKHUB_PORT:-5577}"
 SKIP_HOST=0
@@ -37,6 +38,7 @@ Options:
   --port VALUE           Mac Host HTTP port, default: 5577
   --token VALUE          Shared Host/device token, default: installed Host token
   --device-id VALUE      Device id stored on the StickS3
+  --lang VALUE           Device UI language: en or zh, default: en
   --skip-host            Do not install/repair the Mac Host first
   --reset                Clear runtime config on the StickS3 and restart it
   --non-interactive      Do not prompt for missing values
@@ -50,6 +52,7 @@ Environment variables:
   TASKHUB_PORT
   TASKHUB_DEVICE_TOKEN
   TASKHUB_DEVICE_ID
+  TASKHUB_LANG
 EOF
 }
 
@@ -97,6 +100,11 @@ while [ "$#" -gt 0 ]; do
     --device-id)
       [ "$#" -ge 2 ] || fail "--device-id requires a value"
       DEVICE_ID="$2"
+      shift
+      ;;
+    --lang)
+      [ "$#" -ge 2 ] || fail "--lang requires a value"
+      TASKHUB_LANG="$2"
       shift
       ;;
     --skip-host)
@@ -175,6 +183,12 @@ if [ -z "$HOST" ]; then
 fi
 [ -n "$HOST" ] || fail "could not auto-detect Mac LAN IP; pass --host"
 
+TASKHUB_LANG="$(printf '%s' "$TASKHUB_LANG" | tr '[:upper:]' '[:lower:]')"
+case "$TASKHUB_LANG" in
+  en|zh|zh-*) ;;
+  *) fail "--lang must be en or zh" ;;
+esac
+
 if [ "$RESET_ONLY" -eq 0 ]; then
   if [ -z "$WIFI_SSID" ]; then
     WIFI_SSID="$(detect_wifi_ssid | head -1 || true)"
@@ -196,7 +210,7 @@ fi
 
 stty -f "$SERIAL_PORT" 115200 raw -echo -echoe -echok -ixon -ixoff 2>/dev/null || true
 
-export SERIAL_PORT WIFI_SSID WIFI_PASSWORD HOST HOST_PORT DEVICE_ID DEVICE_TOKEN RESET_ONLY
+export SERIAL_PORT WIFI_SSID WIFI_PASSWORD HOST HOST_PORT DEVICE_ID DEVICE_TOKEN TASKHUB_LANG RESET_ONLY
 python3 - <<'PY'
 import json
 import os
@@ -217,6 +231,7 @@ else:
         "port": int(os.environ.get("HOST_PORT") or "5577"),
         "device_id": os.environ.get("DEVICE_ID") or "sticks3-task-01",
         "token": os.environ["DEVICE_TOKEN"],
+        "lang": "zh" if os.environ.get("TASKHUB_LANG", "en").lower().startswith("zh") else "en",
     }
     success_type = "taskhub.configured"
 
