@@ -378,8 +378,9 @@ selected task. Transcription is local (whisper.cpp); audio never leaves the LAN.
    ```
 
 Then on the device: short-press BtnB to open a task's app, hold BtnB to talk,
-release to type the text in. Tunables: `TASK_HUB_WHISPER_MODEL`,
-`TASK_HUB_WHISPER_LANGUAGE`, and `?enter=1` on `/voice` to auto-send.
+release to transcribe and send. Tunables: `TASK_HUB_WHISPER_MODEL`,
+`TASK_HUB_WHISPER_LANGUAGE`, and device-side `VOICE_AUTO_SEND` /
+`TASKHUB_VOICE_SEND` / `--voice-send off` for paste-only review before sending.
 
 ## Updating
 

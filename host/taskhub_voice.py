@@ -25,10 +25,49 @@ from typing import Dict, Optional, Tuple
 # host/run_whisper_server.sh. We fall back to one-shot whisper-cli if it's down.
 WHISPER_SERVER_URL = os.environ.get("TASK_HUB_WHISPER_URL", "http://127.0.0.1:8080/inference")
 WHISPER_CLI = os.environ.get("TASK_HUB_WHISPER_CLI", "whisper-cli")
-WHISPER_MODEL = os.environ.get(
-    "TASK_HUB_WHISPER_MODEL",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "ggml-large-v3-turbo.bin"),
+
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_NAMES = (
+    "ggml-large-v3-turbo-q5_0.bin",
+    "ggml-large-v3-turbo.bin",
+    "ggml-medium.bin",
+    "ggml-small.bin",
 )
+
+
+def resolve_whisper_model(
+    explicit: Optional[str] = None,
+    *,
+    module_dir: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> str:
+    """Resolve the model path for the CLI fallback.
+
+    The Host is often copied into ~/Library/Application Support, while the
+    downloaded models usually remain in the repo under host/models. Try both
+    shapes so voice mode survives a normal Host install.
+    """
+    if explicit is None:
+        explicit = os.environ.get("TASK_HUB_WHISPER_MODEL", "")
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+
+    module_dir = os.path.abspath(module_dir or MODULE_DIR)
+    cwd = os.path.abspath(cwd or os.getcwd())
+    search_dirs = [
+        os.path.join(module_dir, "models"),
+        os.path.join(os.path.dirname(module_dir), "host", "models"),
+        os.path.join(cwd, "host", "models"),
+    ]
+    for directory in search_dirs:
+        for name in DEFAULT_MODEL_NAMES:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                return path
+    return os.path.join(module_dir, "models", DEFAULT_MODEL_NAMES[0])
+
+
+WHISPER_MODEL = resolve_whisper_model()
 # "auto" lets whisper detect Mandarin vs English per clip (handles code-switching
 # reasonably). Override to "zh" or "en" to force a language.
 WHISPER_LANGUAGE = os.environ.get("TASK_HUB_WHISPER_LANGUAGE", "auto")

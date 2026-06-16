@@ -35,6 +35,8 @@ TASK_CACHE_MS = int(os.environ.get("TASK_HUB_CACHE_MS", "3000"))
 TRANSCRIPT_CACHE_MAX = int(os.environ.get("TASK_HUB_TRANSCRIPT_CACHE_MAX", "200"))
 
 CODEX_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CODEX_RUNNING_STALE_MS", "900000"))
+CODEX_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CODEX_DONE_WINDOW_MS", "300000"))
+CODEX_MAX_THREADS = int(os.environ.get("TASK_HUB_CODEX_MAX_THREADS", "6"))
 QUESTION_WAITING_STALE_MS = int(os.environ.get("TASK_HUB_QUESTION_WAITING_STALE_MS", "3600000"))
 
 # 90s default (was 15min): with process detection now reliable, the time-based

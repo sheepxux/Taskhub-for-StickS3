@@ -12,6 +12,9 @@ fi
 
 export TASK_HUB_TOKEN="${TOKEN:-dev-token}"
 export PATH="$HOME/.local/node/bin:$HOME/.local/node-v22.22.1-darwin-arm64/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [ -z "${TASK_HUB_WHISPER_MODEL:-}" ] && [ -f "$ROOT/host/models/ggml-large-v3-turbo-q5_0.bin" ]; then
+  export TASK_HUB_WHISPER_MODEL="$ROOT/host/models/ggml-large-v3-turbo-q5_0.bin"
+fi
 exec python3 -u "$ROOT/host/task_hub.py" \
   --bind "${TASK_HUB_BIND:-0.0.0.0}" \
   --port "${TASK_HUB_PORT:-5577}"

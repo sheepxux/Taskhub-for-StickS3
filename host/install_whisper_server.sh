@@ -24,7 +24,7 @@ if [ ! -f "$MODEL" ]; then
   echo "Whisper model not found: $MODEL" >&2
   echo "Download one, e.g.:" >&2
   echo "  mkdir -p '$ROOT/host/models' && curl -L -o '$MODEL' \\" >&2
-  echo "    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" >&2
+  echo "    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin" >&2
   exit 1
 fi
 

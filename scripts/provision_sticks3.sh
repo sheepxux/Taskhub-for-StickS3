@@ -12,6 +12,7 @@ WIFI_PASSWORD="${TASKHUB_WIFI_PASSWORD:-}"
 DEVICE_ID="${TASKHUB_DEVICE_ID:-sticks3-task-01}"
 DEVICE_TOKEN="${TASKHUB_DEVICE_TOKEN:-}"
 TASKHUB_LANG="${TASKHUB_LANG:-en}"
+TASKHUB_VOICE_SEND="${TASKHUB_VOICE_SEND:-1}"
 HOST="${TASKHUB_HOST:-}"
 HOST_PORT="${TASKHUB_PORT:-5577}"
 SKIP_HOST=0
@@ -39,6 +40,7 @@ Options:
   --token VALUE          Shared Host/device token, default: installed Host token
   --device-id VALUE      Device id stored on the StickS3
   --lang VALUE           Device UI language: en or zh, default: en
+  --voice-send VALUE     Send transcript automatically: on/off, default: on
   --skip-host            Do not install/repair the Mac Host first
   --reset                Clear runtime config on the StickS3 and restart it
   --non-interactive      Do not prompt for missing values
@@ -53,6 +55,7 @@ Environment variables:
   TASKHUB_DEVICE_TOKEN
   TASKHUB_DEVICE_ID
   TASKHUB_LANG
+  TASKHUB_VOICE_SEND
 EOF
 }
 
@@ -105,6 +108,11 @@ while [ "$#" -gt 0 ]; do
     --lang)
       [ "$#" -ge 2 ] || fail "--lang requires a value"
       TASKHUB_LANG="$2"
+      shift
+      ;;
+    --voice-send)
+      [ "$#" -ge 2 ] || fail "--voice-send requires a value"
+      TASKHUB_VOICE_SEND="$2"
       shift
       ;;
     --skip-host)
@@ -163,6 +171,16 @@ detect_wifi_ssid() {
   done
 }
 
+normalize_bool_flag() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on) printf '1\n' ;;
+    0|false|no|off) printf '0\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 if [ "$SKIP_HOST" -eq 0 ]; then
   "$ROOT/host/install_task_hub.sh"
 fi
@@ -188,6 +206,7 @@ case "$TASKHUB_LANG" in
   en|zh|zh-*) ;;
   *) fail "--lang must be en or zh" ;;
 esac
+TASKHUB_VOICE_SEND="$(normalize_bool_flag "$TASKHUB_VOICE_SEND")" || fail "--voice-send must be on/off or 1/0"
 
 if [ "$RESET_ONLY" -eq 0 ]; then
   if [ -z "$WIFI_SSID" ]; then
@@ -210,7 +229,7 @@ fi
 
 stty -f "$SERIAL_PORT" 115200 raw -echo -echoe -echok -ixon -ixoff 2>/dev/null || true
 
-export SERIAL_PORT WIFI_SSID WIFI_PASSWORD HOST HOST_PORT DEVICE_ID DEVICE_TOKEN TASKHUB_LANG RESET_ONLY
+export SERIAL_PORT WIFI_SSID WIFI_PASSWORD HOST HOST_PORT DEVICE_ID DEVICE_TOKEN TASKHUB_LANG TASKHUB_VOICE_SEND RESET_ONLY
 python3 - <<'PY'
 import json
 import os
@@ -232,6 +251,7 @@ else:
         "device_id": os.environ.get("DEVICE_ID") or "sticks3-task-01",
         "token": os.environ["DEVICE_TOKEN"],
         "lang": "zh" if os.environ.get("TASKHUB_LANG", "en").lower().startswith("zh") else "en",
+        "voice_send": os.environ.get("TASKHUB_VOICE_SEND", "1") == "1",
     }
     success_type = "taskhub.configured"
 

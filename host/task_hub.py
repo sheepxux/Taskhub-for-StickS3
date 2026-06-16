@@ -40,7 +40,9 @@ from taskhub_config import (
     CLAUDE_HUMAN_INPUT_TOOLS,
     CLAUDE_RUNNING_STALE_MS,
     CLAUDE_TERMINAL_STOP_REASONS,
+    CODEX_DONE_WINDOW_MS,
     CODEX_HUMAN_INPUT_FUNCTIONS,
+    CODEX_MAX_THREADS,
     CODEX_RUNNING_STALE_MS,
     DEFAULT_BIND,
     DEFAULT_DISCOVERY_PORT,
@@ -808,7 +810,8 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
 
     session_id = ""
     cwd = ""
-    updated_ms = int(st.st_mtime * 1000)
+    file_mtime_ms = int(st.st_mtime * 1000)
+    updated_ms = file_mtime_ms
     token_usage: Dict[str, Any] = {}
     rate_percent: Optional[float] = None
     turns = 0
@@ -816,7 +819,7 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
     latest_turn_ms = 0
     latest_completed_turn_id = ""
     latest_completed_ms = 0
-    latest_event_ms = updated_ms
+    latest_event_ms = 0
     latest_user_ms = 0
     latest_agent_message_ms = 0
     latest_agent_message_text = ""
@@ -904,10 +907,12 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
         "latest_completed_turn_id": latest_completed_turn_id,
         "latest_completed_ms": latest_completed_ms,
         "latest_event_ms": latest_event_ms,
+        "file_mtime_ms": file_mtime_ms,
         "latest_user_ms": latest_user_ms,
         "latest_agent_message_ms": latest_agent_message_ms,
         "latest_tool_call_ms": latest_tool_call_ms,
         "latest_human_input_request_ms": latest_human_input_request_ms,
+        "active_turn": bool(latest_turn_id and latest_turn_id != latest_completed_turn_id),
         # Mirror the Claude model: WAIT only for an explicit, unanswered
         # request_user_input call — a turn ending with a question in prose is a
         # completed turn (DONE), not a WAIT.
@@ -932,7 +937,7 @@ def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
             continue
         session_id = scan["session_id"]
         cwd = scan["cwd"]
-        updated_ms = scan["updated_ms"]
+        updated_ms = safe_int(scan["latest_event_ms"]) or scan["updated_ms"]
         token_usage = scan["token_usage"]
         rate_percent = scan["rate_percent"]
         turns = scan["turns"]
@@ -991,6 +996,120 @@ def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
     return records
 
 
+def codex_goal_records() -> Dict[str, Dict[str, Any]]:
+    path = os.path.expanduser("~/.codex/sqlite/goals_1.sqlite")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                select thread_id, objective, status, token_budget, tokens_used, updated_at_ms
+                from thread_goals
+                """
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return {str(row["thread_id"]): dict(row) for row in rows if row["thread_id"]}
+
+
+def codex_state_records(max_threads: int = CODEX_MAX_THREADS) -> List[Dict[str, Any]]:
+    """Read Codex's newer SQLite thread index and enrich each row with the
+    rollout scan. SQLite gives us the complete recent thread list; JSONL still
+    gives the turn-level RUN/WAIT/DONE signal."""
+    path = os.path.expanduser("~/.codex/sqlite/state_5.sqlite")
+    if not os.path.isfile(path):
+        return []
+    goals = codex_goal_records()
+    query_limit = max(max_threads * 4, max_threads)
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                select id, rollout_path, title, cwd, updated_at_ms, tokens_used,
+                       model, reasoning_effort, archived, source, thread_source, preview
+                from threads
+                where archived = 0
+                order by updated_at_ms desc
+                limit ?
+                """,
+                (query_limit,),
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        thread_id = str(item.get("id") or "")
+        rollout_path = os.path.expanduser(str(item.get("rollout_path") or ""))
+        scan = _scan_codex_session(rollout_path) if rollout_path and os.path.isfile(rollout_path) else {}
+        goal = goals.get(thread_id) or {}
+
+        scan_activity_ms = max(
+            safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0),
+            safe_int(scan.get("latest_completed_ms") if isinstance(scan, dict) else 0),
+        )
+        fallback_updated_ms = max(
+            safe_int(item.get("updated_at_ms")),
+            safe_int(goal.get("updated_at_ms")),
+        )
+        updated_ms = scan_activity_ms or fallback_updated_ms
+        turns = safe_int(scan.get("turns") if isinstance(scan, dict) else 0)
+        usage = (scan.get("usage") if isinstance(scan, dict) else {}) or {}
+        if not usage:
+            usage = build_usage(
+                total_tokens=safe_int(item.get("tokens_used")),
+                turns=turns,
+                fields={
+                    "source": "codex-state-db",
+                    "model": item.get("model"),
+                    "reasoning_effort": item.get("reasoning_effort"),
+                    "tokens_used": safe_int(item.get("tokens_used")),
+                },
+            )
+
+        record = {
+            "id": thread_id,
+            "cwd": str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else "")),
+            "folder": folder_label(str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else ""))),
+            "title": str(item.get("title") or ""),
+            "preview": str(item.get("preview") or ""),
+            "updated_ms": updated_ms,
+            "latest_event_ms": safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0) or updated_ms,
+            "latest_turn_id": scan.get("latest_turn_id") if isinstance(scan, dict) else "",
+            "latest_turn_ms": safe_int(scan.get("latest_turn_ms") if isinstance(scan, dict) else 0),
+            "latest_completed_turn_id": scan.get("latest_completed_turn_id") if isinstance(scan, dict) else "",
+            "latest_completed_ms": safe_int(scan.get("latest_completed_ms") if isinstance(scan, dict) else 0),
+            "active_turn": bool(scan.get("active_turn") if isinstance(scan, dict) else False),
+            "waiting_for_user": bool(scan.get("waiting_for_user") if isinstance(scan, dict) else False),
+            "path": rollout_path,
+            "usage": usage,
+            "model": item.get("model"),
+            "reasoning_effort": item.get("reasoning_effort"),
+            "thread_source": item.get("thread_source"),
+            "goal": goal,
+        }
+        records.append(record)
+    records.sort(key=lambda item: safe_int(item.get("updated_ms")), reverse=True)
+    return records[:max_threads]
+
+
+def codex_records() -> List[Dict[str, Any]]:
+    state_records = codex_state_records()
+    if state_records:
+        return state_records
+    return codex_usage_records()
+
+
 def latest_codex_record(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not records:
         return {}
@@ -1016,6 +1135,12 @@ def codex_usage_for_cwd(records: List[Dict[str, Any]], cwd: str) -> Dict[str, An
 
 def codex_title(record: Dict[str, Any], fallback: str = "Codex") -> str:
     title = str(record.get("title") or "").strip()
+    if not title:
+        title = str(record.get("preview") or "").strip()
+    if title:
+        title = re.sub(r"\s+", " ", title).strip()
+        if len(title) > 96:
+            title = title[:93].rstrip() + "..."
     if title:
         return title
     folder = str(record.get("folder") or "").strip()
@@ -1026,12 +1151,20 @@ def codex_title(record: Dict[str, Any], fallback: str = "Codex") -> str:
 
 def codex_subtitle(record: Dict[str, Any], fallback: str = "") -> str:
     folder = str(record.get("folder") or "").strip()
+    parts: List[str] = []
     cwd = str(record.get("cwd") or "").strip()
     if folder:
-        return folder
-    if cwd:
-        return cwd
-    return fallback
+        parts.append(folder)
+    elif cwd:
+        parts.append(cwd)
+    model = str(record.get("model") or "").strip()
+    if model:
+        parts.append(model)
+    goal = record.get("goal") if isinstance(record.get("goal"), dict) else {}
+    goal_status = str(goal.get("status") or "").strip()
+    if goal_status and goal_status != "active":
+        parts.append(goal_status)
+    return join_parts(parts[:3]) or fallback
 
 
 def codex_status(record: Dict[str, Any], app_is_running: bool = False) -> str:
@@ -1041,6 +1174,9 @@ def codex_status(record: Dict[str, Any], app_is_running: bool = False) -> str:
     active_turn = bool(record.get("active_turn"))
     if active_turn and latest and now_ms() - latest < CODEX_RUNNING_STALE_MS:
         return "running"
+    completed = safe_int(record.get("latest_completed_ms"))
+    if completed and now_ms() - completed < CODEX_DONE_WINDOW_MS:
+        return "done"
     if latest and now_ms() - latest < ACTIVE_MINUTES * 60 * 1000:
         return "recent"
     return "idle" if app_is_running else "idle"
@@ -1485,16 +1621,54 @@ class CodexAdapter:
     def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
         commands = commands or ps_commands()
         tasks: List[Task] = []
-        usage_records = codex_usage_records()
+        usage_records = codex_records()
         app_is_running = app_running(commands, "/Applications/Codex.app", "Codex")
         # Case-insensitive: Codex CLI installs may render the path with mixed
         # case depending on launcher; same lesson learned from the Claude fix.
         app_server_count = sum(ci_contains("Codex.app/Contents/Resources/codex app-server", line) for line in commands)
         titles = window_titles("Codex") if app_is_running else []
+        window_title = titles[0] if titles and titles[0] != "Codex" else "Codex"
+        seen_ids = set()
+        seen_cwds = set()
 
-        if app_is_running:
+        for record in usage_records[:CODEX_MAX_THREADS]:
+            thread_id = str(record.get("id") or "")
+            if thread_id:
+                seen_ids.add(thread_id)
+            cwd = str(record.get("cwd") or "")
+            if cwd:
+                seen_cwds.add(cwd)
+            title = codex_title(record, window_title)
+            status = codex_status(record, app_is_running=True)
+            usage = record.get("usage") or {}
+            subtitle = codex_subtitle(record, f"{app_server_count} app-server process(es)")
+            tasks.append(
+                task(
+                    task_id=stable_id("codex-thread", thread_id or cwd or title),
+                    source=self.source,
+                    title=title,
+                    status=status,
+                    subtitle=subtitle,
+                    updated_ms=safe_int(record.get("updated_ms")) or None,
+                    detail={
+                        "session_id": record.get("id"),
+                        "cwd": record.get("cwd"),
+                        "folder": record.get("folder"),
+                        "usage_source": usage.get("source"),
+                        "app_server_count": app_server_count,
+                        "waiting_for_user": bool(record.get("waiting_for_user")),
+                        "active_turn": bool(record.get("active_turn")),
+                        "latest_completed_ms": safe_int(record.get("latest_completed_ms")),
+                        "thread_source": record.get("thread_source"),
+                    },
+                    usage=usage,
+                    open_action={"type": "app", "target": "com.openai.codex"},
+                    needs_attention=status == "waiting",
+                )
+            )
+
+        if app_is_running and not tasks:
             record = latest_codex_record(usage_records)
-            window_title = titles[0] if titles and titles[0] != "Codex" else "Codex desktop"
             title = codex_title(record, window_title)
             status = codex_status(record, app_is_running=True)
             usage = record.get("usage") or {}
@@ -1506,6 +1680,7 @@ class CodexAdapter:
                     title=title,
                     status=status,
                     subtitle=subtitle,
+                    updated_ms=safe_int(record.get("updated_ms")) or None,
                     detail={
                         "session_id": record.get("id"),
                         "cwd": record.get("cwd"),
@@ -1527,7 +1702,11 @@ class CodexAdapter:
             cwd = first_match(r"--working-dir\s+(.+?)(?:\s--|$)", line)
             if not session:
                 continue
+            if cwd and cwd in seen_cwds:
+                continue
             record = codex_record_for_cwd(usage_records, cwd)
+            if record.get("id") and record.get("id") in seen_ids:
+                continue
             project = folder_label(cwd) or session[:8]
             title = codex_title(record, f"Codex · {project}")
             subtitle = codex_subtitle(record, project)
@@ -1540,6 +1719,7 @@ class CodexAdapter:
                     title=title,
                     status=status,
                     subtitle=subtitle or "active kernel",
+                    updated_ms=safe_int(record.get("updated_ms")) or None,
                     detail={
                         "session_id": session,
                         "codex_session_id": record.get("id"),
@@ -1564,6 +1744,7 @@ class CodexAdapter:
                     title=codex_title(record, "Codex"),
                     status="idle",
                     subtitle=codex_subtitle(record, "not running"),
+                    updated_ms=safe_int(record.get("updated_ms")) or None,
                     detail={
                         "session_id": record.get("id"),
                         "cwd": record.get("cwd"),

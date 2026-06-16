@@ -265,6 +265,7 @@ class CodexSessionScan(unittest.TestCase):
             scan = th._scan_codex_session(path)
             self.assertEqual(scan["latest_turn_id"], "t1")
             self.assertNotEqual(scan["latest_turn_id"], scan["latest_completed_turn_id"])
+            self.assertTrue(scan["active_turn"])
             self.assertFalse(scan["waiting_for_user"])
         finally:
             os.remove(path)
@@ -282,6 +283,7 @@ class CodexSessionScan(unittest.TestCase):
         try:
             scan = th._scan_codex_session(path)
             self.assertEqual(scan["latest_turn_id"], scan["latest_completed_turn_id"])  # not active
+            self.assertFalse(scan["active_turn"])
             self.assertFalse(scan["waiting_for_user"])
         finally:
             os.remove(path)
@@ -315,6 +317,68 @@ class CodexSessionScan(unittest.TestCase):
         finally:
             os.remove(path)
             th._CODEX_SESSION_CACHE.pop(path, None)
+
+    def test_completed_at_seconds_marks_done(self):
+        completed_sec = th.now_ms() // 1000
+        path = write_jsonl([
+            {"type": "session_meta", "timestamp": iso_now(-9000), "payload": {"id": "s5", "cwd": "/x"}},
+            {"type": "event_msg", "timestamp": iso_now(-7000), "payload": {"type": "task_started", "turn_id": "t1"}},
+            {
+                "type": "event_msg",
+                "timestamp": iso_now(),
+                "payload": {"type": "task_complete", "turn_id": "t1", "completed_at": completed_sec},
+            },
+        ])
+        try:
+            scan = th._scan_codex_session(path)
+            self.assertEqual(scan["latest_turn_id"], scan["latest_completed_turn_id"])
+            self.assertGreater(scan["latest_completed_ms"], 10_000_000_000)
+            self.assertEqual(th.codex_status(scan, app_is_running=True), "done")
+        finally:
+            os.remove(path)
+            th._CODEX_SESSION_CACHE.pop(path, None)
+
+    def test_file_mtime_does_not_make_stale_session_recent(self):
+        stale_ms = th.now_ms() - (th.ACTIVE_MINUTES + 60) * 60 * 1000
+        stale_iso = datetime.fromtimestamp(stale_ms / 1000, timezone.utc).isoformat()
+        path = write_jsonl([
+            {"type": "session_meta", "timestamp": stale_iso, "payload": {"id": "s6", "cwd": "/x"}},
+            {"type": "event_msg", "timestamp": stale_iso, "payload": {"type": "task_started", "turn_id": "t1"}},
+            {
+                "type": "event_msg",
+                "timestamp": stale_iso,
+                "payload": {"type": "task_complete", "turn_id": "t1", "completed_at": stale_ms // 1000},
+            },
+        ])
+        try:
+            os.utime(path, None)
+            scan = th._scan_codex_session(path)
+            self.assertEqual(scan["latest_event_ms"], th.iso_to_ms(stale_iso))
+            self.assertGreater(scan["file_mtime_ms"], scan["latest_event_ms"])
+            self.assertEqual(th.codex_status(scan, app_is_running=True), "idle")
+        finally:
+            os.remove(path)
+            th._CODEX_SESSION_CACHE.pop(path, None)
+
+    def test_adapter_preserves_record_updated_time(self):
+        old_ms = th.now_ms() - 90 * 60 * 1000
+        original = th.codex_records
+        try:
+            th.codex_records = lambda: [{
+                "id": "s7",
+                "cwd": "/x",
+                "folder": "x",
+                "title": "Old Codex task",
+                "updated_ms": old_ms,
+                "latest_event_ms": old_ms,
+                "usage": {},
+            }]
+            tasks = th.CodexAdapter().list_tasks(commands=[])
+            self.assertEqual(tasks[0]["updated_ms"], old_ms)
+            self.assertGreaterEqual(tasks[0]["age_sec"], 90 * 60)
+            self.assertLess(tasks[0]["age_sec"], 90 * 60 + 2)
+        finally:
+            th.codex_records = original
 
 
 class ExternalIngest(unittest.TestCase):

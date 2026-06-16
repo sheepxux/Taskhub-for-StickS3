@@ -16,6 +16,14 @@ for helper in "$ROOT"/host/taskhub_*.py; do
   [ -f "$helper" ] || continue
   cp "$helper" "$APP_DIR/$(basename "$helper")"
 done
+if [ -d "$ROOT/host/models" ]; then
+  if [ -L "$APP_DIR/models" ]; then
+    rm -f "$APP_DIR/models"
+  fi
+  if [ ! -e "$APP_DIR/models" ]; then
+    ln -s "$ROOT/host/models" "$APP_DIR/models"
+  fi
+fi
 
 if [ ! -s "$TOKEN_FILE" ]; then
   TOKEN=""
@@ -43,6 +51,9 @@ TOKEN="$(cat "$ROOT/token" 2>/dev/null || true)"
 
 export TASK_HUB_TOKEN="${TOKEN:-dev-token}"
 export PATH="$HOME/.local/node/bin:$HOME/.local/node-v22.22.1-darwin-arm64/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [ -z "${TASK_HUB_WHISPER_MODEL:-}" ] && [ -f "$ROOT/models/ggml-large-v3-turbo-q5_0.bin" ]; then
+  export TASK_HUB_WHISPER_MODEL="$ROOT/models/ggml-large-v3-turbo-q5_0.bin"
+fi
 exec /usr/bin/python3 -u "$ROOT/task_hub.py" --bind 0.0.0.0 --port 5577
 SH
 chmod +x "$APP_DIR/run_task_hub.sh"

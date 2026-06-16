@@ -27,6 +27,7 @@ WIFI_PASSWORD="${TASKHUB_WIFI_PASSWORD:-}"
 DEVICE_TOKEN="${TASKHUB_DEVICE_TOKEN:-}"
 DEVICE_ID="${TASKHUB_DEVICE_ID:-sticks3-task-01}"
 TASKHUB_LANG="${TASKHUB_LANG:-en}"
+TASKHUB_VOICE_SEND="${TASKHUB_VOICE_SEND:-1}"
 
 usage() {
   cat <<'EOF'
@@ -55,6 +56,7 @@ Options:
   --token VALUE            Set the shared Host/firmware device token
   --device-id VALUE        Set DEVICE_ID in firmware secrets
   --lang VALUE             Set device UI language: en or zh, default: en
+  --voice-send VALUE       Send transcript automatically: on/off, default: on
   --non-interactive        Do not prompt for missing Wi-Fi values
   -h, --help               Show this help
 
@@ -64,6 +66,7 @@ Environment variables:
   TASKHUB_DEVICE_TOKEN
   TASKHUB_DEVICE_ID
   TASKHUB_LANG
+  TASKHUB_VOICE_SEND
 EOF
 }
 
@@ -138,6 +141,11 @@ while [ "$#" -gt 0 ]; do
       TASKHUB_LANG="$2"
       shift
       ;;
+    --voice-send)
+      [ "$#" -ge 2 ] || fail "--voice-send requires a value"
+      TASKHUB_VOICE_SEND="$2"
+      shift
+      ;;
     --non-interactive)
       NON_INTERACTIVE=1
       ;;
@@ -191,6 +199,41 @@ else:
     text += line + "\n"
 path.write_text(text)
 PY
+}
+
+set_raw_define() {
+  local key="$1"
+  local value="$2"
+  python3 - "$SECRETS" "$key" "$value" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+
+text = path.read_text()
+line = f'#define {key:<15} {value}'
+pattern = re.compile(rf'^[ \t]*#define[ \t]+{re.escape(key)}[ \t]+.*$', re.M)
+if pattern.search(text):
+    text = pattern.sub(line, text)
+else:
+    if not text.endswith("\n"):
+        text += "\n"
+    text += line + "\n"
+path.write_text(text)
+PY
+}
+
+normalize_bool_flag() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on) printf '1\n' ;;
+    0|false|no|off) printf '0\n' ;;
+    *) return 1 ;;
+  esac
 }
 
 random_token() {
@@ -255,6 +298,7 @@ configure_firmware() {
   [ -n "$DEVICE_TOKEN" ] && set_string_define DEVICE_TOKEN "$DEVICE_TOKEN"
   [ -n "$DEVICE_ID" ] && set_string_define DEVICE_ID "$DEVICE_ID"
   [ -n "$TASKHUB_LANG" ] && set_string_define TASKHUB_LANG "$TASKHUB_LANG"
+  [ -n "$TASKHUB_VOICE_SEND" ] && set_raw_define VOICE_AUTO_SEND "$TASKHUB_VOICE_SEND"
   [ -n "$WIFI_SSID" ] && set_string_define WIFI_SSID "$WIFI_SSID"
   [ -n "$WIFI_PASSWORD" ] && set_string_define WIFI_PASSWORD "$WIFI_PASSWORD"
 
@@ -329,6 +373,7 @@ case "$TASKHUB_LANG" in
   en|zh|zh-*) ;;
   *) fail "--lang must be en or zh" ;;
 esac
+TASKHUB_VOICE_SEND="$(normalize_bool_flag "$TASKHUB_VOICE_SEND")" || fail "--voice-send must be on/off or 1/0"
 
 if [ "$DO_FIRMWARE" -eq 1 ]; then
   configure_firmware
@@ -358,6 +403,7 @@ if [ "$DO_PROVISION" -eq 1 ]; then
   [ -n "$WIFI_PASSWORD" ] && args+=(--wifi-password "$WIFI_PASSWORD")
   [ -n "$DEVICE_TOKEN" ] && args+=(--token "$DEVICE_TOKEN")
   [ -n "$TASKHUB_LANG" ] && args+=(--lang "$TASKHUB_LANG")
+  [ -n "$TASKHUB_VOICE_SEND" ] && args+=(--voice-send "$TASKHUB_VOICE_SEND")
   "$ROOT/scripts/provision_sticks3.sh" "${args[@]}"
 fi
 

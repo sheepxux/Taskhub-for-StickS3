@@ -35,6 +35,7 @@
 #define DEVICE_ID       "sticks3-task-01"
 #define DEVICE_TOKEN    "dev-token"
 #define TASKHUB_LANG    "en"
+#define VOICE_AUTO_SEND 1
 #define AUTO_WAKE_SECONDS 600
 #endif
 
@@ -48,6 +49,10 @@
 
 #if !defined(TASKHUB_LANG)
 #define TASKHUB_LANG "en"
+#endif
+
+#if !defined(VOICE_AUTO_SEND)
+#define VOICE_AUTO_SEND 1
 #endif
 
 #if !defined(AUTO_WAKE_SECONDS)
@@ -78,6 +83,9 @@ static constexpr int C_LOVABLE_ORANGE = 0xFD20;
 static constexpr int C_LOVABLE_SHADOW = 0x5BFF;
 static constexpr int C_BLUE = 0x5BDF;
 static constexpr int C_CARD = 0x1082;
+static constexpr int C_PANEL = 0x18C3;
+static constexpr int C_LINE = 0x2945;
+static constexpr int C_DARK = 0x0841;
 
 static constexpr int MAX_TASKS = 10;
 // Tightened: with a cached BSSID hint, a healthy join lands in <1s and the hub
@@ -333,6 +341,7 @@ static int cfgHubPort = TASK_HUB_PORT;
 static String cfgDeviceId;
 static String cfgDeviceToken;
 static String cfgLang;
+static bool cfgVoiceAutoSend = VOICE_AUTO_SEND != 0;
 static bool cfgReady = false;
 static bool setupMode = false;
 static String serialConfigLine;
@@ -374,6 +383,18 @@ static String normalizeLang(String lang) {
   return "en";
 }
 
+static bool jsonBoolOrDefault(JsonVariantConst value, bool fallback) {
+  if (value.isNull()) return fallback;
+  if (value.is<bool>()) return value.as<bool>();
+  if (value.is<int>()) return value.as<int>() != 0;
+  String text = value.as<String>();
+  text.trim();
+  text.toLowerCase();
+  if (text == "0" || text == "false" || text == "no" || text == "off") return false;
+  if (text == "1" || text == "true" || text == "yes" || text == "on") return true;
+  return fallback;
+}
+
 static bool loadRuntimeConfig() {
   bool fromNvs = false;
   Preferences prefs;
@@ -387,6 +408,7 @@ static bool loadRuntimeConfig() {
       cfgDeviceId = prefs.getString("device_id", DEVICE_ID);
       cfgDeviceToken = prefs.getString("token", "");
       cfgLang = normalizeLang(prefs.getString("lang", TASKHUB_LANG));
+      cfgVoiceAutoSend = prefs.getBool("voice_send", VOICE_AUTO_SEND != 0);
     }
     prefs.end();
   }
@@ -399,6 +421,7 @@ static bool loadRuntimeConfig() {
     cfgDeviceId = String(DEVICE_ID);
     cfgDeviceToken = String(DEVICE_TOKEN);
     cfgLang = normalizeLang(String(TASKHUB_LANG));
+    cfgVoiceAutoSend = VOICE_AUTO_SEND != 0;
   }
 
   if (!cfgLang.length()) cfgLang = "en";
@@ -415,7 +438,7 @@ static bool loadRuntimeConfig() {
 
 static bool saveRuntimeConfig(const String& ssid, const String& password, const String& host,
                               int port, const String& deviceId, const String& token,
-                              const String& lang) {
+                              const String& lang, bool voiceAutoSend) {
   if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) return false;
   if (!token.length()) return false;
 
@@ -428,6 +451,7 @@ static bool saveRuntimeConfig(const String& ssid, const String& password, const 
   prefs.putString("device_id", deviceId.length() ? deviceId : String(DEVICE_ID));
   prefs.putString("token", token);
   prefs.putString("lang", normalizeLang(lang));
+  prefs.putBool("voice_send", voiceAutoSend);
   prefs.putBool("configured", true);
   prefs.end();
 
@@ -455,6 +479,7 @@ static void sendSerialConfigStatus(const char* type, bool ok, const char* messag
   doc["port"] = cfgHubPort;
   doc["device_id"] = cfgDeviceId;
   doc["lang"] = cfgLang;
+  doc["voice_send"] = cfgVoiceAutoSend;
   serializeJson(doc, Serial);
   Serial.println();
 }
@@ -499,6 +524,12 @@ static void handleSerialConfigLine(String line) {
   String lang = doc["lang"].as<String>();
   if (!lang.length()) lang = doc["language"].as<String>();
   if (!lang.length()) lang = cfgLang.length() ? cfgLang : String(TASKHUB_LANG);
+  bool voiceAutoSend = cfgVoiceAutoSend;
+  if (!doc["voice_send"].isNull()) {
+    voiceAutoSend = jsonBoolOrDefault(doc["voice_send"], cfgVoiceAutoSend);
+  } else if (!doc["voice_auto_send"].isNull()) {
+    voiceAutoSend = jsonBoolOrDefault(doc["voice_auto_send"], cfgVoiceAutoSend);
+  }
 
   if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) {
     sendSerialConfigStatus("taskhub.error", false, "ssid required");
@@ -509,7 +540,7 @@ static void handleSerialConfigLine(String line) {
     return;
   }
 
-  bool saved = saveRuntimeConfig(ssid, password, host, port, deviceId, token, lang);
+  bool saved = saveRuntimeConfig(ssid, password, host, port, deviceId, token, lang, voiceAutoSend);
   sendSerialConfigStatus(saved ? "taskhub.configured" : "taskhub.error", saved,
                          saved ? "saved; restarting" : "save failed");
   if (saved) {
@@ -766,11 +797,76 @@ static const char* statusLabel(const String& status) {
   return "UNK";
 }
 
+static int statusTextColor(const String& status) {
+  if (status == "run" || status == "fail" || status == "idle") return C_WHITE;
+  return C_BG;
+}
+
+static int statusPillWidth(const String& status) {
+  const char* label = statusLabel(status);
+  M5.Display.setFont(&fonts::Font0);
+  int w = M5.Display.textWidth(label) + 12;
+  return w < 34 ? 34 : w;
+}
+
+static void drawStatusPill(const String& status, int x, int y, int bg, bool compact = false) {
+  int col = statusColor(status);
+  int w = compact ? 34 : statusPillWidth(status);
+  int h = compact ? 12 : 15;
+  M5.Display.fillRoundRect(x, y, w, h, 4, col);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(statusTextColor(status), col);
+  M5.Display.drawString(statusLabel(status), x + w / 2, y + h / 2 + 1);
+  M5.Display.setTextDatum(top_left);
+  (void)bg;
+}
+
 static String ageLabel(uint32_t sec) {
   if (sec < 60) return String(sec) + "s";
   if (sec < 3600) return String(sec / 60) + "m";
   if (sec < 86400) return String(sec / 3600) + "h";
   return String(sec / 86400) + "d";
+}
+
+static String displaySourceLabel(const AiTask& t) {
+  String label = t.source;
+  if (t.device.length()) label += "@" + t.device;
+  return label;
+}
+
+static void drawBatteryGlyph(int x, int y, int pct) {
+  int col = pct <= LOW_BATTERY_THRESHOLD_PCT ? C_RED : (pct < 60 ? C_AMBER : C_GREEN);
+  M5.Display.drawRoundRect(x, y, 19, 9, 2, C_LINE);
+  M5.Display.fillRect(x + 19, y + 3, 2, 3, C_LINE);
+  int fillW = map(pct < 0 ? 0 : (pct > 100 ? 100 : pct), 0, 100, 0, 15);
+  if (fillW > 0) M5.Display.fillRect(x + 2, y + 2, fillW, 5, col);
+}
+
+static void drawIndexRail(int x, int y, int w, int h) {
+  if (taskCount <= 1) {
+    M5.Display.fillRoundRect(x, y, w, h, h / 2, C_LINE);
+    return;
+  }
+  M5.Display.fillRoundRect(x, y, w, h, h / 2, C_LINE);
+  int segW = max(3, w / taskCount);
+  int pos = map(selected, 0, taskCount - 1, 0, w - segW);
+  M5.Display.fillRoundRect(x + pos, y, segW, h, h / 2, C_BLUE);
+}
+
+static void drawMetricDots(int x, int y) {
+  int r = 2;
+  if (runCount > 0) {
+    M5.Display.fillCircle(x, y, r, C_BLUE);
+    x += 7;
+  }
+  if (waitCount > 0) {
+    M5.Display.fillCircle(x, y, r, C_AMBER);
+    x += 7;
+  }
+  if (attentionCount > 0 && waitCount == 0) {
+    M5.Display.fillCircle(x, y, r, C_AMBER);
+  }
 }
 
 static int nextUtf8Index(const String& s, int idx) {
@@ -1185,25 +1281,38 @@ static void setBootStatus(const String& text, int color) {
 }
 
 static void topBar() {
-  M5.Display.fillRect(0, 0, M5.Display.width(), 20, C_BG);
+  int W = M5.Display.width();
+  M5.Display.fillRect(0, 0, W, 22, C_BG);
+  M5.Display.drawFastHLine(0, 21, W, C_DARK);
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(C_GRAY, C_BG);
-  drawTaskHubMiniMark(5, 2, C_BLUE);
-  M5.Display.drawString("TaskHub", 26, 6);
-
-  M5.Display.setTextDatum(top_right);
-  M5.Display.setTextColor(wifiOk ? C_GREEN : C_AMBER, C_BG);
-  M5.Display.drawString(wifiOk ? "wifi" : "net", M5.Display.width() - 38, 6);
+  drawTaskHubMiniMark(5, 3, C_BLUE);
   M5.Display.setTextColor(C_WHITE, C_BG);
-  M5.Display.drawString(String(battPct) + "%", M5.Display.width() - 6, 6);
+  M5.Display.drawString("TaskHub", 26, 7);
+  if (W > 170) drawMetricDots(76, 10);
+
+  int battX = W - 25;
+  drawBatteryGlyph(battX, 6, battPct);
+  int wifiX = battX - 12;
+  int wifiCol = wifiOk ? C_GREEN : C_AMBER;
+  M5.Display.fillCircle(wifiX, 14, 2, wifiCol);
+  M5.Display.drawFastVLine(wifiX, 8, 4, wifiCol);
+  M5.Display.drawFastHLine(wifiX - 2, 8, 5, wifiCol);
+
+  M5.Display.setTextColor(C_WHITE, C_BG);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.drawString(String(battPct) + "%", battX - 15, 7);
+}
+
+static void centerTextBg(const String& text, int y, int color, int bg, const lgfx::IFont* font) {
+  M5.Display.setFont(font);
+  M5.Display.setTextColor(color, bg);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(text, M5.Display.width() / 2, y);
 }
 
 static void centerText(const String& text, int y, int color, const lgfx::IFont* font) {
-  M5.Display.setFont(font);
-  M5.Display.setTextColor(color, C_BG);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(text, M5.Display.width() / 2, y);
+  centerTextBg(text, y, color, C_BG, font);
 }
 
 static void drawMessage(const String& line1, const String& line2, int color) {
@@ -1218,9 +1327,10 @@ static void drawMessage(const String& line1, const String& line2, int color) {
 // tall screen instead of stretching the single landscape card.
 static void drawPortraitList() {
   int W = M5.Display.width();
-  int top = 22;
-  int bottom = M5.Display.height() - 13;
-  int rowH = 40;
+  int H = M5.Display.height();
+  int top = 25;
+  int bottom = H - 15;
+  int rowH = 42;
   int maxRows = (bottom - top) / rowH;
   if (maxRows < 1) maxRows = 1;
   int start = 0;
@@ -1233,28 +1343,33 @@ static void drawPortraitList() {
     int col = statusColor(t.status);
     bool sel = (idx == selected);
     int cy = top + i * rowH;
-    int ch = rowH - 4;
-    int bg = sel ? C_CARD : C_BG;
+    int ch = rowH - 5;
+    int bg = sel ? C_PANEL : C_BG;
+    int x = 4;
+    int w = W - 8;
 
-    M5.Display.fillRoundRect(3, cy, W - 6, ch, 5, bg);
-    if (sel) M5.Display.drawRoundRect(3, cy, W - 6, ch, 5, C_GRAY);
-    M5.Display.fillRoundRect(3, cy, 6, ch, 5, col);
+    M5.Display.fillRoundRect(x, cy, w, ch, 6, bg);
+    if (sel) M5.Display.drawRoundRect(x, cy, w, ch, 6, C_LINE);
+    M5.Display.fillRoundRect(x, cy, 4, ch, 4, col);
 
-    String src = t.source;
-    if (t.device.length()) src += "@" + t.device;
-    String srcFit = fitText(src, &fonts::Font0, W - 41 - 6);
+    drawAiSourceIcon(t.source, x + 9, cy + 6, bg);
+    drawStatusPill(t.status, x + 25, cy + 5, bg, true);
     M5.Display.setFont(&fonts::Font0);
-    M5.Display.setTextDatum(top_left);
-    M5.Display.setTextColor(col, bg);
-    M5.Display.drawString(statusLabel(t.status), 13, cy + 5);
+    M5.Display.setTextDatum(top_right);
     M5.Display.setTextColor(C_GRAY, bg);
-    M5.Display.drawString(srcFit, 41, cy + 5);
+    M5.Display.drawString(ageLabel(t.ageSec), x + w - 7, cy + 7);
+
+    String srcFit = fitText(displaySourceLabel(t), &fonts::Font0, W - 94);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(C_GRAY, bg);
+    M5.Display.drawString(srcFit, x + 62, cy + 7);
 
     String title = t.title.length() ? t.title : t.source;
-    String titleFit = fitText(title, &fonts::efontCN_12, W - 17);
+    String titleFit = fitText(title, &fonts::efontCN_12, W - 24);
     M5.Display.setFont(&fonts::efontCN_12);
     M5.Display.setTextColor(C_WHITE, bg);
-    M5.Display.drawString(titleFit, 13, cy + 20);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.drawString(titleFit, x + 10, cy + 22);
   }
 
   M5.Display.setFont(&fonts::Font0);
@@ -1263,10 +1378,11 @@ static void drawPortraitList() {
   String f = String(selected + 1) + "/" + String(taskCount);
   if (waitCount > 0) f += " " + String(waitCount) + "w";
   if (hiddenCount > 0) f += " +" + String(hiddenCount);
-  M5.Display.drawString(f, 5, M5.Display.height() - 2);
+  M5.Display.drawString(f, 5, H - 2);
+  drawIndexRail(W - 53, H - 7, 34, 4);
   M5.Display.setTextDatum(bottom_right);
   M5.Display.setTextColor(C_GRAY, C_BG);
-  M5.Display.drawString("A", W - 5, M5.Display.height() - 2);
+  M5.Display.drawString("A", W - 5, H - 2);
 }
 
 static void drawList() {
@@ -1276,14 +1392,21 @@ static void drawList() {
   if (taskCount == 0) {
     int H = M5.Display.height();
     bool allHidden = !lastError.length() && hiddenCount > 0;
-    centerText(lastError.length() ? uiText("Cannot read tasks", "无法读取任务")
-                                  : (allHidden ? uiText("Old tasks hidden", "旧任务已隐藏")
-                                               : uiText("No tasks", "暂无任务")),
-               H * 42 / 100, lastError.length() ? C_RED : C_GRAY, &fonts::efontCN_16);
-    centerText(lastError.length() ? lastError
-                                  : (allHidden ? String(hiddenCount) + uiText(" hidden · auto refresh", " hidden · 会自动刷新")
-                                               : uiText("Auto refresh", "会定时自动刷新")),
-               H * 65 / 100, C_GRAY, &fonts::efontCN_12);
+    int cardX = 8;
+    int cardY = H * 28 / 100;
+    int cardW = M5.Display.width() - 16;
+    int cardH = H * 44 / 100;
+    M5.Display.fillRoundRect(cardX, cardY, cardW, cardH, 7, C_CARD);
+    M5.Display.drawRoundRect(cardX, cardY, cardW, cardH, 7, C_LINE);
+    drawTaskHubMiniMark(cardX + 12, cardY + 10, lastError.length() ? C_RED : C_BLUE);
+    centerTextBg(lastError.length() ? uiText("Cannot read tasks", "无法读取任务")
+                                    : (allHidden ? uiText("Old tasks hidden", "旧任务已隐藏")
+                                                 : uiText("No tasks", "暂无任务")),
+                 H * 45 / 100, lastError.length() ? C_RED : C_WHITE, C_CARD, &fonts::efontCN_16);
+    centerTextBg(lastError.length() ? lastError
+                                    : (allHidden ? String(hiddenCount) + uiText(" hidden · auto refresh", " hidden · 会自动刷新")
+                                                 : uiText("Auto refresh", "会定时自动刷新")),
+                 H * 64 / 100, C_GRAY, C_CARD, &fonts::efontCN_12);
     centerText(uiText("BtnA refresh", "BtnA 刷新"), H * 90 / 100, C_GRAY, &fonts::efontCN_12);
     return;
   }
@@ -1299,35 +1422,35 @@ static void drawList() {
   int col = statusColor(t.status);
   int screenW = M5.Display.width();
   int screenH = M5.Display.height();
-  int cardX = 6;
-  int cardY = 23;
-  int cardW = screenW - 12;
-  int cardH = screenH - 43;
-  int contentX = cardX + 14;
+  int cardX = 5;
+  int cardY = 25;
+  int cardW = screenW - 10;
+  int cardH = screenH - 47;
+  int contentX = cardX + 13;
   int contentW = cardW - 24;
 
   M5.Display.fillRoundRect(cardX, cardY, cardW, cardH, 7, C_CARD);
-  M5.Display.fillRoundRect(cardX, cardY, 8, cardH, 7, col);
+  M5.Display.drawRoundRect(cardX, cardY, cardW, cardH, 7, C_LINE);
+  M5.Display.fillRoundRect(cardX, cardY, 5, cardH, 5, col);
+  M5.Display.drawFastHLine(contentX, cardY + 31, contentW, C_DARK);
 
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(col, C_CARD);
-  M5.Display.drawString(statusLabel(t.status), contentX, cardY + 8);
-  int sourceIconX = contentX + 38;
+  drawStatusPill(t.status, contentX, cardY + 8, C_CARD);
+  int sourceIconX = contentX + statusPillWidth(t.status) + 8;
   int sourceTextX = sourceIconX + 15;
-  drawAiSourceIcon(t.source, sourceIconX, cardY + 7, C_CARD);
-  String sourceLabel = t.source;
-  if (t.device.length()) sourceLabel += "@" + t.device;
-  drawFittedText(sourceLabel, sourceTextX, cardY + 8, screenW - sourceTextX - 58, C_GRAY, C_CARD, &fonts::Font0);
+  drawAiSourceIcon(t.source, sourceIconX, cardY + 9, C_CARD);
+  drawFittedText(displaySourceLabel(t), sourceTextX, cardY + 9, screenW - sourceTextX - 56, C_GRAY, C_CARD, &fonts::Font0);
 
   M5.Display.setTextDatum(top_right);
   M5.Display.setTextColor(C_GRAY, C_CARD);
   M5.Display.drawString(ageLabel(t.ageSec), screenW - 16, cardY + 8);
 
-  drawWrappedText(t.title, contentX, cardY + 28, contentW, 18, 2, C_WHITE, C_CARD, &fonts::efontCN_16);
+  String title = t.title.length() ? t.title : t.source;
+  drawWrappedText(title, contentX, cardY + 38, contentW, 17, 2, C_WHITE, C_CARD, &fonts::efontCN_16);
 
   String meta = t.subtitle.length() ? t.subtitle : t.usage;
-  drawFittedText(meta, contentX, cardY + cardH - 22, contentW, C_GRAY, C_CARD, &fonts::efontCN_12);
+  int metaY = cardY + cardH - 21;
+  M5.Display.fillRoundRect(contentX - 3, metaY - 2, contentW + 6, 18, 4, C_PANEL);
+  drawFittedText(meta, contentX, metaY, contentW, C_GRAY, C_PANEL, &fonts::efontCN_12);
 
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(t.usage.length() ? C_AMBER : (attentionCount > 0 ? C_AMBER : C_GRAY), C_BG);
@@ -1335,12 +1458,14 @@ static void drawList() {
   String footerLeft = t.usage.length() ? t.usage : String(activeCount) + " active · " + String(attentionCount) + " alert";
   if (!t.usage.length() && waitCount > 0) footerLeft += " · " + String(waitCount) + " wait";
   if (!t.usage.length() && hiddenCount > 0) footerLeft += " · " + String(hiddenCount) + " hidden";
-  M5.Display.drawString(fitText(footerLeft, &fonts::Font0, screenW - 78), 6, screenH - 3);
+  M5.Display.drawString(fitText(footerLeft, &fonts::Font0, screenW - 92), 7, screenH - 4);
+
+  drawIndexRail(screenW - 82, screenH - 8, 42, 4);
 
   M5.Display.setTextDatum(bottom_right);
   M5.Display.setTextColor(C_GRAY, C_BG);
   String footerRight = String(selected + 1) + "/" + String(taskCount) + " A";
-  M5.Display.drawString(footerRight, screenW - 6, screenH - 3);
+  M5.Display.drawString(footerRight, screenW - 6, screenH - 4);
 }
 
 // Map the IMU gravity vector to a display rotation. Returns the current
@@ -1601,9 +1726,25 @@ static void drawVoiceRecordingUI(uint32_t sec) {
   M5.Display.fillScreen(C_BG);
   int W = M5.Display.width();
   int H = M5.Display.height();
-  M5.Display.fillCircle(W / 2, H * 30 / 100, 9, C_RED);
-  centerText(uiText("Recording", "录音中"), H * 52 / 100, C_RED, &fonts::efontCN_16);
-  centerText(String(sec) + uiText("s · release to send", "s · 松手发送"), H * 74 / 100, C_GRAY, &fonts::efontCN_12);
+  topBar();
+  int cardX = 10;
+  int cardY = H * 24 / 100;
+  int cardW = W - 20;
+  int cardH = H * 55 / 100;
+  M5.Display.fillRoundRect(cardX, cardY, cardW, cardH, 8, C_CARD);
+  M5.Display.drawRoundRect(cardX, cardY, cardW, cardH, 8, C_LINE);
+
+  int cx = W / 2;
+  int cy = cardY + 18;
+  M5.Display.fillCircle(cx, cy, 11, C_RED);
+  M5.Display.drawCircle(cx, cy, 15, C_LINE);
+  centerTextBg(uiText("Recording", "录音中"), cardY + cardH * 44 / 100, C_RED, C_CARD, &fonts::efontCN_16);
+
+  String target = taskCount > 0 && selected < taskCount ? displaySourceLabel(tasks[selected]) : uiText("front app", "前台 App");
+  centerTextBg(fitText(target, &fonts::efontCN_12, cardW - 16), cardY + cardH * 66 / 100, C_GRAY, C_CARD, &fonts::efontCN_12);
+
+  String action = cfgVoiceAutoSend ? uiText("release to send", "松手发送") : uiText("release to type", "松手输入");
+  centerTextBg(String(sec) + "s · " + action, cardY + cardH * 84 / 100, C_WHITE, C_CARD, &fonts::Font0);
 }
 
 // Keep the mic's DMA slots fed so capture is gapless while BtnB is held.
@@ -1651,10 +1792,17 @@ static void stopAndSendVoice() {
   uint32_t pcmBytes = samples * 2;
   writeWavHeader(voiceBuf, pcmBytes);
 
-  drawMessage(uiText("Transcribing...", "转写中..."), "", C_BLUE);
+  drawMessage(cfgVoiceAutoSend ? uiText("Sending...", "发送中...") : uiText("Transcribing...", "转写中..."), "", C_BLUE);
   String tid = (taskCount > 0 && selected < taskCount) ? tasks[selected].id : "";
   String url = apiBase() + "/voice";
-  if (tid.length()) url += "?task=" + urlEncode(tid);
+  String sep = "?";
+  if (tid.length()) {
+    url += sep + "task=" + urlEncode(tid);
+    sep = "&";
+  }
+  if (cfgVoiceAutoSend) {
+    url += sep + "enter=1";
+  }
 
   HTTPClient http;
   http.begin(url);
@@ -1676,7 +1824,9 @@ static void stopAndSendVoice() {
     if (text.length() == 0) {
       drawMessage(uiText("No speech heard", "没听清"), uiText("Try again", "再试一次"), C_AMBER);
     } else {
-      drawMessage(injected ? uiText("Typed", "已输入") : uiText("Transcribed", "已转写"), text, injected ? C_GREEN : C_AMBER);
+      drawMessage(injected ? (cfgVoiceAutoSend ? uiText("Sent", "已发送") : uiText("Typed", "已输入"))
+                           : uiText("Transcribed", "已转写"),
+                  text, injected ? C_GREEN : C_AMBER);
     }
   } else {
     drawMessage(uiText("Voice failed", "语音失败"), code > 0 ? String("HTTP ") + code : uiText("Cannot connect", "无法连接"), C_RED);

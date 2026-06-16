@@ -7,12 +7,25 @@
 - StickS3 firmware UI language setting: fixed device text defaults to English
   and can be switched to Chinese with `TASKHUB_LANG=zh`, `--lang zh`, or USB
   provisioning payload field `lang`.
+- StickS3 voice mode now auto-sends by default after pasting the transcript.
+  `VOICE_AUTO_SEND`, `TASKHUB_VOICE_SEND`, and `--voice-send off` keep a
+  paste-only review mode available.
 
 ### Fixed
 
 - Claude Code local-agent sessions created by newer Claude builds are now read
   from their per-session `.claude/projects` transcript root, restoring
   RUN/WAIT/DONE instead of falling back to REC.
+- Voice input fallback now resolves the local whisper model after the Host is
+  installed into `~/Library/Application Support/StickS3TaskHub`, so `/voice`
+  no longer fails immediately when the resident whisper-server is not already
+  running.
+
+### Changed
+
+- Refined the StickS3 task UI with a cleaner top bar, status pills, AI source
+  icons, stronger selected-task hierarchy, and compact progress rails in both
+  landscape and portrait layouts.
 
 ## v2.0.0 — 2026-06-05
 
