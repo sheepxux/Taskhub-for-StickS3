@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.2 — 2026-06-20
+
 ### Added
 
 - StickS3 firmware UI language setting: fixed device text defaults to English
@@ -20,12 +22,22 @@
   installed into `~/Library/Application Support/StickS3TaskHub`, so `/voice`
   no longer fails immediately when the resident whisper-server is not already
   running.
+- Codex thread discovery now reads both current Codex state DB locations
+  (`~/.codex/state_5.sqlite` and `~/.codex/sqlite/state_5.sqlite`), restoring
+  newly opened Codex tasks after Codex's local storage migration.
+- OpenClaw heartbeat/default direct sessions are hidden from the StickS3 list,
+  and failed OpenClaw rows expire after a short attention window instead of
+  staying pinned forever when there is no real task.
+- Codex row timestamps preserve the real session activity time, so old tasks no
+  longer appear as freshly updated just because an index or file mtime changed.
 
 ### Changed
 
 - Refined the StickS3 task UI with a cleaner top bar, status pills, AI source
   icons, stronger selected-task hierarchy, and compact progress rails in both
   landscape and portrait layouts.
+- Host regression tests now cover Codex's dual SQLite paths, stale Codex mtime
+  handling, and OpenClaw idle/heartbeat filtering.
 
 ## v2.0.0 — 2026-06-05
 
