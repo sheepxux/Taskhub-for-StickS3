@@ -11,6 +11,7 @@ Run:  python3 -m unittest discover -s host/tests
 """
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,42 @@ def write_jsonl(lines):
         for obj in lines:
             fh.write(json.dumps(obj) + "\n")
     return path
+
+
+def write_codex_state_db(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            """
+            create table threads (
+              id text,
+              rollout_path text,
+              title text,
+              cwd text,
+              updated_at_ms integer,
+              tokens_used integer,
+              model text,
+              reasoning_effort text,
+              archived integer,
+              source text,
+              thread_source text,
+              preview text
+            )
+            """
+        )
+        con.executemany(
+            """
+            insert into threads (
+              id, rollout_path, title, cwd, updated_at_ms, tokens_used, model,
+              reasoning_effort, archived, source, thread_source, preview
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 class PureHelpers(unittest.TestCase):
@@ -379,6 +416,91 @@ class CodexSessionScan(unittest.TestCase):
             self.assertLess(tasks[0]["age_sec"], 90 * 60 + 2)
         finally:
             th.codex_records = original
+
+    def test_state_records_read_root_and_nested_codex_dbs(self):
+        old_home = os.environ.get("HOME")
+        now = th.now_ms()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                write_codex_state_db(
+                    os.path.join(tmp, ".codex", "state_5.sqlite"),
+                    [("root-thread", "", "Root DB thread", "/tmp/root", now, 10, "gpt-test", "", 0, "", "user", "")],
+                )
+                write_codex_state_db(
+                    os.path.join(tmp, ".codex", "sqlite", "state_5.sqlite"),
+                    [("nested-thread", "", "Nested DB thread", "/tmp/nested", now - 1000, 5, "gpt-test", "", 0, "", "user", "")],
+                )
+                records = th.codex_state_records(max_threads=4)
+                ids = [item["id"] for item in records]
+                self.assertIn("root-thread", ids)
+                self.assertIn("nested-thread", ids)
+                self.assertEqual(records[0]["id"], "root-thread")
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+
+class OpenClawSessions(unittest.TestCase):
+    def test_stale_failed_sessions_are_hidden(self):
+        now = th.now_ms()
+        old_ms = now - th.OPENCLAW_FAILED_TTL_MS - 1000
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_dir = os.path.join(tmp, "agents", "main", "sessions")
+            os.makedirs(sessions_dir)
+            with open(os.path.join(sessions_dir, "sessions.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "old-failed": {
+                            "sessionId": "old",
+                            "status": "failed",
+                            "updatedAt": old_ms,
+                            "endedAt": old_ms,
+                            "model": "old-model",
+                        },
+                        "fresh-failed": {
+                            "sessionId": "fresh",
+                            "status": "failed",
+                            "updatedAt": now,
+                            "endedAt": now,
+                            "model": "fresh-model",
+                        },
+                        "heartbeat-failed": {
+                            "sessionId": "heartbeat",
+                            "status": "failed",
+                            "updatedAt": now,
+                            "endedAt": now,
+                            "lastTo": "heartbeat",
+                            "model": "heartbeat-model",
+                        },
+                        "heartbeat-running": {
+                            "sessionId": "heartbeat-running",
+                            "status": "running",
+                            "updatedAt": now,
+                            "lastTo": "heartbeat",
+                            "model": "heartbeat-running-model",
+                        },
+                        "agent:main:main": {
+                            "sessionId": "idle-direct",
+                            "status": "running",
+                            "updatedAt": now,
+                            "chatType": "direct",
+                            "model": "idle-direct-model",
+                        },
+                    },
+                    fh,
+                )
+            adapter = th.OpenClawAdapter()
+            adapter.state_dir = tmp
+            tasks = adapter._list_sessions()
+            titles = [item["title"] for item in tasks]
+            self.assertTrue(any("fresh-model" in title for title in titles))
+            self.assertFalse(any("old-model" in title for title in titles))
+            self.assertFalse(any("heartbeat-model" in title for title in titles))
+            self.assertFalse(any("heartbeat-running-model" in title for title in titles))
+            self.assertFalse(any("idle-direct-model" in title for title in titles))
 
 
 class ExternalIngest(unittest.TestCase):

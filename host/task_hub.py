@@ -60,6 +60,7 @@ from taskhub_config import (
     MANUS_MAX_SESSIONS,
     MANUS_RUNNING_STALE_MS,
     MANUS_TERMINAL_STATUS_CODES,
+    OPENCLAW_FAILED_TTL_MS,
     MAX_TASKS,
     OPENCLAW_RUNNING_STALE_MS,
     PEER_CACHE_MS,
@@ -996,109 +997,138 @@ def codex_usage_records(max_files: int = 80) -> List[Dict[str, Any]]:
     return records
 
 
+def codex_db_paths(filename: str) -> List[str]:
+    candidates = [
+        os.path.expanduser(os.path.join("~/.codex", filename)),
+        os.path.expanduser(os.path.join("~/.codex/sqlite", filename)),
+    ]
+    seen: set = set()
+    paths: List[str] = []
+    for path in candidates:
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        paths.append(path)
+    return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
 def codex_goal_records() -> Dict[str, Dict[str, Any]]:
-    path = os.path.expanduser("~/.codex/sqlite/goals_1.sqlite")
-    if not os.path.isfile(path):
-        return {}
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
-        con.row_factory = sqlite3.Row
+    records: Dict[str, Dict[str, Any]] = {}
+    for path in codex_db_paths("goals_1.sqlite"):
         try:
-            rows = con.execute(
-                """
-                select thread_id, objective, status, token_budget, tokens_used, updated_at_ms
-                from thread_goals
-                """
-            ).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return {}
-    return {str(row["thread_id"]): dict(row) for row in rows if row["thread_id"]}
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    """
+                    select thread_id, objective, status, token_budget, tokens_used, updated_at_ms
+                    from thread_goals
+                    """
+                ).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        for row in rows:
+            thread_id = str(row["thread_id"] or "")
+            if not thread_id:
+                continue
+            item = dict(row)
+            current = records.get(thread_id) or {}
+            if safe_int(item.get("updated_at_ms")) >= safe_int(current.get("updated_at_ms")):
+                records[thread_id] = item
+    return records
 
 
 def codex_state_records(max_threads: int = CODEX_MAX_THREADS) -> List[Dict[str, Any]]:
     """Read Codex's newer SQLite thread index and enrich each row with the
     rollout scan. SQLite gives us the complete recent thread list; JSONL still
     gives the turn-level RUN/WAIT/DONE signal."""
-    path = os.path.expanduser("~/.codex/sqlite/state_5.sqlite")
-    if not os.path.isfile(path):
+    paths = codex_db_paths("state_5.sqlite")
+    if not paths:
         return []
     goals = codex_goal_records()
     query_limit = max(max_threads * 4, max_threads)
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
-        con.row_factory = sqlite3.Row
+    records_by_id: Dict[str, Dict[str, Any]] = {}
+    for path in paths:
         try:
-            rows = con.execute(
-                """
-                select id, rollout_path, title, cwd, updated_at_ms, tokens_used,
-                       model, reasoning_effort, archived, source, thread_source, preview
-                from threads
-                where archived = 0
-                order by updated_at_ms desc
-                limit ?
-                """,
-                (query_limit,),
-            ).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return []
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    """
+                    select id, rollout_path, title, cwd, updated_at_ms, tokens_used,
+                           model, reasoning_effort, archived, source, thread_source, preview
+                    from threads
+                    where archived = 0
+                    order by updated_at_ms desc
+                    limit ?
+                    """,
+                    (query_limit,),
+                ).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
 
-    records: List[Dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        thread_id = str(item.get("id") or "")
-        rollout_path = os.path.expanduser(str(item.get("rollout_path") or ""))
-        scan = _scan_codex_session(rollout_path) if rollout_path and os.path.isfile(rollout_path) else {}
-        goal = goals.get(thread_id) or {}
+        for row in rows:
+            item = dict(row)
+            thread_id = str(item.get("id") or "")
+            if not thread_id:
+                continue
+            rollout_path = os.path.expanduser(str(item.get("rollout_path") or ""))
+            scan = _scan_codex_session(rollout_path) if rollout_path and os.path.isfile(rollout_path) else {}
+            goal = goals.get(thread_id) or {}
 
-        scan_activity_ms = max(
-            safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0),
-            safe_int(scan.get("latest_completed_ms") if isinstance(scan, dict) else 0),
-        )
-        fallback_updated_ms = max(
-            safe_int(item.get("updated_at_ms")),
-            safe_int(goal.get("updated_at_ms")),
-        )
-        updated_ms = scan_activity_ms or fallback_updated_ms
-        turns = safe_int(scan.get("turns") if isinstance(scan, dict) else 0)
-        usage = (scan.get("usage") if isinstance(scan, dict) else {}) or {}
-        if not usage:
-            usage = build_usage(
-                total_tokens=safe_int(item.get("tokens_used")),
-                turns=turns,
-                fields={
-                    "source": "codex-state-db",
-                    "model": item.get("model"),
-                    "reasoning_effort": item.get("reasoning_effort"),
-                    "tokens_used": safe_int(item.get("tokens_used")),
-                },
+            scan_activity_ms = max(
+                safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0),
+                safe_int(scan.get("latest_completed_ms") if isinstance(scan, dict) else 0),
             )
+            fallback_updated_ms = max(
+                safe_int(item.get("updated_at_ms")),
+                safe_int(goal.get("updated_at_ms")),
+            )
+            updated_ms = scan_activity_ms or fallback_updated_ms
+            turns = safe_int(scan.get("turns") if isinstance(scan, dict) else 0)
+            usage = (scan.get("usage") if isinstance(scan, dict) else {}) or {}
+            if not usage:
+                usage = build_usage(
+                    total_tokens=safe_int(item.get("tokens_used")),
+                    turns=turns,
+                    fields={
+                        "source": "codex-state-db",
+                        "model": item.get("model"),
+                        "reasoning_effort": item.get("reasoning_effort"),
+                        "tokens_used": safe_int(item.get("tokens_used")),
+                    },
+                )
 
-        record = {
-            "id": thread_id,
-            "cwd": str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else "")),
-            "folder": folder_label(str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else ""))),
-            "title": str(item.get("title") or ""),
-            "preview": str(item.get("preview") or ""),
-            "updated_ms": updated_ms,
-            "latest_event_ms": safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0) or updated_ms,
-            "latest_turn_id": scan.get("latest_turn_id") if isinstance(scan, dict) else "",
-            "latest_turn_ms": safe_int(scan.get("latest_turn_ms") if isinstance(scan, dict) else 0),
-            "latest_completed_turn_id": scan.get("latest_completed_turn_id") if isinstance(scan, dict) else "",
-            "latest_completed_ms": safe_int(scan.get("latest_completed_ms") if isinstance(scan, dict) else 0),
-            "active_turn": bool(scan.get("active_turn") if isinstance(scan, dict) else False),
-            "waiting_for_user": bool(scan.get("waiting_for_user") if isinstance(scan, dict) else False),
-            "path": rollout_path,
-            "usage": usage,
-            "model": item.get("model"),
-            "reasoning_effort": item.get("reasoning_effort"),
-            "thread_source": item.get("thread_source"),
-            "goal": goal,
-        }
-        records.append(record)
+            record = {
+                "id": thread_id,
+                "cwd": str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else "")),
+                "folder": folder_label(str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else ""))),
+                "title": str(item.get("title") or ""),
+                "preview": str(item.get("preview") or ""),
+                "updated_ms": updated_ms,
+                "latest_event_ms": safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0) or updated_ms,
+                "latest_turn_id": scan.get("latest_turn_id") if isinstance(scan, dict) else "",
+                "latest_turn_ms": safe_int(scan.get("latest_turn_ms") if isinstance(scan, dict) else 0),
+                "latest_completed_turn_id": scan.get("latest_completed_turn_id") if isinstance(scan, dict) else "",
+                "latest_completed_ms": safe_int(scan.get("latest_completed_ms") if isinstance(scan, dict) else 0),
+                "active_turn": bool(scan.get("active_turn") if isinstance(scan, dict) else False),
+                "waiting_for_user": bool(scan.get("waiting_for_user") if isinstance(scan, dict) else False),
+                "path": rollout_path,
+                "usage": usage,
+                "model": item.get("model"),
+                "reasoning_effort": item.get("reasoning_effort"),
+                "thread_source": item.get("thread_source"),
+                "goal": goal,
+                "state_db": path,
+            }
+            current = records_by_id.get(thread_id)
+            if not current or safe_int(record.get("updated_ms")) >= safe_int(current.get("updated_ms")):
+                records_by_id[thread_id] = record
+    records = list(records_by_id.values())
     records.sort(key=lambda item: safe_int(item.get("updated_ms")), reverse=True)
     return records[:max_threads]
 
@@ -1249,7 +1279,7 @@ class OpenClawAdapter:
             )
             raw_status = str(item.get("status") or "")
             status = self._status_from_openclaw(raw_status, updated, ended_ms=safe_ms(item.get("ended_at")))
-            if status not in {"running", "waiting", "failed"} and updated and updated < cutoff:
+            if not self._include_task(status, updated, cutoff):
                 continue
             raw_id = str(item.get("task_id") or item.get("run_id") or item)
             title = str(item.get("label") or item.get("task_kind") or item.get("runtime") or "OpenClaw task")
@@ -1306,6 +1336,9 @@ class OpenClawAdapter:
             for key, entry in store.items():
                 if not isinstance(entry, dict):
                     continue
+                session_key = str(key)
+                if self._is_idle_session(session_key, entry.get("chatType"), entry.get("lastTo")):
+                    continue
                 updated = safe_ms(entry.get("updatedAt") or entry.get("endedAt") or entry.get("startedAt"))
                 raw_status = str(entry.get("status") or "")
                 status = self._status_from_openclaw(
@@ -1314,10 +1347,9 @@ class OpenClawAdapter:
                     ended_ms=safe_ms(entry.get("endedAt")),
                     aborted=bool(entry.get("abortedLastRun")),
                 )
-                if status not in {"running", "waiting", "failed"} and updated and updated < cutoff:
+                if not self._include_task(status, updated, cutoff):
                     continue
 
-                session_key = str(key)
                 session_id = str(entry.get("sessionId") or session_key)
                 model = str(entry.get("model") or "session")
                 effective_agent = agent_id or self._agent_from_session_key(session_key) or str(entry.get("agentId") or "main")
@@ -1367,6 +1399,8 @@ class OpenClawAdapter:
             status = normalize_status(str(item.get("status") or "unknown"))
             title = str(item.get("title") or item.get("name") or item.get("kind") or "OpenClaw task")
             updated = safe_ms(item.get("updatedAt") or item.get("createdAt"))
+            if not self._include_task(status, updated, now_ms() - ACTIVE_MINUTES * 60 * 1000):
+                continue
             out.append(
                 task(
                     task_id=stable_id("openclaw-task", raw_id),
@@ -1396,6 +1430,8 @@ class OpenClawAdapter:
         )
         for item in (session_data or {}).get("sessions", []) or []:
             key = str(item.get("key") or item.get("sessionId") or item)
+            if self._is_idle_session(key, item.get("kind"), item.get("lastTo")):
+                continue
             age_ms = int(item.get("ageMs") or 10**9)
             status = "running" if age_ms < OPENCLAW_RUNNING_STALE_MS else "recent"
             agent = item.get("agentId") or "main"
@@ -1446,6 +1482,24 @@ class OpenClawAdapter:
         if latest and now_ms() - latest < ACTIVE_MINUTES * 60 * 1000:
             return "recent"
         return "idle"
+
+    def _include_task(self, status: str, updated_ms: Optional[int], cutoff_ms: int) -> bool:
+        updated = safe_int(updated_ms)
+        if status == "failed":
+            return bool(updated) and now_ms() - updated <= OPENCLAW_FAILED_TTL_MS
+        if status in {"running", "waiting"}:
+            return True
+        if updated and updated < cutoff_ms:
+            return False
+        return True
+
+    def _is_idle_session(self, key: str, kind: Any = "", last_to: Any = "") -> bool:
+        if str(last_to or "").lower() == "heartbeat":
+            return True
+        parts = str(key or "").split(":")
+        if len(parts) >= 3 and parts[0] == "agent" and parts[1] == parts[2]:
+            return str(kind or "").lower() in {"direct", ""}
+        return False
 
     def _usage_from_session(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         fields = {
