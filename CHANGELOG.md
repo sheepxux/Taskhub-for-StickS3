@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v2.0.3 — 2026-06-26
+
+### Fixed
+
+- Updated the local Claude Code CLI compatibility baseline to `2.1.193` and
+  verified Codex remains current at `0.142.2`.
+- Added a Claude Desktop fallback row so the Host still shows Claude as idle
+  when the app is open but no local Claude Code task metadata is available.
+- Increased the StickS3 HTTP startup window and added a short boot retry loop,
+  preventing a false `Cannot read tasks` screen while the Mac Host warms its
+  first task scan.
+- Relaxed a Codex adapter timestamp boundary test that could fail on exact
+  second rollover without indicating a product regression.
+
 ## v2.0.2 — 2026-06-20
 
 ### Added

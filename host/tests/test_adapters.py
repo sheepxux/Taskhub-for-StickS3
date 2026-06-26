@@ -166,6 +166,23 @@ class StatusMachines(unittest.TestCase):
 
 
 class ClaudeTranscriptScan(unittest.TestCase):
+    def test_claude_app_fallback_when_no_code_session_metadata(self):
+        old_home = os.environ.get("HOME")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HOME"] = tmp
+            try:
+                commands = ["/Applications/Claude.app/Contents/MacOS/Claude"]
+                tasks = th.ClaudeAdapter().list_tasks(commands=commands)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0]["id"], "claude-app")
+                self.assertEqual(tasks[0]["status"], "idle")
+                self.assertEqual(tasks[0]["detail"]["metadata_source"], "desktop-app-fallback")
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
     def test_tool_use_turn_is_active(self):
         path = write_jsonl([
             {"type": "user", "timestamp": iso_now(-5000), "message": {"role": "user", "content": "go"}},
@@ -413,7 +430,7 @@ class CodexSessionScan(unittest.TestCase):
             tasks = th.CodexAdapter().list_tasks(commands=[])
             self.assertEqual(tasks[0]["updated_ms"], old_ms)
             self.assertGreaterEqual(tasks[0]["age_sec"], 90 * 60)
-            self.assertLess(tasks[0]["age_sec"], 90 * 60 + 2)
+            self.assertLessEqual(tasks[0]["age_sec"], 90 * 60 + 2)
         finally:
             th.codex_records = original
 

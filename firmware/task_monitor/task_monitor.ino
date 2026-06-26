@@ -89,12 +89,16 @@ static constexpr int C_DARK = 0x0841;
 
 static constexpr int MAX_TASKS = 10;
 // Tightened: with a cached BSSID hint, a healthy join lands in <1s and the hub
-// answers in <500ms on LAN. A wake that doesn't make it in these windows is
-// almost certainly an outage — bail fast so the radio doesn't drain the cell.
+// usually answers in <500ms on LAN once its cache is warm. A cold Host pass can
+// take several seconds while desktop adapters scan local stores, so HTTP gets a
+// larger window to avoid a false "Cannot read tasks" on boot.
 static constexpr uint32_t WIFI_TIMEOUT_MS = 5000;
-static constexpr uint32_t HTTP_TIMEOUT_MS = 3000;
+static constexpr uint32_t HTTP_TIMEOUT_MS = 8000;
 static constexpr uint32_t DISCOVERY_TIMEOUT_MS = 900;
 static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
+static constexpr uint32_t BOOT_FETCH_RETRY_MS = 45000;
+static constexpr uint32_t WAKE_FETCH_RETRY_MS = 12000;
+static constexpr uint32_t FETCH_RETRY_DELAY_MS = 1200;
 
 #if !defined(INTERACTIVE_TIMEOUT_MS)
 #define INTERACTIVE_TIMEOUT_MS 10000
@@ -1615,6 +1619,30 @@ static bool fetchTasks() {
   return true;
 }
 
+static bool fetchTasksWithStartupRetry(uint32_t retryWindowMs) {
+  uint32_t start = millis();
+  int attempt = 0;
+  while (true) {
+    attempt++;
+    if (attempt > 1) {
+      setBootStatus(uiText("retry sync...", "重试同步..."), C_AMBER);
+    }
+
+    if (fetchTasks()) return true;
+
+    if (retryWindowMs == 0 || millis() - start >= retryWindowMs) {
+      return false;
+    }
+
+    uint32_t waitStart = millis();
+    while (millis() - waitStart < FETCH_RETRY_DELAY_MS && millis() - start < retryWindowMs) {
+      M5.update();
+      handleSerialConfig();
+      delay(50);
+    }
+  }
+}
+
 static bool openSelectedTask() {
   if (taskCount == 0 || selected >= taskCount) return false;
   if (!ensureWifi()) {
@@ -1684,7 +1712,7 @@ static void enterDeepSleep() {
 
 static void refreshNow() {
   drawMessage(uiText("Refreshing", "刷新中"), apiBase(), C_AMBER);
-  bool ok = fetchTasks();
+  bool ok = fetchTasksWithStartupRetry(wokeFromSleep ? WAKE_FETCH_RETRY_MS : BOOT_FETCH_RETRY_MS);
   updateBattery();
   updateAlerts();
   if (hasWaitingTasks()) {

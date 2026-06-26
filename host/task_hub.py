@@ -1531,6 +1531,7 @@ class ClaudeAdapter:
 
     def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
         commands = commands or ps_commands()
+        app_is_running = app_running(commands, "/Applications/Claude.app", "Claude")
         running_resumes = set()
         # Detect any Claude Code process by --resume flag. Case-insensitive
         # because the active binary lives under `claude.app/` (lowercase) while
@@ -1665,6 +1666,23 @@ class ClaudeAdapter:
                         needs_attention=status == "waiting",
                     )
                 )
+
+        if not tasks and app_is_running:
+            title = window_titles("Claude")
+            tasks.append(
+                task(
+                    task_id="claude-app",
+                    source=self.source,
+                    title=title[0] if title and title[0] != "Claude" else "Claude",
+                    status="idle",
+                    subtitle="app open · no local task metadata",
+                    detail={
+                        "app_running": True,
+                        "metadata_source": "desktop-app-fallback",
+                    },
+                    open_action={"type": "app", "target": "com.anthropic.claudefordesktop"},
+                )
+            )
 
         return tasks
 
