@@ -8,6 +8,11 @@
   deep-sleep wake, then replaces it with fresh Host data when Wi-Fi sync
   completes. This makes screen-off wake feel much faster without keeping Wi-Fi
   alive.
+- The StickS3 `/tasks?format=stick` Host endpoint now uses a stale-while-
+  revalidate path: if a recent task snapshot exists, the device gets it in a
+  few milliseconds while the Host refreshes Claude/Codex/browser adapters in
+  the background. Firmware follows up automatically when the Host reports that
+  a background sync is still in progress.
 - Voice recording buffer allocation is now lazy, so ordinary wake-to-check
   flows no longer allocate the large PSRAM audio buffer during boot.
 - Eco mode is now the default firmware power profile: lower screen brightness,

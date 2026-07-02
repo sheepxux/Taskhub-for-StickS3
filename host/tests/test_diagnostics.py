@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -71,6 +72,56 @@ class DiagnosticsHelpers(unittest.TestCase):
             self.assertEqual(snapshot["adapters"][0]["statuses"], {"running": 1})
         finally:
             th.taskhub_voice = old_voice
+
+    def test_stick_fast_path_returns_stale_cache_while_refreshing(self):
+        class FakeAdapter:
+            source = "Fake"
+
+            def __init__(self):
+                self.title = "old task"
+                self.delay = 0.0
+
+            def list_tasks(self):
+                if self.delay:
+                    time.sleep(self.delay)
+                return [
+                    th.task(
+                        task_id="fake-1",
+                        source="Fake",
+                        title=self.title,
+                        status="running",
+                    )
+                ]
+
+        hub = th.Hub(token="test-token", http_port=5577, discovery_port=5578, bind="127.0.0.1")
+        adapter = FakeAdapter()
+        hub.adapters = [adapter]
+        hub.peer_manager.remote_tasks = lambda: []  # type: ignore[method-assign]
+
+        rows = hub.list_tasks(include_remote=True)
+        self.assertEqual(rows[0]["title"], "old task")
+
+        adapter.title = "new task"
+        adapter.delay = 0.2
+        with hub.cache_lock:
+            hub.cache_at = th.now_ms() - th.TASK_CACHE_MS - 1
+
+        started = time.monotonic()
+        rows = hub.list_tasks(include_remote=True, allow_stale=True, stale_ms=60000)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(rows[0]["title"], "old task")
+
+        deadline = time.monotonic() + 2.0
+        refreshed_title = ""
+        while time.monotonic() < deadline:
+            with hub.cache_lock:
+                refreshed_title = hub.cache[0]["title"] if hub.cache else ""
+            if refreshed_title == "new task":
+                break
+            time.sleep(0.05)
+        self.assertEqual(refreshed_title, "new task")
 
 
 if __name__ == "__main__":

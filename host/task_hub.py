@@ -73,8 +73,10 @@ from taskhub_config import (
     PERPLEXITY_COMPUTER_RUNNING_STALE_MS,
     PERPLEXITY_RUNNING_STALE_MS,
     QUESTION_WAITING_STALE_MS,
+    TASK_BACKGROUND_REFRESH_MIN_MS,
     TASK_CACHE_MS,
     TASK_HUB_VERSION,
+    TASK_STICK_STALE_CACHE_MS,
     TRANSCRIPT_CACHE_MAX,
 )
 
@@ -4586,6 +4588,11 @@ class Hub:
         ]
         self.cache: List[Task] = []
         self.cache_at = 0
+        self.cache_lock = threading.Lock()
+        self.refresh_lock = threading.Lock()
+        self.refreshing = False
+        self.refresh_started_at = 0
+        self.last_refresh_error = ""
         self.detail_base_url = "http://127.0.0.1:5577"
         self.peer_manager = PeerManager(token, http_port, discovery_port)
 
@@ -4594,10 +4601,7 @@ class Hub:
             return list(adapter.list_tasks(commands))
         return list(adapter.list_tasks())
 
-    def list_tasks(self, include_remote: bool = True) -> List[Task]:
-        if include_remote and now_ms() - self.cache_at < TASK_CACHE_MS and self.cache:
-            return self.cache
-
+    def _scan_tasks(self, include_remote: bool = True) -> List[Task]:
         commands = ps_commands()
         tasks: List[Task] = []
         for adapter in self.adapters:
@@ -4626,9 +4630,68 @@ class Hub:
 
         for item in self.peer_manager.remote_tasks():
             dedup[item["id"]] = item
-        self.cache = sorted(dedup.values(), key=sort_key)[:MAX_TASKS]
-        self.cache_at = now_ms()
-        return self.cache
+        return sorted(dedup.values(), key=sort_key)[:MAX_TASKS]
+
+    def _update_task_cache(self, include_remote: bool = True) -> List[Task]:
+        tasks = self._scan_tasks(include_remote=include_remote)
+        if include_remote:
+            with self.cache_lock:
+                self.cache = tasks
+                self.cache_at = now_ms()
+                self.last_refresh_error = ""
+        return tasks
+
+    def _refresh_tasks_background(self, include_remote: bool = True) -> None:
+        if not include_remote:
+            return
+        now = now_ms()
+        with self.refresh_lock:
+            if self.refreshing:
+                return
+            if self.refresh_started_at and now - self.refresh_started_at < TASK_BACKGROUND_REFRESH_MIN_MS:
+                return
+            self.refreshing = True
+            self.refresh_started_at = now
+
+        def worker() -> None:
+            try:
+                self._update_task_cache(include_remote=True)
+            except Exception as exc:  # Defensive: adapter errors are handled per adapter.
+                traceback.print_exc()
+                with self.cache_lock:
+                    self.last_refresh_error = str(exc)[:240]
+            finally:
+                with self.refresh_lock:
+                    self.refreshing = False
+
+        threading.Thread(target=worker, name="taskhub-cache-refresh", daemon=True).start()
+
+    def cache_age_ms(self) -> Optional[int]:
+        with self.cache_lock:
+            if not self.cache_at:
+                return None
+            return max(0, now_ms() - self.cache_at)
+
+    def list_tasks(
+        self,
+        include_remote: bool = True,
+        allow_stale: bool = False,
+        stale_ms: int = 0,
+    ) -> List[Task]:
+        if include_remote:
+            now = now_ms()
+            with self.cache_lock:
+                cache = list(self.cache)
+                cache_at = self.cache_at
+            if cache:
+                cache_age = now - cache_at
+                if cache_age < TASK_CACHE_MS:
+                    return cache
+                if allow_stale and stale_ms > 0 and cache_age < stale_ms:
+                    self._refresh_tasks_background(include_remote=True)
+                    return cache
+
+        return self._update_task_cache(include_remote=include_remote)
 
     def local_adapter_diagnostics(self) -> Tuple[List[Dict[str, Any]], List[Task]]:
         commands = ps_commands()
@@ -4706,7 +4769,10 @@ class Hub:
             "voice": voice,
             "peers": peers,
             "caches": {
-                "task_cache_age_ms": max(0, generated - self.cache_at) if self.cache_at else None,
+                "task_cache_age_ms": self.cache_age_ms(),
+                "task_cache_refreshing": self.refreshing,
+                "task_cache_last_refresh_error": self.last_refresh_error,
+                "task_stick_stale_cache_ms": TASK_STICK_STALE_CACHE_MS,
                 "claude_transcript_cache": len(_CLAUDE_TRANSCRIPT_CACHE),
                 "codex_session_cache": len(_CODEX_SESSION_CACHE),
                 "max_entries": TRANSCRIPT_CACHE_MAX,
@@ -4715,7 +4781,8 @@ class Hub:
 
     def ingest(self, payload: Any) -> Tuple[bool, str, int]:
         result = self.external.ingest(payload)
-        self.cache_at = 0  # force the next /tasks read to include the new push
+        with self.cache_lock:
+            self.cache_at = 0  # force the next /tasks read to include the new push
         return result
 
     def find_task(self, task_id: str) -> Optional[Task]:
@@ -4943,10 +5010,16 @@ class Handler(BaseHTTPRequestHandler):
         fmt = (qs.get("format") or ["full"])[0]
         scope = (qs.get("scope") or ["all"])[0].lower()
         include_remote = scope not in {"local", "self"}
-        tasks = self.hub.list_tasks(include_remote=include_remote)
+        stick_fast_path = fmt == "stick" and include_remote
+        tasks = self.hub.list_tasks(
+            include_remote=include_remote,
+            allow_stale=stick_fast_path,
+            stale_ms=TASK_STICK_STALE_CACHE_MS if stick_fast_path else 0,
+        )
         active = sum(1 for t in tasks if t.get("status") in {"running", "waiting", "failed"})
         attention = sum(1 for t in tasks if t.get("needs_attention") or t.get("status") == "waiting")
         if fmt == "stick":
+            cache_age = self.hub.cache_age_ms() if include_remote else None
             payload = {
                 "ok": True,
                 "ts": now_ms(),
@@ -4954,6 +5027,8 @@ class Handler(BaseHTTPRequestHandler):
                 "count": len(tasks),
                 "active": active,
                 "attention": attention,
+                "cache_age_ms": cache_age,
+                "syncing": bool(include_remote and cache_age is not None and cache_age >= TASK_CACHE_MS),
                 "device": short_device_label(DEVICE_NAME),
                 "tasks": [compact_task(t) for t in tasks[: max(1, min(limit, 12))]],
             }

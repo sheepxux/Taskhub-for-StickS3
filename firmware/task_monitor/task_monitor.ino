@@ -100,6 +100,7 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 static constexpr uint32_t BOOT_FETCH_RETRY_MS = 45000;
 static constexpr uint32_t WAKE_FETCH_RETRY_MS = 12000;
 static constexpr uint32_t FETCH_RETRY_DELAY_MS = 1200;
+static constexpr uint32_t STALE_SYNC_FOLLOWUP_MS = 4500;
 static constexpr int RTC_SNAPSHOT_TASKS = 5;
 static constexpr size_t RTC_ID_LEN = 40;
 static constexpr size_t RTC_SOURCE_LEN = 16;
@@ -422,10 +423,12 @@ static int battPct = 100;
 static bool wifiOk = false;
 static bool wokeByTimer = false;
 static bool wokeFromSleep = false;
+static bool hostSyncing = false;
 static uint32_t lastInputAt = 0;
 static uint32_t lastManualSelectAt = 0;
 static uint32_t lastRefreshAt = 0;
 static uint32_t lastDiscoveryAt = 0;
+static uint32_t nextSyncFollowupAt = 0;
 static uint32_t activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
 static String hubHost;
 static int hubPort = TASK_HUB_PORT;
@@ -720,6 +723,13 @@ static String apiBase() {
 static uint32_t awakeRefreshMs() {
   if (waitCount > 0) return AWAKE_REFRESH_WAIT_MS;
   return (activeCount > 0 || attentionCount > 0) ? AWAKE_REFRESH_ACTIVE_MS : AWAKE_REFRESH_IDLE_MS;
+}
+
+static void keepAwakeForHostSyncing() {
+  if (!hostSyncing) return;
+  uint32_t minTimeout = STALE_SYNC_FOLLOWUP_MS + 2500;
+  if (activeTimeoutMs != UINT32_MAX && activeTimeoutMs < minTimeout) activeTimeoutMs = minTimeout;
+  lastInputAt = millis();
 }
 
 static String urlEncode(const String& s) {
@@ -1701,6 +1711,8 @@ static bool fetchTasks() {
   lastError = "";
   String previousSelectedId = (taskCount > 0 && selected < taskCount) ? tasks[selected].id : "";
   bool previousHadWait = waitCount > 0;
+  hostSyncing = false;
+  nextSyncFollowupAt = 0;
   if (!ensureWifi()) {
     lastError = uiText("Wi-Fi failed", "Wi-Fi 失败");
     if (previousHadWait || snapshotPreviewActive) clearStaleWaitSnapshot();
@@ -1759,6 +1771,8 @@ static bool fetchTasks() {
   totalCount = doc["count"] | 0;
   activeCount = doc["active"] | 0;
   attentionCount = doc["attention"] | 0;
+  hostSyncing = doc["syncing"] | false;
+  nextSyncFollowupAt = hostSyncing ? millis() + STALE_SYNC_FOLLOWUP_MS : 0;
   taskCount = 0;
   hiddenCount = 0;
   waitCount = 0;
@@ -1786,8 +1800,8 @@ static bool fetchTasks() {
     if (t.status == "wait") waitCount++;
     if (t.status == "run") runCount++;
   }
-  Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d wifi=%s ip=%s\n",
-                taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount,
+  Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d syncing=%d wifi=%s ip=%s\n",
+                taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount, (int)hostSyncing,
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
   setBootStatus(uiText("ready", "就绪"), C_GREEN);
   if (taskCount == 0) {
@@ -1911,6 +1925,7 @@ static void refreshNow() {
     lastInputAt = millis();
 #endif
   }
+  keepAwakeForHostSyncing();
   lastRefreshAt = millis();
   drawList();
   lastInputAt = millis();
@@ -2184,6 +2199,7 @@ void setup() {
 #else
   activeTimeoutMs = UINT32_MAX;
 #endif
+  keepAwakeForHostSyncing();
   lastInputAt = millis();
   lastRefreshAt = millis();
   bootScreenActive = false;
@@ -2234,6 +2250,25 @@ void loop() {
     if (old != battPct || oldWifi != wifiOk) drawList();
   }
 
+  if (hostSyncing && nextSyncFollowupAt != 0 && (int32_t)(millis() - nextSyncFollowupAt) >= 0) {
+    bool ok = fetchTasks();
+    updateBattery();
+    updateAlerts();
+    if (hasWaitingTasks()) {
+      M5.Display.wakeup();
+      applyDisplayBrightness();
+      activeTimeoutMs = waitAttentionTimeoutMs();
+#if ENABLE_DEEP_SLEEP
+    } else if (activeTimeoutMs == UINT32_MAX || activeTimeoutMs > INTERACTIVE_TIMEOUT_MS) {
+      activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
+#endif
+    }
+    keepAwakeForHostSyncing();
+    lastRefreshAt = millis();
+    drawList();
+    (void)ok;
+  }
+
   if ((!ENABLE_DEEP_SLEEP || hasWaitingTasks()) &&
       millis() - lastRefreshAt > awakeRefreshMs() &&
       millis() - lastInputAt > AUTO_REFRESH_INPUT_GUARD_MS) {
@@ -2250,6 +2285,7 @@ void loop() {
       lastInputAt = millis();
 #endif
     }
+    keepAwakeForHostSyncing();
     lastRefreshAt = millis();
     drawList();
     (void)ok;

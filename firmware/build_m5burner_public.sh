@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FQBN="esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=custom,PSRAM=opi"
+FQBN="esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=custom,PSRAM=opi,UploadMode=cdc"
 SKETCH="$ROOT/firmware/task_monitor"
 OUT_DIR="$ROOT/dist/m5burner/task_monitor_public"
 PATH_MAP_FLAGS="-ffile-prefix-map=$HOME=/build -fmacro-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
