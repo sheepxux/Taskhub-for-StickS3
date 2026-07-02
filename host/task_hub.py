@@ -22,6 +22,7 @@ import socket
 import socketserver
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -296,6 +297,114 @@ def app_running(commands: Iterable[str], bundle_path_fragment: str, binary_name:
         if needle in low and binary in low:
             return True
     return False
+
+
+def display_path(path: Any) -> str:
+    value = str(path or "")
+    if not value:
+        return ""
+    home = os.path.expanduser("~")
+    if home and value == home:
+        return "~"
+    if home and value.startswith(home + os.sep):
+        return "~" + value[len(home) :]
+    return value
+
+
+def diagnostic_status_counts(tasks: Iterable[Task]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in tasks:
+        status = normalize_status(str(item.get("status") or "unknown"))
+        counts[status] = counts.get(status, 0) + 1
+    return {key: counts[key] for key in sorted(counts)}
+
+
+def diagnostic_task_summary(tasks: Iterable[Task]) -> Dict[str, Any]:
+    task_list = list(tasks)
+    statuses = [normalize_status(str(item.get("status") or "unknown")) for item in task_list]
+    return {
+        "count": len(task_list),
+        "active": sum(1 for status in statuses if status in {"running", "waiting", "failed"}),
+        "attention": sum(
+            1 for item, status in zip(task_list, statuses) if item.get("needs_attention") or status == "waiting"
+        ),
+        "statuses": diagnostic_status_counts(task_list),
+    }
+
+
+def tcp_probe_url(url: str, timeout: float = 0.45) -> Dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return {"ok": False, "error": "missing host"}
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    started = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+        return {
+            "ok": True,
+            "host": host,
+            "port": port,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "port": port,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": str(exc)[:160],
+        }
+
+
+def voice_diagnostics() -> Dict[str, Any]:
+    if taskhub_voice is None:
+        return {
+            "available": False,
+            "status": "unavailable",
+            "error": "voice module unavailable",
+        }
+
+    model_path = str(getattr(taskhub_voice, "WHISPER_MODEL", "") or "")
+    cli_name = str(getattr(taskhub_voice, "WHISPER_CLI", "whisper-cli") or "whisper-cli")
+    server_url = str(getattr(taskhub_voice, "WHISPER_SERVER_URL", "") or "")
+    try:
+        accessibility_ok = bool(taskhub_voice.accessibility_trusted())
+        accessibility_error = ""
+    except Exception as exc:
+        accessibility_ok = False
+        accessibility_error = str(exc)[:160]
+
+    server = tcp_probe_url(server_url) if server_url else {"ok": False, "error": "not configured"}
+    cli_path = shutil.which(cli_name)
+    model_exists = bool(model_path and os.path.isfile(model_path))
+    server_ok = bool(server.get("ok"))
+    fallback_ok = bool(cli_path and model_exists)
+    status = "ok" if server_ok and accessibility_ok else ("degraded" if (server_ok or fallback_ok) else "offline")
+    return {
+        "available": True,
+        "status": status,
+        "whisper_server": {
+            "url": server_url,
+            **server,
+        },
+        "whisper_cli": {
+            "command": cli_name,
+            "available": bool(cli_path),
+            "path": display_path(cli_path),
+        },
+        "model": {
+            "name": os.path.basename(model_path),
+            "path": display_path(model_path),
+            "exists": model_exists,
+        },
+        "language": getattr(taskhub_voice, "WHISPER_LANGUAGE", ""),
+        "max_audio_mb": round(int(getattr(taskhub_voice, "MAX_AUDIO_BYTES", 0)) / 1024 / 1024, 1),
+        "accessibility_trusted": accessibility_ok,
+        "accessibility_error": accessibility_error,
+        "restore_clipboard": bool(getattr(taskhub_voice, "VOICE_RESTORE_CLIPBOARD", False)),
+    }
 
 
 def process_name_running(name: str) -> bool:
@@ -3823,6 +3932,10 @@ def html_page(title: str, body: str) -> bytes:
       font-size: 13px;
       color: color-mix(in srgb, CanvasText 78%, transparent);
     }}
+    .state-ok {{ color: #16a34a; }}
+    .state-warn {{ color: #d97706; }}
+    .state-bad {{ color: #dc2626; }}
+    .state-muted {{ color: color-mix(in srgb, CanvasText 58%, transparent); }}
     .actions {{
       display: flex;
       flex-wrap: wrap;
@@ -3904,6 +4017,23 @@ def kv_rows(values: Dict[str, Any]) -> str:
             continue
         rows.append(f"<dt>{html.escape(str(key))}</dt><dd>{html.escape(str(value))}</dd>")
     return "<dl>" + "".join(rows) + "</dl>"
+
+
+def status_class(status: Any) -> str:
+    value = str(status or "").lower()
+    if value in {"ok", "live"}:
+        return "state-ok"
+    if value in {"degraded", "discovered", "warning"}:
+        return "state-warn"
+    if value in {"failed", "error", "offline", "unavailable"}:
+        return "state-bad"
+    return "state-muted"
+
+
+def status_counts_label(counts: Any) -> str:
+    if not isinstance(counts, dict) or not counts:
+        return "-"
+    return ", ".join(f"{key}:{counts[key]}" for key in sorted(counts))
 
 
 def render_task_detail(t: Task) -> bytes:
@@ -4045,6 +4175,114 @@ def render_peers_page(snapshot: Dict[str, Any]) -> bytes:
 </table>
 """
     return html_page("TaskHub Peers", body)
+
+
+def render_diagnostics_page(snapshot: Dict[str, Any]) -> bytes:
+    adapters = snapshot.get("adapters") if isinstance(snapshot.get("adapters"), list) else []
+    adapter_rows = []
+    for adapter in adapters:
+        if not isinstance(adapter, dict):
+            continue
+        state = "ok" if adapter.get("ok") else "failed"
+        adapter_rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(str(adapter.get('source') or 'Adapter'))}</strong></td>"
+            f"<td><span class=\"{status_class(state)}\">{html.escape(state)}</span>"
+            f"<br>{html.escape(str(adapter.get('duration_ms') or 0))} ms</td>"
+            f"<td>{safe_int(adapter.get('count'))}"
+            f"<br><span class=\"state-muted\">{html.escape(status_counts_label(adapter.get('statuses')))}</span></td>"
+            f"<td>{safe_int(adapter.get('active'))} active"
+            f"<br>{safe_int(adapter.get('attention'))} attention</td>"
+            f"<td>{html.escape(str(adapter.get('error') or ''))}</td>"
+            "</tr>"
+        )
+    if not adapter_rows:
+        adapter_rows.append('<tr><td colspan="5">No adapters registered.</td></tr>')
+
+    peers = snapshot.get("peers") if isinstance(snapshot.get("peers"), dict) else {}
+    voice = snapshot.get("voice") if isinstance(snapshot.get("voice"), dict) else {}
+    voice_server = voice.get("whisper_server") if isinstance(voice.get("whisper_server"), dict) else {}
+    voice_cli = voice.get("whisper_cli") if isinstance(voice.get("whisper_cli"), dict) else {}
+    voice_model = voice.get("model") if isinstance(voice.get("model"), dict) else {}
+    local = snapshot.get("local_tasks") if isinstance(snapshot.get("local_tasks"), dict) else {}
+    host_info = snapshot.get("host") if isinstance(snapshot.get("host"), dict) else {}
+    auth = snapshot.get("auth") if isinstance(snapshot.get("auth"), dict) else {}
+    caches = snapshot.get("caches") if isinstance(snapshot.get("caches"), dict) else {}
+
+    body = f"""
+<section class="top">
+  <div>
+    <h1>TaskHub Diagnostics</h1>
+    <div class="meta">
+      <span class="pill">{html.escape(str(snapshot.get("version") or ""))}</span>
+      <span class="pill"><span class="{status_class(snapshot.get("status"))}">{html.escape(str(snapshot.get("status") or ""))}</span></span>
+      <span class="pill">{html.escape(str(host_info.get("device_label") or ""))}</span>
+    </div>
+  </div>
+  <div class="actions">
+    <a class="button secondary" href="/tasks">Tasks</a>
+    <a class="button secondary" href="/peers">Peers</a>
+    <a class="button secondary" href="/diagnostics.json">JSON</a>
+  </div>
+</section>
+<h2>Host</h2>
+{kv_rows({
+    "Generated": snapshot.get("generated_at"),
+    "Version": snapshot.get("version"),
+    "Status": snapshot.get("status"),
+    "Device": f"{host_info.get('device_name')} ({host_info.get('device_id')})",
+    "LAN IP": host_info.get("ip"),
+    "HTTP bind": f"{host_info.get('bind')}:{host_info.get('port')}",
+    "Discovery port": host_info.get("discovery_port"),
+    "Process": f"pid {host_info.get('pid')} / {host_info.get('python')}",
+})}
+<h2>Security</h2>
+{kv_rows({
+    "Token configured": "yes" if auth.get("token_configured") else "no",
+    "Default token active": "yes" if auth.get("default_token_active") else "no",
+    "Token length": auth.get("token_length"),
+    "Note": "Token value is intentionally omitted from diagnostics.",
+})}
+<h2>Local Task Summary</h2>
+{kv_rows({
+    "Total": local.get("count"),
+    "Active": local.get("active"),
+    "Needs attention": local.get("attention"),
+    "Statuses": status_counts_label(local.get("statuses")),
+})}
+<h2>Voice Mode</h2>
+{kv_rows({
+    "Status": voice.get("status"),
+    "Module available": "yes" if voice.get("available") else "no",
+    "Whisper server": f"{'ok' if voice_server.get('ok') else 'offline'} ({voice_server.get('host')}:{voice_server.get('port')})",
+    "Whisper URL": voice_server.get("url"),
+    "CLI fallback": f"{'yes' if voice_cli.get('available') else 'no'} / {voice_cli.get('command')}",
+    "Model": f"{voice_model.get('name')} ({'found' if voice_model.get('exists') else 'missing'})",
+    "Language": voice.get("language"),
+    "Accessibility trusted": "yes" if voice.get("accessibility_trusted") else "no",
+    "Accessibility error": voice.get("accessibility_error"),
+})}
+<h2>Adapters</h2>
+<table>
+  <thead><tr><th>Source</th><th>Status</th><th>Tasks</th><th>Active</th><th>Error</th></tr></thead>
+  <tbody>{''.join(adapter_rows)}</tbody>
+</table>
+<h2>Peers</h2>
+{kv_rows({
+    "Enabled": "yes" if peers.get("enabled") else "no",
+    "Discovered": peers.get("discovery_count"),
+    "Peer rows": len(peers.get("peers") if isinstance(peers.get("peers"), list) else []),
+    "Discovery duration": f"{safe_int(peers.get('discovery_duration_ms'))} ms",
+    "Discovery error": peers.get("discovery_error"),
+})}
+<h2>Caches</h2>
+{kv_rows({
+    "Task cache age": f"{safe_int(caches.get('task_cache_age_ms'))} ms" if caches.get("task_cache_age_ms") is not None else "",
+    "Claude transcript cache": caches.get("claude_transcript_cache"),
+    "Codex session cache": caches.get("codex_session_cache"),
+})}
+"""
+    return html_page("TaskHub Diagnostics", body)
 
 
 class PeerManager:
@@ -4324,7 +4562,17 @@ class ExternalTaskAdapter:
 
 
 class Hub:
-    def __init__(self, token: str = DEFAULT_TOKEN, http_port: int = DEFAULT_PORT, discovery_port: int = DEFAULT_DISCOVERY_PORT) -> None:
+    def __init__(
+        self,
+        token: str = DEFAULT_TOKEN,
+        http_port: int = DEFAULT_PORT,
+        discovery_port: int = DEFAULT_DISCOVERY_PORT,
+        bind: str = DEFAULT_BIND,
+    ) -> None:
+        self.token = token
+        self.http_port = http_port
+        self.discovery_port = discovery_port
+        self.bind = bind
         self.external = ExternalTaskAdapter()
         self.adapters = [
             OpenClawAdapter(),
@@ -4341,6 +4589,11 @@ class Hub:
         self.detail_base_url = "http://127.0.0.1:5577"
         self.peer_manager = PeerManager(token, http_port, discovery_port)
 
+    def _list_adapter_tasks(self, adapter: Any, commands: List[str]) -> List[Task]:
+        if isinstance(adapter, (ClaudeAdapter, CodexAdapter, ManusAdapter, PerplexityAdapter, GeminiAdapter, LovableAdapter, AppAdapter)):
+            return list(adapter.list_tasks(commands))
+        return list(adapter.list_tasks())
+
     def list_tasks(self, include_remote: bool = True) -> List[Task]:
         if include_remote and now_ms() - self.cache_at < TASK_CACHE_MS and self.cache:
             return self.cache
@@ -4349,10 +4602,7 @@ class Hub:
         tasks: List[Task] = []
         for adapter in self.adapters:
             try:
-                if isinstance(adapter, (ClaudeAdapter, CodexAdapter, ManusAdapter, PerplexityAdapter, GeminiAdapter, LovableAdapter, AppAdapter)):
-                    tasks.extend(adapter.list_tasks(commands))
-                else:
-                    tasks.extend(adapter.list_tasks())
+                tasks.extend(self._list_adapter_tasks(adapter, commands))
             except Exception as exc:
                 traceback.print_exc()
                 tasks.append(
@@ -4379,6 +4629,89 @@ class Hub:
         self.cache = sorted(dedup.values(), key=sort_key)[:MAX_TASKS]
         self.cache_at = now_ms()
         return self.cache
+
+    def local_adapter_diagnostics(self) -> Tuple[List[Dict[str, Any]], List[Task]]:
+        commands = ps_commands()
+        rows: List[Dict[str, Any]] = []
+        all_tasks: List[Task] = []
+        for adapter in self.adapters:
+            source = str(getattr(adapter, "source", adapter.__class__.__name__))
+            started = time.monotonic()
+            try:
+                tasks = self._list_adapter_tasks(adapter, commands)
+                summary = diagnostic_task_summary(tasks)
+                rows.append(
+                    {
+                        "source": source,
+                        "ok": True,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        **summary,
+                    }
+                )
+                all_tasks.extend(tasks)
+            except Exception as exc:
+                traceback.print_exc()
+                rows.append(
+                    {
+                        "source": source,
+                        "ok": False,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "count": 0,
+                        "active": 0,
+                        "attention": 1,
+                        "statuses": {"failed": 1},
+                        "error": str(exc)[:240],
+                    }
+                )
+        return rows, all_tasks
+
+    def diagnostics_snapshot(self, refresh_peers: bool = False) -> Dict[str, Any]:
+        generated = now_ms()
+        adapter_rows, local_tasks = self.local_adapter_diagnostics()
+        local_summary = diagnostic_task_summary(local_tasks)
+        voice = voice_diagnostics()
+        peers = self.peers_snapshot(refresh=refresh_peers)
+        adapter_errors = sum(1 for row in adapter_rows if not row.get("ok"))
+        voice_status = str(voice.get("status") or "")
+        default_token_active = bool(self.token and self.token == "dev-token")
+        status = "ok"
+        if adapter_errors or voice_status in {"offline", "unavailable"} or default_token_active:
+            status = "degraded"
+        elif voice_status == "degraded":
+            status = "degraded"
+        return {
+            "ok": True,
+            "status": status,
+            "generated_at": ms_to_iso(generated),
+            "version": TASK_HUB_VERSION,
+            "host": {
+                "pid": os.getpid(),
+                "python": display_path(sys.executable),
+                "cwd": display_path(os.getcwd()),
+                "ip": local_ip_hint(),
+                "bind": self.bind,
+                "port": self.http_port,
+                "discovery_port": self.discovery_port,
+                "device_id": DEVICE_ID,
+                "device_name": DEVICE_NAME,
+                "device_label": short_device_label(DEVICE_NAME),
+            },
+            "auth": {
+                "token_configured": bool(self.token),
+                "token_length": len(self.token or ""),
+                "default_token_active": default_token_active,
+            },
+            "local_tasks": local_summary,
+            "adapters": adapter_rows,
+            "voice": voice,
+            "peers": peers,
+            "caches": {
+                "task_cache_age_ms": max(0, generated - self.cache_at) if self.cache_at else None,
+                "claude_transcript_cache": len(_CLAUDE_TRANSCRIPT_CACHE),
+                "codex_session_cache": len(_CODEX_SESSION_CACHE),
+                "max_entries": TRANSCRIPT_CACHE_MAX,
+            },
+        }
 
     def ingest(self, payload: Any) -> Tuple[bool, str, int]:
         result = self.external.ingest(payload)
@@ -4580,6 +4913,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(200, render_peers_page(snapshot))
             return
 
+        if parsed.path in {"/diagnostics", "/diagnostics.json"}:
+            if not self.task_allowed():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            snapshot = self.hub.diagnostics_snapshot(
+                refresh_peers=(qs.get("refresh") or ["0"])[0] in {"1", "true", "yes"}
+            )
+            if parsed.path == "/diagnostics.json":
+                self.send_json(200, snapshot)
+            else:
+                self.send_html(200, render_diagnostics_page(snapshot))
+            return
+
         if parsed.path == "/tasks" and self.is_loopback() and (
             not parsed.query or "text/html" in (self.headers.get("Accept") or "")
         ):
@@ -4773,7 +5119,7 @@ def main() -> int:
     parser.add_argument("--discovery-port", type=int, default=DEFAULT_DISCOVERY_PORT)
     args = parser.parse_args()
 
-    hub = Hub(token=args.token, http_port=args.port, discovery_port=args.discovery_port)
+    hub = Hub(token=args.token, http_port=args.port, discovery_port=args.discovery_port, bind=args.bind)
     hub.detail_base_url = f"http://127.0.0.1:{args.port}"
     Handler.hub = hub
     Handler.token = args.token

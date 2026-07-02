@@ -5,7 +5,7 @@
 [English](README.md) | 简体中文 | [安装说明](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v2.0.4-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v2.1.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#隐私与安全)
@@ -57,10 +57,10 @@ TaskHub 的目标是给这些后台任务一个实体状态面板：
 
 ## 当前版本
 
-当前版本是 `v2.0.4`，适合作为开发者和 maker 的公开版本使用。
+当前版本是 `v2.1.0`，适合作为开发者和 maker 的公开版本使用。
 
 已经完成的核心链路包括：Mac Host、StickS3 固件、Wi-Fi 发现、精简任务显示、
-按钮操作、语音输入、深度睡眠、多 Mac 局域网聚合，以及多设备诊断页面。
+按钮操作、语音输入、深度睡眠、多 Mac 局域网聚合，以及 Host/多设备诊断页面。
 
 需要注意：不同 AI 工具开放的本地信息不同。Codex、Claude Code、OpenClaw
 这类工具可以做到更细的任务/回合追踪；Perplexity、Gemini、Lovable 这类
@@ -74,6 +74,7 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | StickS3 固件 | Ready | 原生 240x135 UI、按钮、Wi-Fi 发现、深度睡眠 |
 | M5Burner 公开固件 | Ready | 不编译本机 secrets，首次使用通过 USB 写入 NVS 配置 |
 | macOS Host | Ready | LaunchAgent 安装、本地 HTTP API、UDP 发现 |
+| Host 诊断 | Ready | `/diagnostics` 汇总 adapter、语音、权限、缓存和 peer 状态，不暴露 token 或任务标题 |
 | 多 Mac 聚合 | Ready | 同 token Host 可互相发现并合并任务 |
 | BtnB 打开来源 | Ready | 本机任务打开本机 App，远程任务转发到来源 Mac |
 | WAIT 注意模式 | Ready | 任务等待输入时保持屏幕唤醒 |
@@ -287,6 +288,8 @@ cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
 诊断页面：
 
 ```bash
+open http://127.0.0.1:5577/diagnostics
+curl http://127.0.0.1:5577/diagnostics.json
 open http://127.0.0.1:5577/peers
 curl http://127.0.0.1:5577/peers.json?refresh=1
 ```
@@ -303,6 +306,8 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 | `/tasks/:id/open` | 从 StickS3 打开任务来源 |
 | `/tasks/:id/open-native` | Host 之间转发打开请求 |
 | `/voice` | 转写上传的音频并粘进目标 App（语音模式） |
+| `/diagnostics` | Host、adapter、语音、缓存、多设备状态诊断页 |
+| `/diagnostics.json` | 机器可读诊断信息，不包含 token 值或任务标题 |
 | `/peers` | 多设备诊断页面 |
 | `/peers.json` | 多设备诊断 JSON |
 | `/debug/lovable` | Lovable 状态判断调试信息 |
@@ -379,6 +384,7 @@ TaskHub 是 local-first 设计：
 | --- | --- |
 | StickS3 找不到 Host | 确认同一 Wi-Fi，并打开 `/health` |
 | 返回 `401` | 检查 `DEVICE_TOKEN` 是否和 Host token 一致 |
+| 任务状态不刷新或不准 | 打开 `/diagnostics`，看对应来源的 adapter 行 |
 | 多 Mac 不显示 | 打开 `/peers.json?refresh=1`，检查 token 和 UDP `5578` |
 | App 只显示 `REC` | 该 App 可能只暴露活动信号，没有稳定任务状态 |
 | Lovable 状态不准 | 打开 `/debug/lovable` 看 renderer CPU 和 browser basis |
@@ -422,6 +428,6 @@ extension/               Chrome/Edge Web Bridge
 
 ## Release
 
-当前版本：`v2.0.4`。
+当前版本：`v2.1.0`。
 
 更新记录见 [CHANGELOG.md](CHANGELOG.md)。

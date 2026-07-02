@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v2.1.0 — 2026-07-02
+
+### Added
+
+- `/diagnostics` local Host page with adapter health, task status counts,
+  voice-mode readiness, Accessibility permission, cache sizes, and peer
+  discovery summary.
+- `/diagnostics.json` for machine-readable support checks. The snapshot omits
+  token values and task titles so it can be shared more safely during debugging.
+- Regression tests for diagnostics status normalization, home-path redaction,
+  and privacy-safe snapshots.
+
+### Changed
+
+- Documentation now points users to `/diagnostics` as the first stop when task
+  status, voice input, or multi-device discovery looks wrong.
+
 ## v2.0.4 — 2026-07-02
 
 ### Fixed

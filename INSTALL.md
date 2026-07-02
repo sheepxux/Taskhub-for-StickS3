@@ -251,6 +251,8 @@ as the aggregator:
 Useful checks:
 
 ```bash
+open http://127.0.0.1:5577/diagnostics
+curl http://127.0.0.1:5577/diagnostics.json
 open http://127.0.0.1:5577/peers
 curl http://127.0.0.1:5577/peers.json?refresh=1
 ```
@@ -271,6 +273,20 @@ TaskHub still works without this permission, but browser-based sources may only
 show app activity rather than detailed titles or visible `RUN`/`WAIT` signals.
 
 ## Troubleshooting
+
+### Start With Host Diagnostics
+
+Open the local diagnostics page first when task status, voice mode, or
+multi-device discovery looks wrong:
+
+```bash
+open http://127.0.0.1:5577/diagnostics
+curl http://127.0.0.1:5577/diagnostics.json
+```
+
+The page summarizes adapter health, local task counts, voice-mode readiness,
+Accessibility permission, caches, and peer discovery. It intentionally omits
+token values and task titles.
 
 ### StickS3 Cannot Find The Host
 

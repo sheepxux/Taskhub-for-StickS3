@@ -5,7 +5,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 [简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v2.0.4-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v2.1.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#privacy-and-security)
@@ -59,7 +59,7 @@ resolution. Regenerate them with `python3 docs/render_screens.py`.
 
 ## Current Release
 
-`v2.0.4` is the current public build for developers and hardware makers. The
+`v2.1.0` is the current public build for developers and hardware makers. The
 core pipeline is working: Mac Host, StickS3 firmware, Wi-Fi discovery, compact
 task display, button actions, deep sleep, voice input, and LAN multi-device
 aggregation.
@@ -75,6 +75,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | StickS3 firmware | Ready | Native 240x135 UI, buttons, Wi-Fi discovery, deep sleep |
 | M5Burner public firmware | Ready | Builds without local secrets; first use is configured over USB into device NVS |
 | macOS Host | Ready | LaunchAgent installer, local HTTP API, UDP discovery |
+| Host diagnostics | Ready | `/diagnostics` checks adapters, voice mode, local permissions, caches, and peers without exposing tokens or task titles |
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnB open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
 | WAIT attention mode | Ready | Keeps the display awake while a task needs user input |
@@ -361,6 +362,8 @@ Useful environment variables:
 Diagnostics:
 
 ```bash
+open http://127.0.0.1:5577/diagnostics
+curl http://127.0.0.1:5577/diagnostics.json
 open http://127.0.0.1:5577/peers
 curl http://127.0.0.1:5577/peers.json?refresh=1
 ```
@@ -377,6 +380,8 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 | `/tasks/:id/open` | Open selected source from the StickS3 |
 | `/tasks/:id/open-native` | Host-to-host remote open forwarding |
 | `/voice` | Transcribe a posted audio clip and paste it into a target app (voice mode) |
+| `/diagnostics` | Human-readable Host health, adapter, voice, cache, and peer diagnostics |
+| `/diagnostics.json` | Machine-readable diagnostics without token values or task titles |
 | `/peers` | Human-readable multi-device diagnostics |
 | `/peers.json` | Machine-readable peer status |
 | `/debug/lovable` | Lovable app/browser signal diagnostics |
@@ -457,6 +462,7 @@ TaskHub is local-first.
 | --- | --- |
 | StickS3 cannot find the Host | Confirm Mac and StickS3 are on the same Wi-Fi, then check `/health` |
 | `401` from the Host | Confirm `DEVICE_TOKEN` matches the Host token file |
+| Task status looks stale or wrong | Open `/diagnostics` and check the source adapter row |
 | No peer Macs show up | Open `/peers.json?refresh=1`, check token match and UDP port `5578` |
 | An app only shows `REC` | The app may expose activity but no active task signal |
 | Lovable running state looks wrong | Open `/debug/lovable` and inspect renderer CPU/browser basis |
@@ -508,6 +514,6 @@ CHANGELOG.md             Release notes
 
 ## Release
 
-Current release: `v2.0.4`.
+Current release: `v2.1.0`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
