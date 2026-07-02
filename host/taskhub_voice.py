@@ -13,6 +13,7 @@ opened with BtnB). Everything stays on the LAN / local machine.
 from __future__ import annotations
 
 import json
+import ctypes
 import os
 import re
 import subprocess
@@ -89,6 +90,12 @@ def bundle_for_source(source: str) -> str:
     return SOURCE_BUNDLES.get((source or "").strip().lower(), "")
 WHISPER_TIMEOUT = float(os.environ.get("TASK_HUB_WHISPER_TIMEOUT", "30"))
 MAX_AUDIO_BYTES = int(os.environ.get("TASK_HUB_VOICE_MAX_BYTES", str(12 * 1024 * 1024)))
+VOICE_ACTIVATE_DELAY_SEC = float(os.environ.get("TASK_HUB_VOICE_ACTIVATE_DELAY", "0.65"))
+VOICE_PASTE_SETTLE_SEC = float(os.environ.get("TASK_HUB_VOICE_PASTE_SETTLE", "0.45"))
+VOICE_RESTORE_DELAY_SEC = float(os.environ.get("TASK_HUB_VOICE_RESTORE_DELAY", "0.45"))
+VOICE_RESTORE_CLIPBOARD = os.environ.get("TASK_HUB_VOICE_RESTORE_CLIPBOARD", "0").lower() in {
+    "1", "true", "yes", "on"
+}
 
 # whisper emits these for silence/non-speech; never inject them.
 _NOISE_TOKENS = {
@@ -195,11 +202,26 @@ def _safe_bundle(value: Optional[str]) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9 ._-]{1,80}", value) else ""
 
 
+def accessibility_trusted() -> bool:
+    """Whether this Host process is trusted to drive macOS accessibility events."""
+    if os.environ.get("TASK_HUB_VOICE_SKIP_ACCESSIBILITY_CHECK", "").lower() in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        app_services = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        fn = app_services.AXIsProcessTrusted
+        fn.restype = ctypes.c_bool
+        return bool(fn())
+    except Exception:
+        return True
+
+
 def inject_text(
     text: str,
     *,
     press_enter: bool = False,
-    restore_clipboard: bool = True,
+    restore_clipboard: bool = VOICE_RESTORE_CLIPBOARD,
     activate_bundle: Optional[str] = None,
     activate_name: Optional[str] = None,
 ) -> Tuple[bool, str]:
@@ -210,6 +232,8 @@ def inject_text(
     controlling app to have macOS Accessibility permission."""
     if not text:
         return False, "empty text"
+    if not accessibility_trusted():
+        return False, "Accessibility permission required for TaskHub Host (System Settings -> Privacy & Security -> Accessibility)"
     steps = [
         "on run argv",
         "  set theText to item 1 of argv",
@@ -221,18 +245,42 @@ def inject_text(
     bundle = _safe_bundle(activate_bundle)
     name = _safe_bundle(activate_name)
     if bundle:
-        steps += ["  try", f"    tell application id \"{bundle}\" to activate", "  end try", "  delay 0.35"]
+        steps += [
+            "  try",
+            f"    tell application id \"{bundle}\" to activate",
+            "  end try",
+            f"  delay {VOICE_ACTIVATE_DELAY_SEC:.2f}",
+            "  tell application \"System Events\"",
+            f"    set targetProcesses to application processes whose bundle identifier is \"{bundle}\"",
+            "    if (count of targetProcesses) > 0 then",
+            "      set frontmost of item 1 of targetProcesses to true",
+            "    end if",
+            "  end tell",
+            "  delay 0.20",
+        ]
     elif name:
-        steps += ["  try", f"    tell application \"{name}\" to activate", "  end try", "  delay 0.35"]
+        steps += [
+            "  try",
+            f"    tell application \"{name}\" to activate",
+            "  end try",
+            f"  delay {VOICE_ACTIVATE_DELAY_SEC:.2f}",
+            "  tell application \"System Events\"",
+            f"    if exists application process \"{name}\" then",
+            f"      set frontmost of application process \"{name}\" to true",
+            "    end if",
+            "  end tell",
+            "  delay 0.20",
+        ]
     steps += [
         "  set the clipboard to theText",
-        "  delay 0.05",
-        "  tell application \"System Events\" to keystroke \"v\" using command down",
+        "  delay 0.10",
+        "  tell application \"System Events\" to key code 9 using command down",
+        f"  delay {VOICE_PASTE_SETTLE_SEC:.2f}",
     ]
     if press_enter:
-        steps += ["  delay 0.25", "  tell application \"System Events\" to key code 36"]  # Return
+        steps += ["  tell application \"System Events\" to key code 36", "  delay 0.20"]  # Return
     if restore_clipboard:
-        steps += ["  delay 0.2", "  set the clipboard to savedClip"]
+        steps += [f"  delay {VOICE_RESTORE_DELAY_SEC:.2f}", "  set the clipboard to savedClip"]
     steps.append("end run")
     script = "\n".join(steps)
     try:
@@ -262,7 +310,7 @@ def handle_voice(
     ok, text, err = transcribe(data)
     if not ok:
         return {"ok": False, "error": err}
-    result: Dict[str, object] = {"ok": True, "text": text, "injected": False}
+    result: Dict[str, object] = {"ok": True, "text": text, "injected": False, "inject_requested": inject}
     if not text:
         result["note"] = err or "no speech detected"
         return result

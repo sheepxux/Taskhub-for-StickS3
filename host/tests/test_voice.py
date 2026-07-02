@@ -43,5 +43,28 @@ class VoiceModelResolution(unittest.TestCase):
             )
 
 
+class VoiceHandle(unittest.TestCase):
+    def test_handle_voice_reports_injection_error_without_losing_transcript(self):
+        old_transcribe = voice.transcribe
+        old_inject = voice.inject_text
+        try:
+            voice.transcribe = lambda data: (True, "hello", "")
+
+            def fake_inject(text, *, press_enter=False, restore_clipboard=True, activate_bundle=None, activate_name=None):
+                return False, "Accessibility permission required"
+
+            voice.inject_text = fake_inject
+            result = voice.handle_voice(b"wav", inject=True, press_enter=True, activate_bundle="com.openai.codex")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["text"], "hello")
+            self.assertTrue(result["inject_requested"])
+            self.assertFalse(result["injected"])
+            self.assertEqual(result["inject_error"], "Accessibility permission required")
+            self.assertEqual(result["target"], "com.openai.codex")
+        finally:
+            voice.transcribe = old_transcribe
+            voice.inject_text = old_inject
+
+
 if __name__ == "__main__":
     unittest.main()

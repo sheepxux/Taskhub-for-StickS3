@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## v2.0.4 — 2026-07-02
+
+### Fixed
+
+- Improved voice input injection reliability by waiting longer for the target
+  app to activate, letting Electron/WebView apps consume the paste before the
+  clipboard can be restored, keeping the transcript on the clipboard by default
+  for reliable paste delivery, and reporting injection failures without logging
+  the spoken transcript.
+- The macOS Host LaunchAgent now runs in the Aqua interactive session so
+  voice-mode paste/send keystrokes actually reach the target app.
+- StickS3 now shows `Type failed` / `输入失败` when transcription succeeds but
+  macOS input injection fails, instead of implying the text was typed.
+- The first boot task fetch now uses the same startup retry window as manual
+  refreshes, reducing false `Cannot read tasks` screens while the Host warms up.
+- Verified Codex `0.142.5` and the Claude Desktop bundled Claude Code
+  `2.1.197` storage/process shape.
+
 ## v2.0.3 — 2026-06-26
 
 ### Fixed

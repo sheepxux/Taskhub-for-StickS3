@@ -4680,6 +4680,19 @@ class Handler(BaseHTTPRequestHandler):
                 result = taskhub_voice.handle_voice(
                     audio, inject=inject, press_enter=press_enter, activate_bundle=activate_bundle or None
                 )
+                try:
+                    print(
+                        "[voice] "
+                        f"ok={bool(result.get('ok'))} "
+                        f"chars={len(str(result.get('text') or ''))} "
+                        f"inject_requested={inject} "
+                        f"injected={bool(result.get('injected'))} "
+                        f"target={activate_bundle or '-'} "
+                        f"error={str(result.get('error') or result.get('inject_error') or '')[:120]}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             except Exception as exc:
                 traceback.print_exc()
                 self.send_json(500, {"ok": False, "error": str(exc)[:200]})

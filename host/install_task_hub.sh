@@ -82,6 +82,10 @@ cat > "$PLIST" <<PLIST
   </array>
   <key>WorkingDirectory</key>
   <string>$APP_DIR</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

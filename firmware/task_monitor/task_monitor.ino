@@ -1844,13 +1844,24 @@ static void stopAndSendVoice() {
   if (code == 200) {
     JsonDocument doc;
     String text = "";
+    String injectError = "";
     bool injected = false;
     if (deserializeJson(doc, resp) == DeserializationError::Ok) {
       text = String((const char*)(doc["text"] | ""));
       injected = doc["injected"] | false;
+      injectError = String((const char*)(doc["inject_error"] | ""));
     }
     if (text.length() == 0) {
       drawMessage(uiText("No speech heard", "没听清"), uiText("Try again", "再试一次"), C_AMBER);
+    } else if (!injected) {
+      if (injectError.indexOf("Accessibility") >= 0 || injectError.indexOf("accessibility") >= 0) {
+        injectError = uiText("Check Accessibility", "检查辅助权限");
+      } else if (injectError.length() > 34) {
+        injectError = injectError.substring(0, 34);
+      }
+      drawMessage(uiText("Type failed", "输入失败"),
+                  injectError.length() ? injectError : uiText("Check Accessibility", "检查辅助权限"),
+                  C_RED);
     } else {
       drawMessage(injected ? (cfgVoiceAutoSend ? uiText("Sent", "已发送") : uiText("Typed", "已输入"))
                            : uiText("Transcribed", "已转写"),
@@ -1977,7 +1988,7 @@ void setup() {
     drawBootScreen("boot...");
   }
 
-  bool ok = fetchTasks();
+  bool ok = fetchTasksWithStartupRetry(wokeFromSleep ? WAKE_FETCH_RETRY_MS : BOOT_FETCH_RETRY_MS);
   updateBattery();
   updateAlerts();
 #if ENABLE_DEEP_SLEEP
