@@ -78,7 +78,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Host diagnostics | Ready | `/diagnostics` checks adapters, voice mode, local permissions, caches, and peers without exposing tokens or task titles |
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnB open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
-| WAIT attention mode | Ready | Keeps the display awake while a task needs user input |
+| WAIT attention mode | Ready | Wakes and holds the display briefly when input is needed, then sleeps and keeps checking |
 | WAIT alert | Ready | Edge-triggered screen wake + short double beep when a task first needs input (`ALERT_*` tunable) |
 | DONE alert | Ready | Edge-triggered softer rising chime when a running task finishes |
 | Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
@@ -150,7 +150,7 @@ anything from the computer.
 | Label | Color intent | Meaning | StickS3 visibility |
 | --- | --- | --- | --- |
 | `RUN` | Blue | Active task or active agent turn | Always visible |
-| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible, keeps screen awake, and fires a one-shot wake + double-beep alert on entry |
+| `WAIT` | Yellow | Waiting for user input or queued attention | Always visible while awake; fires a one-shot wake + double-beep alert, then sleeps again after the attention hold |
 | `FAIL` | Red | Failed or needs attention | Always visible |
 | `DONE` | Green | Completed | Hidden after 10 minutes by default; a running-to-finished edge plays a softer chime |
 | `REC` | White/gray | Recently active | Hidden after 1 hour by default |
@@ -169,7 +169,7 @@ stateDiagram-v2
   IDLE --> Hidden: older than 10 minutes
   REC --> Hidden: older than 1 hour
   FAIL --> [*]: stays visible
-  WAIT --> [*]: stays visible
+  WAIT --> [*]: sleeps after attention hold
   RUN --> [*]: stays visible
 ```
 
@@ -388,25 +388,33 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 
 ## Power Profile
 
-The firmware is battery-first by default. It wakes, fetches once, stays visible
-briefly, then sleeps again. Active and WAIT tasks refresh more often.
+The firmware is battery-first by default. It wakes, fetches once, shows the last
+task snapshot immediately when possible, stays visible briefly, then sleeps
+again. Active and WAIT tasks still refresh more often, but Eco Mode avoids
+keeping the tiny display lit forever.
 
 | Setting | Default |
 | --- | --- |
+| Eco mode | `ECO_MODE=1` |
 | Normal timer wake | `AUTO_WAKE_SECONDS=600` |
-| Active/attention timer wake | `ACTIVE_WAKE_SECONDS=60` |
-| Low-battery timer wake | `LOW_BATTERY_WAKE_SECONDS=900` |
-| Timer-wake screen time | `QUIET_TIMER_TIMEOUT_MS=3000` |
-| Button-wake screen time | `INTERACTIVE_TIMEOUT_MS=10000` |
-| Normal brightness | `DISPLAY_BRIGHTNESS=32` |
-| Low-battery brightness | `LOW_BATTERY_BRIGHTNESS=16` |
+| Active/attention timer wake | `ACTIVE_WAKE_SECONDS=120` |
+| Low-battery timer wake | `LOW_BATTERY_WAKE_SECONDS=1200` |
+| Timer-wake screen time | `QUIET_TIMER_TIMEOUT_MS=1500` |
+| Button-wake screen time | `INTERACTIVE_TIMEOUT_MS=6000` |
+| WAIT attention hold | `WAIT_ATTENTION_TIMEOUT_MS=180000` |
+| Low-battery WAIT hold | `LOW_BATTERY_WAIT_ATTENTION_TIMEOUT_MS=45000` |
+| Normal brightness | `DISPLAY_BRIGHTNESS=22` |
+| Low-battery brightness | `LOW_BATTERY_BRIGHTNESS=8` |
+| Awake active refresh | `AWAKE_REFRESH_ACTIVE_MS=15000` |
+| Awake WAIT refresh | `AWAKE_REFRESH_WAIT_MS=15000` |
 | CPU clock | `POWER_SAVE_CPU_MHZ=80` |
 | Charge current | `CHARGE_CURRENT_MA=200` |
 
 A WAIT almost always follows a running task, so the device is usually deep-sleeping
-with an active task when one appears. `ACTIVE_WAKE_SECONDS=60` caps how long a new
-WAIT can go unnoticed to ~1 minute while staying battery-first; raise it to trade
-latency for battery life.
+with an active task when one appears. `ACTIVE_WAKE_SECONDS=120` caps how long a
+new WAIT can go unnoticed to about two minutes while cutting radio wakeups in
+half versus the old 60-second default. Set `WAIT_ATTENTION_TIMEOUT_MS=0` if you
+want the old always-on WAIT behavior.
 
 The on-device WAIT/DONE alerts are tunable in `firmware/task_monitor/secrets.h`:
 

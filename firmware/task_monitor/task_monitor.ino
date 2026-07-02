@@ -2,7 +2,8 @@
  * StickS3 AI task monitor.
  *
  * Battery-first workflow:
- *   wake -> Wi-Fi -> GET /tasks?format=stick -> show compact list -> sleep.
+ *   wake -> show cached task preview -> Wi-Fi -> GET /tasks?format=stick
+ *   -> show fresh compact list -> sleep.
  *
  * BtnB: open the selected task on the Mac through Task Hub.
  * BtnA: next task.
@@ -99,26 +100,53 @@ static constexpr uint32_t DISCOVERY_REFRESH_MS = 300000;
 static constexpr uint32_t BOOT_FETCH_RETRY_MS = 45000;
 static constexpr uint32_t WAKE_FETCH_RETRY_MS = 12000;
 static constexpr uint32_t FETCH_RETRY_DELAY_MS = 1200;
+static constexpr int RTC_SNAPSHOT_TASKS = 5;
+static constexpr size_t RTC_ID_LEN = 40;
+static constexpr size_t RTC_SOURCE_LEN = 16;
+static constexpr size_t RTC_TITLE_LEN = 72;
+static constexpr size_t RTC_STATUS_LEN = 8;
+static constexpr size_t RTC_SUBTITLE_LEN = 48;
+static constexpr size_t RTC_USAGE_LEN = 32;
+static constexpr size_t RTC_DEVICE_LEN = 12;
+
+#if !defined(ECO_MODE)
+#define ECO_MODE 1
+#endif
 
 #if !defined(INTERACTIVE_TIMEOUT_MS)
+#if ECO_MODE
+#define INTERACTIVE_TIMEOUT_MS 6000
+#else
 #define INTERACTIVE_TIMEOUT_MS 10000
+#endif
 #endif
 
 #if !defined(QUIET_TIMER_TIMEOUT_MS)
+#if ECO_MODE
+#define QUIET_TIMER_TIMEOUT_MS 1500
+#else
 #define QUIET_TIMER_TIMEOUT_MS 3000
+#endif
 #endif
 
 #if !defined(ACTIVE_WAKE_SECONDS)
 // A WAIT almost always appears while a task is already running, so the device
 // is most likely deep-sleeping with active/attention tasks when one shows up.
-// 60s (was 180s) caps the worst-case "turned to WAIT" latency to ~1 min while
-// staying battery-first — active windows are bounded, so the 3x wake frequency
-// only applies briefly. Tune up for more battery, down for snappier alerts.
+// 120s caps the worst-case "turned to WAIT" latency to ~2 min while cutting
+// radio wakeups in half versus the old 60s default.
+#if ECO_MODE
+#define ACTIVE_WAKE_SECONDS 120
+#else
 #define ACTIVE_WAKE_SECONDS 60
+#endif
 #endif
 
 #if !defined(LOW_BATTERY_WAKE_SECONDS)
+#if ECO_MODE
+#define LOW_BATTERY_WAKE_SECONDS 1200
+#else
 #define LOW_BATTERY_WAKE_SECONDS 900
+#endif
 #endif
 
 #if !defined(LOW_BATTERY_THRESHOLD_PCT)
@@ -126,11 +154,35 @@ static constexpr uint32_t FETCH_RETRY_DELAY_MS = 1200;
 #endif
 
 #if !defined(DISPLAY_BRIGHTNESS)
+#if ECO_MODE
+#define DISPLAY_BRIGHTNESS 22
+#else
 #define DISPLAY_BRIGHTNESS 32
+#endif
 #endif
 
 #if !defined(LOW_BATTERY_BRIGHTNESS)
+#if ECO_MODE
+#define LOW_BATTERY_BRIGHTNESS 8
+#else
 #define LOW_BATTERY_BRIGHTNESS 16
+#endif
+#endif
+
+#if !defined(WAIT_ATTENTION_TIMEOUT_MS)
+#if ECO_MODE
+#define WAIT_ATTENTION_TIMEOUT_MS 180000
+#else
+#define WAIT_ATTENTION_TIMEOUT_MS 0
+#endif
+#endif
+
+#if !defined(LOW_BATTERY_WAIT_ATTENTION_TIMEOUT_MS)
+#if ECO_MODE
+#define LOW_BATTERY_WAIT_ATTENTION_TIMEOUT_MS 45000
+#else
+#define LOW_BATTERY_WAIT_ATTENTION_TIMEOUT_MS 0
+#endif
 #endif
 
 #if !defined(POWER_SAVE_CPU_MHZ)
@@ -142,15 +194,27 @@ static constexpr uint32_t FETCH_RETRY_DELAY_MS = 1200;
 #endif
 
 #if !defined(AWAKE_REFRESH_IDLE_MS)
+#if ECO_MODE
+#define AWAKE_REFRESH_IDLE_MS 60000
+#else
 #define AWAKE_REFRESH_IDLE_MS 30000
+#endif
 #endif
 
 #if !defined(AWAKE_REFRESH_ACTIVE_MS)
+#if ECO_MODE
+#define AWAKE_REFRESH_ACTIVE_MS 15000
+#else
 #define AWAKE_REFRESH_ACTIVE_MS 5000
+#endif
 #endif
 
 #if !defined(AWAKE_REFRESH_WAIT_MS)
+#if ECO_MODE
+#define AWAKE_REFRESH_WAIT_MS 15000
+#else
 #define AWAKE_REFRESH_WAIT_MS 5000
+#endif
 #endif
 
 #if !defined(MANUAL_SELECTION_HOLD_MS)
@@ -313,6 +377,34 @@ struct AiTask {
   uint32_t ageSec = 0;
 };
 
+struct RtcTaskSnapshotItem {
+  char id[RTC_ID_LEN];
+  char source[RTC_SOURCE_LEN];
+  char title[RTC_TITLE_LEN];
+  char status[RTC_STATUS_LEN];
+  char subtitle[RTC_SUBTITLE_LEN];
+  char usage[RTC_USAGE_LEN];
+  char device[RTC_DEVICE_LEN];
+  uint32_t ageSec;
+  bool attention;
+};
+
+struct RtcTaskSnapshot {
+  uint32_t magic;
+  int count;
+  int selected;
+  int total;
+  int active;
+  int attention;
+  int wait;
+  int run;
+  int hidden;
+  RtcTaskSnapshotItem items[RTC_SNAPSHOT_TASKS];
+};
+
+static constexpr uint32_t RTC_TASK_SNAPSHOT_MAGIC = 0x54485542;  // THUB
+RTC_DATA_ATTR static RtcTaskSnapshot rtcTaskSnapshot = {};
+
 static AiTask tasks[MAX_TASKS];
 static int taskCount = 0;
 static int selected = 0;
@@ -356,6 +448,7 @@ static bool btnBStablePressed = false;
 static bool btnBHoldFired = false;
 static bool btnBClickEvent = false;
 static bool btnBHoldEvent = false;
+static bool snapshotPreviewActive = false;
 
 // Voice mode state. voiceBuf is one PSRAM block: [44-byte WAV header][PCM16].
 static uint8_t* voiceBuf = nullptr;
@@ -375,6 +468,9 @@ static void centerText(const String& text, int y, int color, const lgfx::IFont* 
 static void drawSetupScreen(const String& status);
 static void handleSerialConfig();
 static void sendSerialConfigStatus(const char* type, bool ok, const char* message);
+static void clearRtcTaskSnapshot();
+static void saveRtcTaskSnapshot();
+static bool restoreRtcTaskSnapshot();
 
 static bool isPlaceholder(const String& value, const char* placeholder) {
   return !value.length() || value == placeholder;
@@ -459,6 +555,7 @@ static bool saveRuntimeConfig(const String& ssid, const String& password, const 
   prefs.putBool("configured", true);
   prefs.end();
 
+  clearRtcTaskSnapshot();
   loadRuntimeConfig();
   return cfgReady;
 }
@@ -469,6 +566,7 @@ static void clearRuntimeConfig() {
     prefs.clear();
     prefs.end();
   }
+  clearRtcTaskSnapshot();
   loadRuntimeConfig();
 }
 
@@ -583,6 +681,11 @@ static uint8_t clampBrightness(int value) {
 
 static uint8_t displayBrightness() {
   return lowBatteryMode() ? clampBrightness(LOW_BATTERY_BRIGHTNESS) : clampBrightness(DISPLAY_BRIGHTNESS);
+}
+
+static uint32_t waitAttentionTimeoutMs() {
+  uint32_t configured = lowBatteryMode() ? LOW_BATTERY_WAIT_ATTENTION_TIMEOUT_MS : WAIT_ATTENTION_TIMEOUT_MS;
+  return configured == 0 ? UINT32_MAX : configured;
 }
 
 static void applyDisplayBrightness() {
@@ -1057,6 +1160,84 @@ static void clearStaleWaitSnapshot() {
   waitCount = 0;
   runCount = 0;
   hiddenCount = 0;
+  snapshotPreviewActive = false;
+}
+
+static void copyRtcField(char* dst, size_t len, const String& value) {
+  if (!dst || len == 0) return;
+  size_t n = value.length();
+  if (n >= len) n = len - 1;
+  memcpy(dst, value.c_str(), n);
+  dst[n] = '\0';
+}
+
+static void clearRtcTaskSnapshot() {
+  memset(&rtcTaskSnapshot, 0, sizeof(rtcTaskSnapshot));
+  snapshotPreviewActive = false;
+}
+
+static void saveRtcTaskSnapshot() {
+  rtcTaskSnapshot.magic = RTC_TASK_SNAPSHOT_MAGIC;
+  rtcTaskSnapshot.count = min(taskCount, RTC_SNAPSHOT_TASKS);
+  rtcTaskSnapshot.selected = selected;
+  if (rtcTaskSnapshot.selected >= rtcTaskSnapshot.count) rtcTaskSnapshot.selected = 0;
+  rtcTaskSnapshot.total = totalCount;
+  rtcTaskSnapshot.active = activeCount;
+  rtcTaskSnapshot.attention = attentionCount;
+  rtcTaskSnapshot.wait = waitCount;
+  rtcTaskSnapshot.run = runCount;
+  rtcTaskSnapshot.hidden = hiddenCount;
+  for (int i = 0; i < rtcTaskSnapshot.count; i++) {
+    RtcTaskSnapshotItem& out = rtcTaskSnapshot.items[i];
+    AiTask& in = tasks[i];
+    copyRtcField(out.id, sizeof(out.id), in.id);
+    copyRtcField(out.source, sizeof(out.source), in.source);
+    copyRtcField(out.title, sizeof(out.title), in.title);
+    copyRtcField(out.status, sizeof(out.status), in.status);
+    copyRtcField(out.subtitle, sizeof(out.subtitle), in.subtitle);
+    copyRtcField(out.usage, sizeof(out.usage), in.usage);
+    copyRtcField(out.device, sizeof(out.device), in.device);
+    out.ageSec = in.ageSec;
+    out.attention = in.attention;
+  }
+  for (int i = rtcTaskSnapshot.count; i < RTC_SNAPSHOT_TASKS; i++) {
+    memset(&rtcTaskSnapshot.items[i], 0, sizeof(rtcTaskSnapshot.items[i]));
+  }
+}
+
+static bool restoreRtcTaskSnapshot() {
+  if (rtcTaskSnapshot.magic != RTC_TASK_SNAPSHOT_MAGIC) return false;
+  int n = rtcTaskSnapshot.count;
+  if (n < 0) n = 0;
+  if (n > RTC_SNAPSHOT_TASKS) n = RTC_SNAPSHOT_TASKS;
+  if (n > MAX_TASKS) n = MAX_TASKS;
+
+  taskCount = n;
+  totalCount = rtcTaskSnapshot.total;
+  activeCount = rtcTaskSnapshot.active;
+  attentionCount = rtcTaskSnapshot.attention;
+  waitCount = rtcTaskSnapshot.wait;
+  runCount = rtcTaskSnapshot.run;
+  hiddenCount = rtcTaskSnapshot.hidden;
+  selected = rtcTaskSnapshot.selected;
+  if (selected < 0 || selected >= max(1, taskCount)) selected = 0;
+  lastError = "";
+
+  for (int i = 0; i < taskCount; i++) {
+    RtcTaskSnapshotItem& in = rtcTaskSnapshot.items[i];
+    AiTask& out = tasks[i];
+    out.id = in.id;
+    out.source = in.source;
+    out.title = in.title;
+    out.status = in.status;
+    out.subtitle = in.subtitle;
+    out.usage = in.usage;
+    out.device = in.device;
+    out.ageSec = in.ageSec;
+    out.attention = in.attention;
+  }
+  snapshotPreviewActive = true;
+  return true;
 }
 
 static void updateBtnBEdge() {
@@ -1380,6 +1561,7 @@ static void drawPortraitList() {
   M5.Display.setTextDatum(bottom_left);
   M5.Display.setTextColor(C_GRAY, C_BG);
   String f = String(selected + 1) + "/" + String(taskCount);
+  if (snapshotPreviewActive) f += " sync";
   if (waitCount > 0) f += " " + String(waitCount) + "w";
   if (hiddenCount > 0) f += " +" + String(hiddenCount);
   M5.Display.drawString(f, 5, H - 2);
@@ -1408,8 +1590,9 @@ static void drawList() {
                                                  : uiText("No tasks", "暂无任务")),
                  H * 45 / 100, lastError.length() ? C_RED : C_WHITE, C_CARD, &fonts::efontCN_16);
     centerTextBg(lastError.length() ? lastError
-                                    : (allHidden ? String(hiddenCount) + uiText(" hidden · auto refresh", " hidden · 会自动刷新")
-                                                 : uiText("Auto refresh", "会定时自动刷新")),
+                                    : (snapshotPreviewActive ? uiText("Updating...", "更新中...")
+                                                             : (allHidden ? String(hiddenCount) + uiText(" hidden · auto refresh", " hidden · 会自动刷新")
+                                                                          : uiText("Auto refresh", "会定时自动刷新"))),
                  H * 64 / 100, C_GRAY, C_CARD, &fonts::efontCN_12);
     centerText(uiText("BtnA refresh", "BtnA 刷新"), H * 90 / 100, C_GRAY, &fonts::efontCN_12);
     return;
@@ -1457,11 +1640,12 @@ static void drawList() {
   drawFittedText(meta, contentX, metaY, contentW, C_GRAY, C_PANEL, &fonts::efontCN_12);
 
   M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextColor(t.usage.length() ? C_AMBER : (attentionCount > 0 ? C_AMBER : C_GRAY), C_BG);
+  M5.Display.setTextColor(snapshotPreviewActive ? C_BLUE : (t.usage.length() ? C_AMBER : (attentionCount > 0 ? C_AMBER : C_GRAY)), C_BG);
   M5.Display.setTextDatum(bottom_left);
-  String footerLeft = t.usage.length() ? t.usage : String(activeCount) + " active · " + String(attentionCount) + " alert";
-  if (!t.usage.length() && waitCount > 0) footerLeft += " · " + String(waitCount) + " wait";
-  if (!t.usage.length() && hiddenCount > 0) footerLeft += " · " + String(hiddenCount) + " hidden";
+  String footerLeft = snapshotPreviewActive ? String(uiText("Updating...", "更新中..."))
+                                            : (t.usage.length() ? t.usage : String(activeCount) + " active · " + String(attentionCount) + " alert");
+  if (!snapshotPreviewActive && !t.usage.length() && waitCount > 0) footerLeft += " · " + String(waitCount) + " wait";
+  if (!snapshotPreviewActive && !t.usage.length() && hiddenCount > 0) footerLeft += " · " + String(hiddenCount) + " hidden";
   M5.Display.drawString(fitText(footerLeft, &fonts::Font0, screenW - 92), 7, screenH - 4);
 
   drawIndexRail(screenW - 82, screenH - 8, 42, 4);
@@ -1519,7 +1703,7 @@ static bool fetchTasks() {
   bool previousHadWait = waitCount > 0;
   if (!ensureWifi()) {
     lastError = uiText("Wi-Fi failed", "Wi-Fi 失败");
-    if (previousHadWait) clearStaleWaitSnapshot();
+    if (previousHadWait || snapshotPreviewActive) clearStaleWaitSnapshot();
     Serial.println("[task-monitor] fetch failed: wifi");
     return false;
   }
@@ -1553,7 +1737,7 @@ static bool fetchTasks() {
   if (code != 200) {
     lastError = String("HTTP ") + String(code);
     setBootStatus(lastError, C_RED);
-    if (previousHadWait) clearStaleWaitSnapshot();
+    if (previousHadWait || snapshotPreviewActive) clearStaleWaitSnapshot();
     Serial.printf("[task-monitor] fetch failed: http=%d url=%s\n", code, url.c_str());
     if (requestOpen) http.end();
     return false;
@@ -1567,7 +1751,7 @@ static bool fetchTasks() {
   if (err) {
     lastError = uiText("JSON error", "JSON 错误");
     setBootStatus(lastError, C_RED);
-    if (previousHadWait) clearStaleWaitSnapshot();
+    if (previousHadWait || snapshotPreviewActive) clearStaleWaitSnapshot();
     Serial.printf("[task-monitor] fetch failed: json=%s\n", err.c_str());
     return false;
   }
@@ -1616,6 +1800,8 @@ static bool fetchTasks() {
     int priority = firstPriorityTask();
     selected = priority >= 0 ? priority : 0;
   }
+  snapshotPreviewActive = false;
+  saveRtcTaskSnapshot();
   return true;
 }
 
@@ -1718,9 +1904,9 @@ static void refreshNow() {
   if (hasWaitingTasks()) {
     M5.Display.wakeup();
     applyDisplayBrightness();
-    activeTimeoutMs = UINT32_MAX;
+    activeTimeoutMs = waitAttentionTimeoutMs();
 #if ENABLE_DEEP_SLEEP
-  } else if (activeTimeoutMs == UINT32_MAX) {
+  } else if (activeTimeoutMs == UINT32_MAX || activeTimeoutMs > INTERACTIVE_TIMEOUT_MS) {
     activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
     lastInputAt = millis();
 #endif
@@ -1785,8 +1971,13 @@ static void pumpMic() {
 
 static void startVoiceRecording() {
   if (!voiceBuf) {
-    drawMessage(uiText("Voice unavailable", "语音不可用"), uiText("PSRAM alloc failed", "PSRAM 分配失败"), C_RED);
-    delay(900); drawList(); return;
+    voiceBuf = (uint8_t*)ps_malloc(VOICE_WAV_HEADER + VOICE_MAX_SAMPLES * 2);
+    if (voiceBuf) {
+      voicePcm = (int16_t*)(voiceBuf + VOICE_WAV_HEADER);
+    } else {
+      drawMessage(uiText("Voice unavailable", "语音不可用"), uiText("PSRAM alloc failed", "PSRAM 分配失败"), C_RED);
+      delay(900); drawList(); return;
+    }
   }
   if (!ensureWifi()) {
     drawMessage(uiText("Voice failed", "语音失败"), uiText("Wi-Fi offline", "Wi-Fi 未连接"), C_RED);
@@ -1953,11 +2144,6 @@ void setup() {
   Serial.begin(115200);
   updateBattery();
   applyPowerProfile();
-#if ENABLE_VOICE
-  voiceBuf = (uint8_t*)ps_malloc(VOICE_WAV_HEADER + VOICE_MAX_SAMPLES * 2);
-  if (voiceBuf) voicePcm = (int16_t*)(voiceBuf + VOICE_WAV_HEADER);
-  else Serial.println("[task-monitor] voice: PSRAM alloc failed; hold-to-talk disabled");
-#endif
   if (digitalRead((int)PIN_BTN_A) == LOW && digitalRead((int)PIN_BTN_B) == LOW) {
     clearRuntimeConfig();
     rtcHasCachedBssid = false;
@@ -1982,7 +2168,9 @@ void setup() {
     return;
   }
 
-  if (wokeFromSleep) {
+  if (wokeFromSleep && restoreRtcTaskSnapshot()) {
+    drawList();
+  } else if (wokeFromSleep) {
     drawWakeSyncScreen("wifi...");
   } else {
     drawBootScreen("boot...");
@@ -1992,7 +2180,7 @@ void setup() {
   updateBattery();
   updateAlerts();
 #if ENABLE_DEEP_SLEEP
-  activeTimeoutMs = hasWaitingTasks() ? UINT32_MAX : ((wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS);
+  activeTimeoutMs = hasWaitingTasks() ? waitAttentionTimeoutMs() : ((wokeByTimer && attentionCount == 0 && ok) ? QUIET_TIMER_TIMEOUT_MS : INTERACTIVE_TIMEOUT_MS);
 #else
   activeTimeoutMs = UINT32_MAX;
 #endif
@@ -2055,9 +2243,9 @@ void loop() {
     if (hasWaitingTasks()) {
       M5.Display.wakeup();
       applyDisplayBrightness();
-      activeTimeoutMs = UINT32_MAX;
+      activeTimeoutMs = waitAttentionTimeoutMs();
 #if ENABLE_DEEP_SLEEP
-    } else if (activeTimeoutMs == UINT32_MAX) {
+    } else if (activeTimeoutMs == UINT32_MAX || activeTimeoutMs > INTERACTIVE_TIMEOUT_MS) {
       activeTimeoutMs = INTERACTIVE_TIMEOUT_MS;
       lastInputAt = millis();
 #endif

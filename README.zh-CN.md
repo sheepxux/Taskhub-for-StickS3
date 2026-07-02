@@ -77,7 +77,7 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | Host 诊断 | Ready | `/diagnostics` 汇总 adapter、语音、权限、缓存和 peer 状态，不暴露 token 或任务标题 |
 | 多 Mac 聚合 | Ready | 同 token Host 可互相发现并合并任务 |
 | BtnB 打开来源 | Ready | 本机任务打开本机 App，远程任务转发到来源 Mac |
-| WAIT 注意模式 | Ready | 任务等待输入时保持屏幕唤醒 |
+| WAIT 注意模式 | Ready | 任务等待输入时点亮并保持一段时间，之后睡眠并周期检查 |
 | WAIT 提醒 | Ready | 任务首次需要输入时边沿触发：点亮屏幕 + 短促双蜂鸣（`ALERT_*` 可调） |
 | DONE 提醒 | Ready | 运行任务完成时边沿触发：更柔和的上行提示音 |
 | 省电策略 | Ready | 默认深度睡眠、低亮度、短暂显示 |
@@ -127,7 +127,7 @@ TaskHub 在 Mac 上保留完整任务列表。StickS3 只做显示层过滤：�
 | 标签 | 颜色意图 | 含义 | StickS3 显示策略 |
 | --- | --- | --- | --- |
 | `RUN` | 蓝色 | 正在运行或 Agent 正在执行回合 | 永远显示 |
-| `WAIT` | 黄色 | 等待用户输入或需要注意 | 永远显示、保持屏幕唤醒，并在进入时触发一次提醒（点亮 + 双蜂鸣） |
+| `WAIT` | 黄色 | 等待用户输入或需要注意 | 醒着时永远显示；进入时触发一次提醒（点亮 + 双蜂鸣），注意保持时间结束后重新睡眠 |
 | `FAIL` | 红色 | 失败或需要处理 | 永远显示 |
 | `DONE` | 绿色 | 已完成 | 默认 10 分钟后隐藏；运行任务刚完成时播放柔和提示音 |
 | `REC` | 白灰色 | 最近活动 | 默认 1 小时后隐藏 |
@@ -314,23 +314,30 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 
 ## 省电策略
 
-固件默认是省电优先：唤醒、拉取任务、短暂显示，然后进入深度睡眠。
-有 `RUN` 或 `WAIT` 任务时会更频繁刷新。
+固件默认是省电优先：唤醒、优先显示上次任务快照、拉取最新任务、短暂显示，
+然后进入深度睡眠。有 `RUN` 或 `WAIT` 任务时会更频繁刷新，但 Eco Mode
+不会让小屏无限常亮。
 
 | 设置 | 默认值 |
 | --- | --- |
+| Eco Mode | `ECO_MODE=1` |
 | 普通定时唤醒 | `AUTO_WAKE_SECONDS=600` |
-| 活跃/注意任务唤醒 | `ACTIVE_WAKE_SECONDS=60` |
-| 低电量唤醒 | `LOW_BATTERY_WAKE_SECONDS=900` |
-| 定时唤醒亮屏时间 | `QUIET_TIMER_TIMEOUT_MS=3000` |
-| 按钮唤醒亮屏时间 | `INTERACTIVE_TIMEOUT_MS=10000` |
-| 普通亮度 | `DISPLAY_BRIGHTNESS=32` |
-| 低电量亮度 | `LOW_BATTERY_BRIGHTNESS=16` |
+| 活跃/注意任务唤醒 | `ACTIVE_WAKE_SECONDS=120` |
+| 低电量唤醒 | `LOW_BATTERY_WAKE_SECONDS=1200` |
+| 定时唤醒亮屏时间 | `QUIET_TIMER_TIMEOUT_MS=1500` |
+| 按钮唤醒亮屏时间 | `INTERACTIVE_TIMEOUT_MS=6000` |
+| WAIT 注意保持 | `WAIT_ATTENTION_TIMEOUT_MS=180000` |
+| 低电量 WAIT 保持 | `LOW_BATTERY_WAIT_ATTENTION_TIMEOUT_MS=45000` |
+| 普通亮度 | `DISPLAY_BRIGHTNESS=22` |
+| 低电量亮度 | `LOW_BATTERY_BRIGHTNESS=8` |
+| 醒着时活跃刷新 | `AWAKE_REFRESH_ACTIVE_MS=15000` |
+| 醒着时 WAIT 刷新 | `AWAKE_REFRESH_WAIT_MS=15000` |
 | CPU 频率 | `POWER_SAVE_CPU_MHZ=80` |
 | 充电电流 | `CHARGE_CURRENT_MA=200` |
 
-WAIT 几乎总是在某个任务运行时出现，此时设备多半正深睡。`ACTIVE_WAKE_SECONDS=60`
-把"新 WAIT 被发现"的最坏延迟压到约 1 分钟，同时保持省电优先；想更省电就调大。
+WAIT 几乎总是在某个任务运行时出现，此时设备多半正深睡。`ACTIVE_WAKE_SECONDS=120`
+把"新 WAIT 被发现"的最坏延迟控制在约 2 分钟，同时把无线电唤醒次数比旧的
+60 秒默认减少一半。想恢复旧的 WAIT 常亮行为，可以设 `WAIT_ATTENTION_TIMEOUT_MS=0`。
 
 设备端 WAIT/DONE 提醒可在 `firmware/task_monitor/secrets.h` 调整：
 

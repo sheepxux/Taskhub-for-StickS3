@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+
+- StickS3 now shows the last successful compact task snapshot immediately after
+  deep-sleep wake, then replaces it with fresh Host data when Wi-Fi sync
+  completes. This makes screen-off wake feel much faster without keeping Wi-Fi
+  alive.
+- Voice recording buffer allocation is now lazy, so ordinary wake-to-check
+  flows no longer allocate the large PSRAM audio buffer during boot.
+- Eco mode is now the default firmware power profile: lower screen brightness,
+  shorter screen-on windows, slower active refresh while awake, 120-second
+  active wake cadence, and finite WAIT attention hold before sleeping again.
+- Low-battery behavior is more aggressive: dimmer backlight, 20-minute wake
+  cadence, and 45-second WAIT attention hold before returning to sleep.
+
 ## v2.1.0 — 2026-07-02
 
 ### Added

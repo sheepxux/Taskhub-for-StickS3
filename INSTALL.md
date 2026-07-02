@@ -357,13 +357,16 @@ If no port appears, try another cable or reconnect the device.
 
 ### Battery Drains Too Quickly
 
-Keep deep sleep enabled for normal use. Lower these values in
-`firmware/task_monitor/secrets.h` if needed:
+Keep deep sleep enabled for normal use. Current firmware defaults to Eco Mode.
+For more battery life, lower brightness further or increase the active wake
+cadence in `firmware/task_monitor/secrets.h`:
 
 ```cpp
-#define DISPLAY_BRIGHTNESS 32
-#define QUIET_TIMER_TIMEOUT_MS 3000
-#define INTERACTIVE_TIMEOUT_MS 10000
+#define ECO_MODE 1
+#define DISPLAY_BRIGHTNESS 18
+#define LOW_BATTERY_BRIGHTNESS 6
+#define ACTIVE_WAKE_SECONDS 180
+#define WAIT_ATTENTION_TIMEOUT_MS 120000
 ```
 
 ## Voice Mode (optional)

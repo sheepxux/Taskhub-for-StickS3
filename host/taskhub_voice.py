@@ -96,6 +96,13 @@ VOICE_RESTORE_DELAY_SEC = float(os.environ.get("TASK_HUB_VOICE_RESTORE_DELAY", "
 VOICE_RESTORE_CLIPBOARD = os.environ.get("TASK_HUB_VOICE_RESTORE_CLIPBOARD", "0").lower() in {
     "1", "true", "yes", "on"
 }
+VOICE_FOCUS_CLICK_BUNDLES = {
+    item.strip()
+    for item in os.environ.get("TASK_HUB_VOICE_FOCUS_CLICK_BUNDLES", "com.anthropic.claudefordesktop").split(",")
+    if item.strip()
+}
+VOICE_FOCUS_CLICK_X_RATIO = float(os.environ.get("TASK_HUB_VOICE_FOCUS_CLICK_X_RATIO", "0.50"))
+VOICE_FOCUS_CLICK_Y_RATIO = float(os.environ.get("TASK_HUB_VOICE_FOCUS_CLICK_Y_RATIO", "0.90"))
 
 # whisper emits these for silence/non-speech; never inject them.
 _NOISE_TOKENS = {
@@ -258,6 +265,24 @@ def inject_text(
             "  end tell",
             "  delay 0.20",
         ]
+        if bundle in VOICE_FOCUS_CLICK_BUNDLES:
+            steps += [
+                "  try",
+                "    tell application \"System Events\"",
+                f"      set targetProcesses to application processes whose bundle identifier is \"{bundle}\"",
+                "      if (count of targetProcesses) > 0 then",
+                "        tell window 1 of item 1 of targetProcesses",
+                "          set winPos to position",
+                "          set winSize to size",
+                "        end tell",
+                f"        set clickX to (item 1 of winPos) + ((item 1 of winSize) * {VOICE_FOCUS_CLICK_X_RATIO:.2f})",
+                f"        set clickY to (item 2 of winPos) + ((item 2 of winSize) * {VOICE_FOCUS_CLICK_Y_RATIO:.2f})",
+                "        click at {clickX, clickY}",
+                "      end if",
+                "    end tell",
+                "  end try",
+                "  delay 0.20",
+            ]
     elif name:
         steps += [
             "  try",
