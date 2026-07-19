@@ -15,7 +15,7 @@ DEFAULT_PORT = int(os.environ.get("TASK_HUB_PORT", "5577"))
 DEFAULT_BIND = os.environ.get("TASK_HUB_BIND", "127.0.0.1")
 DEFAULT_TOKEN = os.environ.get("TASK_HUB_TOKEN", "dev-token")
 DEFAULT_DISCOVERY_PORT = int(os.environ.get("TASK_HUB_DISCOVERY_PORT", "5578"))
-TASK_HUB_VERSION = "2.1.0"
+TASK_HUB_VERSION = "2.2.0"
 
 DEVICE_NAME = os.environ.get("TASK_HUB_DEVICE_NAME") or socket.gethostname().split(".")[0] or "TaskHub"
 DEVICE_ID = os.environ.get("TASK_HUB_DEVICE_ID") or (
@@ -35,6 +35,7 @@ TASK_CACHE_MS = int(os.environ.get("TASK_HUB_CACHE_MS", "3000"))
 TASK_STICK_STALE_CACHE_MS = int(os.environ.get("TASK_HUB_STICK_STALE_CACHE_MS", "1800000"))
 TASK_BACKGROUND_REFRESH_MIN_MS = int(os.environ.get("TASK_HUB_BACKGROUND_REFRESH_MIN_MS", "5000"))
 TRANSCRIPT_CACHE_MAX = int(os.environ.get("TASK_HUB_TRANSCRIPT_CACHE_MAX", "200"))
+ADAPTER_MAX_WORKERS = max(1, int(os.environ.get("TASK_HUB_ADAPTER_MAX_WORKERS", "8")))
 
 CODEX_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CODEX_RUNNING_STALE_MS", "900000"))
 CODEX_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CODEX_DONE_WINDOW_MS", "300000"))
@@ -51,12 +52,19 @@ CLAUDE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLAUDE_RUNNING_STALE_MS",
 # turn a distinct just-finished state for the StickS3's green DONE row and
 # on-device DONE chime.
 CLAUDE_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CLAUDE_DONE_WINDOW_MS", "300000"))
+CLAUDE_MAX_TRANSCRIPTS = int(os.environ.get("TASK_HUB_CLAUDE_MAX_TRANSCRIPTS", "12"))
 CLAUDE_TERMINAL_STOP_REASONS = {"end_turn", "stop_sequence", "max_tokens"}
 CLAUDE_HUMAN_INPUT_TOOLS = {"AskUserQuestion"}
 
 CODEX_HUMAN_INPUT_FUNCTIONS = {"request_user_input"}
 OPENCLAW_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_OPENCLAW_RUNNING_STALE_MS", "1800000"))
 OPENCLAW_FAILED_TTL_MS = int(os.environ.get("TASK_HUB_OPENCLAW_FAILED_TTL_MS", "600000"))
+OPENCLAW_CLI_FALLBACK = os.environ.get("TASK_HUB_OPENCLAW_CLI_FALLBACK", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 MANUS_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_MANUS_RUNNING_STALE_MS", "900000"))
 MANUS_MAX_SESSIONS = int(os.environ.get("TASK_HUB_MANUS_MAX_SESSIONS", "3"))
 MANUS_TERMINAL_STATUS_CODES = {5, 7}
@@ -75,3 +83,14 @@ LOVABLE_DOMAINS = tuple(
     if part.strip()
 )
 LOVABLE_MAX_TABS = int(os.environ.get("TASK_HUB_LOVABLE_MAX_TABS", "3"))
+WORKBUDDY_MAX_SESSIONS = int(os.environ.get("TASK_HUB_WORKBUDDY_MAX_SESSIONS", "6"))
+WORKBUDDY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_WORKBUDDY_RUNNING_STALE_MS", "600000"))
+WORKBUDDY_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_WORKBUDDY_DONE_WINDOW_MS", "300000"))
+WEB_AI_ACTIVITY_STALE_MS = int(
+    os.environ.get("TASK_HUB_WEB_AI_ACTIVITY_STALE_MS", str(ACTIVE_MINUTES * 60 * 1000))
+)
+KIMI_RENDERER_RUN_CPU = float(os.environ.get("TASK_HUB_KIMI_RENDERER_RUN_CPU", "8.0"))
+KIMI_RUNNING_HOLD_MS = int(os.environ.get("TASK_HUB_KIMI_RUNNING_HOLD_MS", "15000"))
+KIMI_LOCAL_RUNNING_STALE_MS = int(
+    os.environ.get("TASK_HUB_KIMI_LOCAL_RUNNING_STALE_MS", "21600000")
+)

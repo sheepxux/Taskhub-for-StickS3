@@ -20,6 +20,8 @@ DO_DEPS=0
 DO_COMPILE=0
 DO_UPLOAD=0
 DO_PROVISION=0
+ROTATE_TOKEN=0
+PROVISION_DONE=0
 NON_INTERACTIVE=0
 
 WIFI_SSID="${TASKHUB_WIFI_SSID:-}"
@@ -51,6 +53,7 @@ Options:
   --compile                Compile the StickS3 firmware after setup
   --upload                 Compile and upload the StickS3 firmware
   --provision              Configure an already-flashed StickS3 over USB
+  --rotate-token           Generate a new shared token; requires --provision or --upload
   --wifi-ssid VALUE        Set WIFI_SSID in firmware secrets
   --wifi-password VALUE    Set WIFI_PASSWORD in firmware secrets
   --token VALUE            Set the shared Host/firmware device token
@@ -115,6 +118,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --provision)
       DO_PROVISION=1
+      ;;
+    --rotate-token)
+      ROTATE_TOKEN=1
       ;;
     --wifi-ssid)
       [ "$#" -ge 2 ] || fail "--wifi-ssid requires a value"
@@ -245,12 +251,23 @@ ensure_python() {
 }
 
 ensure_token() {
+  if [ "$ROTATE_TOKEN" -eq 1 ]; then
+    [ -z "$DEVICE_TOKEN" ] || fail "--rotate-token cannot be combined with --token or TASKHUB_DEVICE_TOKEN"
+    DEVICE_TOKEN="$(random_token)"
+    [ -n "$DEVICE_TOKEN" ] || fail "could not generate a secure device token"
+    return
+  fi
+
   if [ -n "$DEVICE_TOKEN" ]; then
+    [ "$DEVICE_TOKEN" != "dev-token" ] || fail "dev-token is not allowed; use --rotate-token to generate a secure token"
     return
   fi
 
   if [ -s "$TOKEN_FILE" ]; then
     DEVICE_TOKEN="$(cat "$TOKEN_FILE")"
+    if [ "$DEVICE_TOKEN" = "dev-token" ]; then
+      warn "the installed Host still uses dev-token; connect the StickS3 and rerun with --rotate-token --provision"
+    fi
     return
   fi
 
@@ -262,9 +279,7 @@ ensure_token() {
     DEVICE_TOKEN="$(random_token)"
   fi
 
-  if [ -z "$DEVICE_TOKEN" ]; then
-    DEVICE_TOKEN="dev-token"
-  fi
+  [ -n "$DEVICE_TOKEN" ] || fail "could not generate a secure device token"
 }
 
 configure_firmware() {
@@ -279,6 +294,12 @@ configure_firmware() {
   local current_ssid current_password
   current_ssid="$(read_define WIFI_SSID "$SECRETS" || true)"
   current_password="$(read_define WIFI_PASSWORD "$SECRETS" || true)"
+  if [ -z "$WIFI_SSID" ] && [ -n "$current_ssid" ] && [ "$current_ssid" != "your-wifi-ssid" ]; then
+    WIFI_SSID="$current_ssid"
+  fi
+  if [ -z "$WIFI_PASSWORD" ] && [ -n "$current_password" ] && [ "$current_password" != "your-wifi-password" ]; then
+    WIFI_PASSWORD="$current_password"
+  fi
 
   if [ -z "$WIFI_SSID" ] && [ "$NON_INTERACTIVE" -eq 0 ] && {
     [ -z "$current_ssid" ] || [ "$current_ssid" = "your-wifi-ssid" ]; }; then
@@ -321,6 +342,19 @@ install_host() {
     printf '%s' "$DEVICE_TOKEN" > "$TOKEN_FILE"
   fi
   "$ROOT/host/install_task_hub.sh"
+}
+
+provision_device() {
+  local args
+  args=(--skip-host --device-id "$DEVICE_ID")
+  [ "$NON_INTERACTIVE" -eq 1 ] && args+=(--non-interactive)
+  [ -n "$TASKHUB_LANG" ] && args+=(--lang "$TASKHUB_LANG")
+  [ -n "$TASKHUB_VOICE_SEND" ] && args+=(--voice-send "$TASKHUB_VOICE_SEND")
+  TASKHUB_WIFI_SSID="$WIFI_SSID" \
+    TASKHUB_WIFI_PASSWORD="$WIFI_PASSWORD" \
+    TASKHUB_DEVICE_TOKEN="$DEVICE_TOKEN" \
+    "$ROOT/scripts/provision_sticks3.sh" "${args[@]}"
+  PROVISION_DONE=1
 }
 
 install_arduino_deps() {
@@ -367,6 +401,12 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 ensure_python
+[ "$ROTATE_TOKEN" -eq 0 ] || [ "$DO_PROVISION" -eq 1 ] || [ "$DO_UPLOAD" -eq 1 ] || \
+  fail "--rotate-token requires --provision or --upload so the StickS3 is updated before the Host"
+[ "$ROTATE_TOKEN" -eq 0 ] || [ "$DO_HOST" -eq 1 ] || \
+  fail "--rotate-token requires Host installation so both sides receive the new token"
+[ "$ROTATE_TOKEN" -eq 0 ] || [ "$DO_UPLOAD" -eq 0 ] || [ "$DO_FIRMWARE" -eq 1 ] || \
+  fail "--rotate-token --upload requires firmware configuration"
 ensure_token
 TASKHUB_LANG="$(printf '%s' "$TASKHUB_LANG" | tr '[:upper:]' '[:lower:]')"
 case "$TASKHUB_LANG" in
@@ -379,12 +419,24 @@ if [ "$DO_FIRMWARE" -eq 1 ]; then
   configure_firmware
 fi
 
-if [ "$DO_HOST" -eq 1 ]; then
-  install_host
-fi
-
 if [ "$DO_DEPS" -eq 1 ]; then
   install_arduino_deps
+fi
+
+# During rotation, update the physical device before replacing the Host token.
+# A failed USB operation therefore leaves the current installation connected.
+if [ "$ROTATE_TOKEN" -eq 1 ] && [ "$DO_UPLOAD" -eq 1 ]; then
+  check_firmware_tools
+  "$ROOT/firmware/flash_task_monitor.sh" all
+  DO_COMPILE=0
+fi
+
+if [ "$ROTATE_TOKEN" -eq 1 ] && [ "$DO_PROVISION" -eq 1 ]; then
+  provision_device
+fi
+
+if [ "$DO_HOST" -eq 1 ]; then
+  install_host
 fi
 
 if [ "$DO_COMPILE" -eq 1 ]; then
@@ -396,15 +448,8 @@ if [ "$DO_COMPILE" -eq 1 ]; then
   fi
 fi
 
-if [ "$DO_PROVISION" -eq 1 ]; then
-  args=(--skip-host --device-id "$DEVICE_ID")
-  [ "$NON_INTERACTIVE" -eq 1 ] && args+=(--non-interactive)
-  [ -n "$WIFI_SSID" ] && args+=(--wifi-ssid "$WIFI_SSID")
-  [ -n "$WIFI_PASSWORD" ] && args+=(--wifi-password "$WIFI_PASSWORD")
-  [ -n "$DEVICE_TOKEN" ] && args+=(--token "$DEVICE_TOKEN")
-  [ -n "$TASKHUB_LANG" ] && args+=(--lang "$TASKHUB_LANG")
-  [ -n "$TASKHUB_VOICE_SEND" ] && args+=(--voice-send "$TASKHUB_VOICE_SEND")
-  "$ROOT/scripts/provision_sticks3.sh" "${args[@]}"
+if [ "$DO_PROVISION" -eq 1 ] && [ "$PROVISION_DONE" -eq 0 ]; then
+  provision_device
 fi
 
 print_summary

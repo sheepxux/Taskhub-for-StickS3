@@ -5,7 +5,7 @@
 [English](README.md) | 简体中文 | [安装说明](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v2.1.0-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v2.2.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#隐私与安全)
@@ -13,7 +13,7 @@
 
 TaskHub for StickS3 可以把 M5StickS3 变成一个小型 AI Agent 状态屏。
 Mac 上的 TaskHub Host 会读取 Codex、Claude Code、OpenClaw、Manus、
-Perplexity、Gemini、Lovable 等工具的本地任务状态，发现同一局域网内
+Perplexity、Gemini、Lovable、Kimi、WorkBuddy、Grok 等工具的本地任务状态，发现同一局域网内
 其他授权 Host，然后把精简后的任务列表通过 Wi-Fi 发送给 StickS3。
 
 设备可以显示哪个任务正在运行、哪个任务正在等待你回复、哪些任务刚完成，
@@ -57,13 +57,13 @@ TaskHub 的目标是给这些后台任务一个实体状态面板：
 
 ## 当前版本
 
-当前版本是 `v2.1.0`，适合作为开发者和 maker 的公开版本使用。
+当前版本是 `v2.2.0`，适合作为开发者和 maker 的公开版本使用。
 
 已经完成的核心链路包括：Mac Host、StickS3 固件、Wi-Fi 发现、精简任务显示、
 按钮操作、语音输入、深度睡眠、多 Mac 局域网聚合，以及 Host/多设备诊断页面。
 
 需要注意：不同 AI 工具开放的本地信息不同。Codex、Claude Code、OpenClaw
-这类工具可以做到更细的任务/回合追踪；Perplexity、Gemini、Lovable 这类
+这类工具可以做到更细的任务/回合追踪；Perplexity、Gemini、Lovable、Kimi、Grok 这类
 App 或网页工具，有些状态只能通过本地活动、进程、缓存、浏览器标题或可见
 界面信号推断。
 
@@ -74,6 +74,7 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | StickS3 固件 | Ready | 原生 240x135 UI、按钮、Wi-Fi 发现、深度睡眠 |
 | M5Burner 公开固件 | Ready | 不编译本机 secrets，首次使用通过 USB 写入 NVS 配置 |
 | macOS Host | Ready | LaunchAgent 安装、本地 HTTP API、UDP 发现 |
+| macOS Host 安装包 | Preview | 可构建不含隐私配置的 `.pkg`；公开分发仍需 Developer ID 签名和公证 |
 | Host 诊断 | Ready | `/diagnostics` 汇总 adapter、语音、权限、缓存和 peer 状态，不暴露 token 或任务标题 |
 | 多 Mac 聚合 | Ready | 同 token Host 可互相发现并合并任务 |
 | BtnB 打开来源 | Ready | 本机任务打开本机 App，远程任务转发到来源 Mac |
@@ -90,6 +91,10 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | Perplexity 适配器 | Activity | 本地 App/浏览器活动，Computer 任务标题不保证稳定 |
 | Gemini 适配器 | Activity | App/网页活动，可见浏览器标题 |
 | Lovable 适配器 | Activity | App/网页活动、renderer CPU、可见生成控件 |
+| Kimi 适配器 | Activity | 本地会话状态结合 daemon 活跃回合及网页标题；仅打开 App 不算 RUN |
+| WorkBuddy 适配器 | Detailed | 本地会话标题、工具调用、RUN/WAIT/DONE、文件夹及可用 token 信息 |
+| Grok 适配器 | Activity | 网页/Safari App 标题和可见停止控件；仅打开 App 不算 RUN |
+| 浏览器桥接 | Optional | `extension/` 读取 Gemini/Grok/Kimi/Lovable/Perplexity 的网页任务标题并推送给 Host |
 
 ## 语音模式
 
@@ -148,6 +153,9 @@ flowchart LR
     Perplexity["Perplexity\nlocal app/browser activity"]
     Gemini["Gemini\nlocal app/browser activity"]
     Lovable["Lovable\napp + browser tabs"]
+    Kimi["Kimi\ndesktop + browser UI"]
+    WorkBuddy["WorkBuddy\nlocal session events"]
+    Grok["Grok\nSafari app + browser UI"]
   end
 
   subgraph "M5StickS3"
@@ -165,6 +173,9 @@ flowchart LR
   Perplexity --> Host
   Gemini --> Host
   Lovable --> Host
+  Kimi --> Host
+  WorkBuddy --> Host
+  Grok --> Host
   Host -- "UDP discovery response" --> Firmware
   Firmware -- "GET /tasks?format=stick" --> Host
   Firmware -- "POST /tasks/:id/open" --> Host
@@ -188,6 +199,16 @@ git clone https://github.com/sheepxux/Taskhub-for-StickS3.git
 cd Taskhub-for-StickS3
 ./scripts/setup.sh
 ```
+
+也可以在 macOS 上构建一个不包含 Wi-Fi、Token、模型和本机路径的开发版
+Host 安装包：
+
+```bash
+./packaging/macos/build_host_pkg.sh
+```
+
+公开分发前仍需使用 Developer ID Installer 证书签名并完成 Apple 公证，详见
+[`packaging/macos/README.md`](packaging/macos/README.md)。
 
 如果已经安装好 `arduino-cli`，可以直接编译固件：
 
@@ -369,6 +390,9 @@ TaskHub 只读取本地数据。准确性取决于对应 AI 工具是否暴露�
 | Perplexity | App/浏览器活动，精确任务标题不保证 |
 | Gemini | App/浏览器活动，可见 tab 标题 |
 | Lovable | App/浏览器活动、项目 tab、renderer CPU、可见生成控件 |
+| Kimi | 本地 `running/completed` 状态结合 daemon 活跃回合，并读取浏览器标题 |
+| WorkBuddy | 本地会话标题、文件夹、工具调用、完成状态和可用 token 信息 |
+| Grok | Safari Web App/浏览器标题、可见停止控件；配合浏览器桥接时标题更准确 |
 
 如果某个 App 只是打开着但没有真正生成或执行，TaskHub 应显示 `REC` 或
 `IDLE`，而不是 `RUN`。
@@ -427,14 +451,14 @@ extension/               Chrome/Edge Web Bridge
 
 ## Roadmap
 
-- 更易用的 macOS 安装器。
+- 为当前 macOS Host 安装包完成 Developer ID 签名和 Apple 公证。
 - 录制本地元数据 fixture，扩展适配器回归测试。
-- 加强 Gemini、Lovable、Perplexity 的浏览器任务提取。
+- 随网页结构变化持续补充浏览器任务提取和录制 fixture。
 - 区别于 WAIT 的 FAIL 提醒音，以及可选的外接蜂鸣器。
 - 面向非开发者的一次性引导流程。
 
 ## Release
 
-当前版本：`v2.1.0`。
+当前版本：`v2.2.0`。
 
 更新记录见 [CHANGELOG.md](CHANGELOG.md)。

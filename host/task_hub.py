@@ -31,14 +31,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from taskhub_config import (
     ACTIVE_MINUTES,
+    ADAPTER_MAX_WORKERS,
     CLAUDE_DONE_WINDOW_MS,
     CLAUDE_HUMAN_INPUT_TOOLS,
+    CLAUDE_MAX_TRANSCRIPTS,
     CLAUDE_RUNNING_STALE_MS,
     CLAUDE_TERMINAL_STOP_REASONS,
     CODEX_DONE_WINDOW_MS,
@@ -53,6 +56,9 @@ from taskhub_config import (
     DEVICE_NAME,
     GEMINI_ACTIVITY_STALE_MS,
     GEMINI_BROWSER_POLL_MS,
+    KIMI_LOCAL_RUNNING_STALE_MS,
+    KIMI_RENDERER_RUN_CPU,
+    KIMI_RUNNING_HOLD_MS,
     LOVABLE_ACTIVITY_STALE_MS,
     LOVABLE_BROWSER_POLL_MS,
     LOVABLE_DOMAINS,
@@ -62,6 +68,7 @@ from taskhub_config import (
     MANUS_RUNNING_STALE_MS,
     MANUS_TERMINAL_STATUS_CODES,
     OPENCLAW_FAILED_TTL_MS,
+    OPENCLAW_CLI_FALLBACK,
     MAX_TASKS,
     OPENCLAW_RUNNING_STALE_MS,
     PEER_CACHE_MS,
@@ -78,6 +85,10 @@ from taskhub_config import (
     TASK_HUB_VERSION,
     TASK_STICK_STALE_CACHE_MS,
     TRANSCRIPT_CACHE_MAX,
+    WEB_AI_ACTIVITY_STALE_MS,
+    WORKBUDDY_DONE_WINDOW_MS,
+    WORKBUDDY_MAX_SESSIONS,
+    WORKBUDDY_RUNNING_STALE_MS,
 )
 
 try:
@@ -97,6 +108,7 @@ _CLAUDE_TRANSCRIPT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # Same idea for Codex session rollouts; codex_usage_records() walks up to 80
 # *.jsonl files per /tasks request, so memoising makes idle sessions free.
 _CODEX_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_WORKBUDDY_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # ThreadingHTTPServer serves /tasks from multiple threads, and the bounded-cache
 # helpers below mutate the OrderedDict in several steps (set → move_to_end →
 # popitem). Those sequences are not atomic, so guard every access with a shared
@@ -291,6 +303,18 @@ def ps_commands() -> List[str]:
     return out.splitlines() if code == 0 else []
 
 
+def process_cwd(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    code, out, _ = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=0.7)
+    if code != 0:
+        return ""
+    for line in out.splitlines():
+        if line.startswith("n/"):
+            return line[1:]
+    return ""
+
+
 def app_running(commands: Iterable[str], bundle_path_fragment: str, binary_name: str) -> bool:
     needle = bundle_path_fragment.lower()
     binary = f"/MacOS/{binary_name}".lower()
@@ -425,6 +449,45 @@ def window_titles(app_name: str) -> List[str]:
     return [part.strip() for part in out.replace("\n", ",").split(",") if part.strip()]
 
 
+def accessibility_labels(process_name: str, limit: int = 160) -> List[str]:
+    """Read visible control labels from a desktop web app.
+
+    A visible Stop control is a much stronger running signal than the app
+    process itself. Fail closed when Accessibility permission is unavailable.
+    """
+    if not process_name:
+        return []
+    safe_process = process_name.replace('"', '\\"')
+    script = f'''
+set AppleScript's text item delimiters to " | "
+tell application "System Events"
+  if not (exists process "{safe_process}") then return ""
+  tell process "{safe_process}"
+    set labels to {{}}
+    try
+      set uiItems to entire contents of front window
+      repeat with el in uiItems
+        try
+          set n to name of el
+          if n is not missing value and n is not "" then set end of labels to (n as text)
+        end try
+        if (count of labels) > {max(10, limit)} then exit repeat
+      end repeat
+    end try
+    return labels as text
+  end tell
+end tell
+'''
+    code, out, _ = run_osascript(script, timeout=1.5)
+    if code != 0 or not out.strip():
+        return []
+    return [
+        item.strip()
+        for item in out.split(" | ")
+        if item.strip() and item.strip().lower() != "missing value"
+    ]
+
+
 def safe_int(value: Any) -> int:
     try:
         return int(value)
@@ -489,6 +552,16 @@ def extract_text(value: Any) -> str:
             if isinstance(value.get(key), str):
                 return str(value.get(key))
     return ""
+
+
+def task_title_text(value: Any, fallback: str = "") -> str:
+    text = re.sub(r"\s+", " ", extract_text(value) if not isinstance(value, str) else value).strip()
+    text = re.sub(r"^<[^>]+>\s*", "", text).strip()
+    if not text:
+        return fallback
+    if len(text) > 96:
+        return text[:93].rstrip() + "..."
+    return text
 
 
 def tool_use_names(value: Any) -> List[str]:
@@ -687,6 +760,10 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
     latest_turn_event_type = ""
     latest_assistant_text_ms = 0
     latest_assistant_text = ""
+    session_id = ""
+    cwd = ""
+    custom_title = ""
+    first_user_text = ""
 
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -701,6 +778,12 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
                 item_type = str(item.get("type") or "")
                 role = str(message.get("role") or item.get("role") or "")
                 stop_reason = str(message.get("stop_reason") or item.get("stop_reason") or "")
+                session_id = str(item.get("sessionId") or session_id)
+                cwd = str(item.get("cwd") or cwd)
+                if item_type == "custom-title":
+                    custom_title = task_title_text(item.get("customTitle"), custom_title)
+                if (role == "user" or item_type == "user") and not first_user_text:
+                    first_user_text = task_title_text(message.get("content") or item.get("content"))
 
                 if event_ms:
                     latest_event_ms = max(latest_event_ms, event_ms)
@@ -768,6 +851,10 @@ def _scan_claude_transcript(path: str) -> Optional[Dict[str, Any]]:
         "latest_non_human_tool_use_ms": latest_non_human_tool_use_ms,
         "latest_stop_reason": latest_stop_reason,
         "latest_request_id": latest_request_id,
+        "session_id": session_id,
+        "cwd": cwd,
+        "custom_title": custom_title,
+        "first_user_text": first_user_text,
         "active_turn": active_turn,
         # WAIT means "the user must answer something", which is only true for an
         # explicit, unanswered AskUserQuestion tool request. A turn that merely
@@ -820,6 +907,10 @@ def claude_session_metrics(
         "latest_non_human_tool_use_ms": scan["latest_non_human_tool_use_ms"],
         "latest_stop_reason": scan["latest_stop_reason"],
         "latest_request_id": scan["latest_request_id"],
+        "session_id": scan.get("session_id", ""),
+        "cwd": scan.get("cwd", ""),
+        "custom_title": scan.get("custom_title", ""),
+        "first_user_text": scan.get("first_user_text", ""),
         "active_turn": scan["active_turn"],
         "waiting_for_user": scan.get("waiting_for_user", False),
     }
@@ -957,8 +1048,11 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
                     updated_ms = iso_to_ms(payload.get("timestamp")) or updated_ms
                 elif payload_type == "user_message":
                     latest_user_ms = event_ms or latest_user_ms
-                elif payload_type == "task_started" or item_type == "turn_context" or payload_type == "turn_context":
-                    latest_turn_id = str(payload.get("turn_id") or item.get("turn_id") or latest_turn_id)
+                elif payload_type in {"task_started", "turn_started"} or item_type == "turn_context" or payload_type == "turn_context":
+                    turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
+                    latest_turn_id = str(
+                        payload.get("turn_id") or turn.get("id") or item.get("turn_id") or latest_turn_id
+                    )
                     latest_turn_ms = safe_ms(payload.get("started_at")) or event_ms or latest_turn_ms
                     updated_ms = latest_turn_ms or event_ms or updated_ms
                 elif payload_type == "agent_message":
@@ -997,11 +1091,24 @@ def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
                     primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
                     rate_percent = safe_float(primary.get("used_percent"))
                     updated_ms = iso_to_ms(item.get("timestamp")) or updated_ms
-                elif payload_type in {"task_complete", "turn_aborted"}:
-                    if payload_type == "task_complete":
+                elif payload_type in {
+                    "task_complete",
+                    "turn_completed",
+                    "turn_aborted",
+                    "turn_interrupted",
+                    "turn_failed",
+                }:
+                    if payload_type in {"task_complete", "turn_completed"}:
                         turns += 1
-                    latest_completed_turn_id = str(payload.get("turn_id") or latest_completed_turn_id)
-                    latest_completed_ms = safe_ms(payload.get("completed_at")) or latest_completed_ms
+                    turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
+                    latest_completed_turn_id = str(
+                        payload.get("turn_id") or turn.get("id") or latest_completed_turn_id
+                    )
+                    latest_completed_ms = (
+                        safe_ms(payload.get("completed_at") or turn.get("completed_at"))
+                        or event_ms
+                        or latest_completed_ms
+                    )
                     updated_ms = latest_completed_ms or updated_ms
     except OSError:
         return None
@@ -1346,7 +1453,7 @@ class OpenClawAdapter:
         tasks.extend(self._list_task_runs())
         tasks.extend(self._list_sessions())
 
-        if not tasks and self.bin and os.path.exists(self.bin):
+        if not tasks and OPENCLAW_CLI_FALLBACK and self.bin and os.path.exists(self.bin):
             tasks.extend(self._list_cli_fallback())
 
         return tasks
@@ -1644,14 +1751,30 @@ class ClaudeAdapter:
         commands = commands or ps_commands()
         app_is_running = app_running(commands, "/Applications/Claude.app", "Claude")
         running_resumes = set()
+        cli_cwds = set()
+        cli_process_count = 0
         # Detect any Claude Code process by --resume flag. Case-insensitive
         # because the active binary lives under `claude.app/` (lowercase) while
         # only the launcher wrapper sits in `Claude.app/`; the old anchored
         # match silently dropped the bare claude.app process (≈half the time).
         claude_re = re.compile(r"\bclaude\b", re.IGNORECASE)
         for line in commands:
-            if claude_re.search(line) and "--resume" in line:
+            low = line.lower()
+            if not claude_re.search(line):
+                continue
+            is_resume = "--resume" in line
+            looks_like_cli = bool(re.search(r"(?:^|\s)(?:\S*/)?claude(?:\s|$)", line, re.IGNORECASE))
+            if "helper" in low or ("/applications/claude.app/contents/macos/claude" in low and not is_resume):
+                looks_like_cli = False
+            if not looks_like_cli:
+                continue
+            cli_process_count += 1
+            if is_resume:
                 running_resumes.update(re.findall(r"--resume\s+([^\s]+)", line))
+            pid_match = re.match(r"\s*(\d+)", line)
+            cwd = process_cwd(safe_int(pid_match.group(1)) if pid_match else 0)
+            if cwd:
+                cli_cwds.add(os.path.realpath(cwd))
 
         roots = [
             os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions"),
@@ -1778,6 +1901,72 @@ class ClaudeAdapter:
                     )
                 )
 
+        # Claude Code CLI sessions are not guaranteed to have a matching
+        # Claude Desktop local_*.json record. Scan recent top-level project
+        # transcripts directly, preserving custom /rename titles when present.
+        known_ids.update(running_resumes)
+        direct_pattern = os.path.expanduser("~/.claude/projects/*/*.jsonl")
+        direct_files = sorted(glob.glob(direct_pattern), key=os.path.getmtime, reverse=True)
+        for path in direct_files[: max(CLAUDE_MAX_TRANSCRIPTS * 4, CLAUDE_MAX_TRANSCRIPTS)]:
+            scan = _scan_claude_transcript(path)
+            if not scan:
+                continue
+            session_id = str(scan.get("session_id") or os.path.splitext(os.path.basename(path))[0])
+            if session_id in known_ids:
+                continue
+            updated = safe_int(scan.get("latest_event_ms"))
+            cwd = str(scan.get("cwd") or "")
+            real_cwd = os.path.realpath(cwd) if cwd else ""
+            process_running = bool(real_cwd and real_cwd in cli_cwds)
+            if not process_running and updated and updated < cutoff:
+                continue
+            metrics = claude_session_metrics(session_id)
+            if not metrics.get("transcript_found"):
+                metrics = {
+                    **scan,
+                    "transcript_found": True,
+                    "turns": safe_int(scan.get("terminal_turns") or scan.get("request_count")),
+                    "usage": build_usage(
+                        total_tokens=safe_int(scan.get("total_tokens")),
+                        turns=safe_int(scan.get("terminal_turns") or scan.get("request_count")),
+                        fields={"source": "claude-transcript", **(scan.get("fields") or {})},
+                    ),
+                }
+            status = claude_status(metrics, updated, process_running=process_running)
+            if status == "idle" and not process_running:
+                continue
+            title = task_title_text(
+                scan.get("custom_title") or scan.get("first_user_text"),
+                folder_label(cwd) or "Claude Code session",
+            )
+            tasks.append(
+                task(
+                    task_id=stable_id("claude-cli", session_id),
+                    source=self.source,
+                    title=title,
+                    status=status,
+                    updated_ms=updated or None,
+                    subtitle=claude_subtitle(metrics, cwd, "Claude Code CLI"),
+                    detail={
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "process_running": process_running,
+                        "cli_process_count": cli_process_count,
+                        "active_turn": bool(metrics.get("active_turn")),
+                        "waiting_for_user": bool(metrics.get("waiting_for_user")),
+                        "turn_state": claude_turn_state(metrics),
+                        "latest_stop_reason": metrics.get("latest_stop_reason"),
+                        "metadata_source": "claude-code-transcript",
+                    },
+                    usage=metrics.get("usage") or {},
+                    open_action={"type": "app", "target": "com.anthropic.claudefordesktop"},
+                    needs_attention=status == "waiting",
+                )
+            )
+            known_ids.add(session_id)
+            if len([item for item in tasks if item.get("detail", {}).get("metadata_source") == "claude-code-transcript"]) >= CLAUDE_MAX_TRANSCRIPTS:
+                break
+
         if not tasks and app_is_running:
             title = window_titles("Claude")
             tasks.append(
@@ -1805,10 +1994,16 @@ class CodexAdapter:
         commands = commands or ps_commands()
         tasks: List[Task] = []
         usage_records = codex_records()
-        app_is_running = app_running(commands, "/Applications/Codex.app", "Codex")
+        app_is_running = app_running(commands, "/Applications/Codex.app", "Codex") or any(
+            "codex framework.framework" in line.lower() or "codex-code-mode-host" in line.lower()
+            for line in commands
+        )
         # Case-insensitive: Codex CLI installs may render the path with mixed
         # case depending on launcher; same lesson learned from the Claude fix.
-        app_server_count = sum(ci_contains("Codex.app/Contents/Resources/codex app-server", line) for line in commands)
+        app_server_count = sum(
+            "/resources/codex" in line.lower() and " app-server" in line.lower()
+            for line in commands
+        )
         titles = window_titles("Codex") if app_is_running else []
         window_title = titles[0] if titles and titles[0] != "Codex" else "Codex"
         seen_ids = set()
@@ -1940,6 +2135,515 @@ class CodexAdapter:
                 )
             )
         return tasks
+
+
+def _scan_workbuddy_session(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cache_key = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = bounded_cache_get(_WORKBUDDY_SESSION_CACHE, path, cache_key)
+    if cached:
+        return cached
+
+    session_id = ""
+    cwd = ""
+    ai_title = ""
+    first_user_text = ""
+    latest_event_ms = 0
+    latest_user_ms = 0
+    latest_user_seq = 0
+    latest_final_ms = 0
+    latest_final_seq = 0
+    latest_seq = 0
+    latest_kind = ""
+    pending_calls: Dict[str, Dict[str, Any]] = {}
+    fields = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for seq, line in enumerate(fh, 1):
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                item_type = str(item.get("type") or "")
+                role = str(item.get("role") or "")
+                event_ms = safe_ms(item.get("timestamp")) or 0
+                session_id = str(item.get("sessionId") or session_id)
+                cwd = str(item.get("cwd") or cwd)
+                if event_ms:
+                    latest_event_ms = max(latest_event_ms, event_ms)
+
+                if item_type == "ai-title":
+                    ai_title = task_title_text(item.get("aiTitle"), ai_title)
+                elif item_type == "message" and role == "user":
+                    latest_user_ms = event_ms or latest_user_ms
+                    latest_user_seq = seq
+                    latest_seq = seq
+                    latest_kind = "user"
+                    if not first_user_text:
+                        first_user_text = task_title_text(item.get("content"))
+                elif item_type == "message" and role == "assistant":
+                    latest_seq = seq
+                    latest_kind = "assistant"
+                    if str(item.get("status") or "").lower() in {"completed", "done", "success"}:
+                        latest_final_ms = event_ms or latest_final_ms
+                        latest_final_seq = seq
+                elif item_type == "function_call":
+                    call_id = str(item.get("callId") or item.get("id") or f"seq-{seq}")
+                    pending_calls[call_id] = {
+                        "name": str(item.get("name") or ""),
+                        "updated_ms": event_ms,
+                        "seq": seq,
+                    }
+                    latest_seq = seq
+                    latest_kind = "function_call"
+                elif item_type == "function_call_result":
+                    call_id = str(item.get("callId") or "")
+                    if call_id:
+                        pending_calls.pop(call_id, None)
+                    latest_seq = seq
+                    latest_kind = "function_call_result"
+                elif item_type == "reasoning":
+                    latest_seq = seq
+                    latest_kind = "reasoning"
+
+                provider = item.get("providerData") if isinstance(item.get("providerData"), dict) else {}
+                raw_usage = provider.get("usage") if isinstance(provider.get("usage"), dict) else {}
+                for field in fields:
+                    fields[field] += safe_int(raw_usage.get(field))
+    except OSError:
+        return None
+
+    # WorkBuddy can omit a function_call_result from the transcript even after
+    # the user answered or the assistant completed a later turn. Calls older
+    # than either event belong to an earlier resolved turn and must not keep
+    # the device pinned in RUN/WAIT.
+    resolved_floor_seq = max(latest_user_seq, latest_final_seq)
+    pending_calls = {
+        call_id: item
+        for call_id, item in pending_calls.items()
+        if safe_int(item.get("seq")) > resolved_floor_seq
+    }
+    pending_names = [str(item.get("name") or "") for item in pending_calls.values()]
+    human_input_request_ms = max(
+        (
+            safe_int(item.get("updated_ms"))
+            for item in pending_calls.values()
+            if str(item.get("name") or "").lower()
+            in {"askuserquestion", "ask_user_question"}
+        ),
+        default=0,
+    )
+    waiting_for_user = is_unanswered_human_input_request(
+        human_input_request_ms,
+        latest_user_ms,
+    )
+    active_turn = bool(
+        pending_calls
+        or latest_user_ms > latest_final_ms
+        or (latest_seq > latest_final_seq and latest_kind in {"reasoning", "function_call", "function_call_result"})
+    )
+    usage_total = sum(fields.values())
+    scan = {
+        "_key": cache_key,
+        "session_id": session_id,
+        "cwd": cwd,
+        "ai_title": ai_title,
+        "first_user_text": first_user_text,
+        "latest_event_ms": latest_event_ms or int(st.st_mtime * 1000),
+        "latest_user_ms": latest_user_ms,
+        "latest_final_ms": latest_final_ms,
+        "latest_human_input_request_ms": human_input_request_ms,
+        "latest_kind": latest_kind,
+        "pending_calls": len(pending_calls),
+        "pending_names": pending_names,
+        "active_turn": active_turn,
+        "waiting_for_user": waiting_for_user,
+        "usage": build_usage(
+            total_tokens=usage_total,
+            fields={"source": "workbuddy-transcript", **fields},
+        ) if usage_total else {},
+    }
+    bounded_cache_set(_WORKBUDDY_SESSION_CACHE, path, scan)
+    return scan
+
+
+def workbuddy_status(scan: Dict[str, Any], process_running: bool = False) -> str:
+    latest = safe_int(scan.get("latest_event_ms"))
+    if scan.get("waiting_for_user"):
+        return "waiting"
+    if scan.get("active_turn") and latest and now_ms() - latest < WORKBUDDY_RUNNING_STALE_MS:
+        return "running"
+    completed = safe_int(scan.get("latest_final_ms"))
+    if not scan.get("active_turn") and completed and now_ms() - completed < WORKBUDDY_DONE_WINDOW_MS:
+        return "done"
+    if latest and now_ms() - latest < ACTIVE_MINUTES * 60 * 1000:
+        return "recent"
+    return "recent" if process_running else "idle"
+
+
+class WorkBuddyAdapter:
+    source = "WorkBuddy"
+
+    def __init__(self) -> None:
+        self.root = os.path.expanduser("~/.workbuddy")
+        self.bundle_id = "com.workbuddy.workbuddy"
+
+    def _live_sessions(self, commands: List[str]) -> Dict[str, Dict[str, Any]]:
+        live: Dict[str, Dict[str, Any]] = {}
+        command_text = "\n".join(commands)
+        for path in glob.glob(os.path.join(self.root, "sessions", "*.json")):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    item = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            session_id = str(item.get("sessionId") or "")
+            pid = safe_int(item.get("pid"))
+            if not session_id or not pid or not re.search(rf"^\s*{pid}\s", command_text, re.MULTILINE):
+                continue
+            live[session_id] = item
+        return live
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        if not os.path.isdir(self.root):
+            return []
+        app_is_running = app_running(commands, "/Applications/WorkBuddy.app", "Electron")
+        live = self._live_sessions(commands)
+        cutoff = now_ms() - ACTIVE_MINUTES * 60 * 1000
+        paths = glob.glob(os.path.join(self.root, "projects", "*", "*.jsonl"))
+        paths = sorted(paths, key=os.path.getmtime, reverse=True)
+        tasks: List[Task] = []
+        seen = set()
+        for path in paths[: max(WORKBUDDY_MAX_SESSIONS * 4, WORKBUDDY_MAX_SESSIONS)]:
+            scan = _scan_workbuddy_session(path)
+            if not scan:
+                continue
+            session_id = str(scan.get("session_id") or os.path.splitext(os.path.basename(path))[0])
+            if session_id in seen:
+                continue
+            updated = safe_int(scan.get("latest_event_ms"))
+            process_running = session_id in live
+            if not process_running and updated and updated < cutoff:
+                continue
+            status = workbuddy_status(scan, process_running=process_running)
+            cwd = str(scan.get("cwd") or (live.get(session_id) or {}).get("cwd") or "")
+            title = task_title_text(
+                scan.get("ai_title") or scan.get("first_user_text"),
+                folder_label(cwd) or "WorkBuddy task",
+            )
+            state = "wait" if status == "waiting" else "active" if status == "running" else "done" if status == "done" else "recent"
+            tasks.append(
+                task(
+                    task_id=stable_id("workbuddy", session_id),
+                    source=self.source,
+                    title=title,
+                    status=status,
+                    updated_ms=updated or None,
+                    subtitle=join_parts([folder_label(cwd), state]),
+                    detail={
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "process_running": process_running,
+                        "active_turn": bool(scan.get("active_turn")),
+                        "waiting_for_user": bool(scan.get("waiting_for_user")),
+                        "latest_human_input_request_at": ms_to_iso(
+                            safe_int(scan.get("latest_human_input_request_ms"))
+                        ),
+                        "pending_calls": safe_int(scan.get("pending_calls")),
+                        "latest_kind": scan.get("latest_kind"),
+                        "metadata_source": "workbuddy-transcript",
+                    },
+                    usage=scan.get("usage") or {},
+                    open_action={"type": "app", "target": self.bundle_id},
+                    needs_attention=status == "waiting",
+                )
+            )
+            seen.add(session_id)
+            if len(tasks) >= WORKBUDDY_MAX_SESSIONS:
+                break
+
+        if not tasks and app_is_running:
+            tasks.append(
+                task(
+                    task_id="workbuddy-app",
+                    source=self.source,
+                    title="WorkBuddy",
+                    status="recent",
+                    subtitle="app open · no active turn",
+                    open_action={"type": "app", "target": self.bundle_id},
+                )
+            )
+        return tasks
+
+
+class DesktopWebAiAdapter:
+    """Conservative fallback for Electron/Safari web apps.
+
+    Browser extension events remain the preferred source. This adapter reports
+    RUN only when a visible Stop control is present; an open app alone is REC.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        process_name: str,
+        bundle_fragment: str,
+        binary_name: str,
+        open_action: Dict[str, str],
+        activity_globs: Optional[List[str]] = None,
+        renderer_fragment: str = "",
+        renderer_run_cpu: float = 0.0,
+        running_hold_ms: int = 0,
+        status_file: str = "",
+        local_running_stale_ms: int = 0,
+        runtime_state_file: str = "",
+    ) -> None:
+        self.source = source
+        self.process_name = process_name
+        self.bundle_fragment = bundle_fragment
+        self.binary_name = binary_name
+        self.open_action = open_action
+        self.activity_globs = activity_globs or []
+        self.renderer_fragment = renderer_fragment
+        self.renderer_run_cpu = renderer_run_cpu
+        self.running_hold_ms = running_hold_ms
+        self.status_file = status_file
+        self.local_running_stale_ms = local_running_stale_ms
+        self.runtime_state_file = runtime_state_file
+        self._last_renderer_signal_ms = 0
+
+    def _activity_ms(self) -> int:
+        latest = 0
+        for pattern in self.activity_globs:
+            for path in glob.glob(pattern):
+                try:
+                    latest = max(latest, int(os.path.getmtime(path) * 1000))
+                except OSError:
+                    continue
+        return latest
+
+    def _running_signal(self, labels: List[str]) -> bool:
+        exact = {
+            "stop",
+            "stop generating",
+            "stop response",
+            "stop thinking",
+            "cancel generation",
+            "cancel response",
+            "停止",
+            "停止生成",
+            "停止回答",
+            "停止思考",
+        }
+        for label in labels:
+            text = re.sub(r"\s+", " ", label).strip().lower()
+            if text in exact or (text.startswith("stop ") and len(text) < 36):
+                return True
+        return False
+
+    def _renderer_cpu_percent(self) -> float:
+        if not self.renderer_fragment or self.renderer_run_cpu <= 0:
+            return 0.0
+        code, out, _ = run(["ps", "-axo", "pcpu=,command="], timeout=1.0)
+        if code != 0:
+            return 0.0
+        max_cpu = 0.0
+        for line in out.splitlines():
+            if self.renderer_fragment not in line:
+                continue
+            parts = line.strip().split(None, 1)
+            if parts:
+                max_cpu = max(max_cpu, safe_float(parts[0]))
+        return max_cpu
+
+    def _local_status_summary(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        if not self.status_file:
+            return counts
+        try:
+            with open(self.status_file, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return counts
+        if not isinstance(raw, dict):
+            return counts
+        for value in raw.values():
+            status = str(value or "").strip().lower()
+            if status:
+                counts[status] = counts.get(status, 0) + 1
+        return counts
+
+    def _status_file_mtime_ms(self) -> int:
+        if not self.status_file:
+            return 0
+        try:
+            return int(os.path.getmtime(self.status_file) * 1000)
+        except OSError:
+            return 0
+
+    def _runtime_state_summary(self) -> Dict[str, Any]:
+        if not self.runtime_state_file:
+            return {}
+        try:
+            with open(self.runtime_state_file, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            file_mtime_ms = int(os.path.getmtime(self.runtime_state_file) * 1000)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        kernel = raw.get("kernel") if isinstance(raw.get("kernel"), dict) else {}
+        active_turns = max(
+            safe_int(kernel.get("activeTurnCount")),
+            len(raw.get("activeKernelTurns") or [])
+            if isinstance(raw.get("activeKernelTurns"), list)
+            else 0,
+        )
+        active_tools = max(
+            safe_int(kernel.get("activeToolCallCount")),
+            len(raw.get("activeKernelToolCalls") or [])
+            if isinstance(raw.get("activeKernelToolCalls"), list)
+            else 0,
+        )
+        pending_interactions = max(
+            safe_int(kernel.get("pendingInteractionCount")),
+            len(raw.get("activePendingInteractions") or [])
+            if isinstance(raw.get("activePendingInteractions"), list)
+            else 0,
+        )
+        active_operations = (
+            len(raw.get("activeOperations") or [])
+            if isinstance(raw.get("activeOperations"), list)
+            else 0
+        )
+        return {
+            "updated_ms": iso_to_ms(raw.get("updatedAt")) or file_mtime_ms,
+            "kernel_status": str(kernel.get("status") or ""),
+            "active_turns": active_turns,
+            "active_tools": active_tools,
+            "pending_interactions": pending_interactions,
+            "active_operations": active_operations,
+        }
+
+    def _title(self, titles: List[str]) -> str:
+        for raw in titles:
+            title = re.sub(rf"\s+[-–—|]\s+{re.escape(self.source)}.*$", "", raw, flags=re.IGNORECASE)
+            title = task_title_text(title)
+            if title and title.lower() not in {self.source.lower(), "kimi-desktop", "web app"}:
+                return title
+        return self.source
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        running = app_running(commands, self.bundle_fragment, self.binary_name)
+        if not running:
+            return []
+        titles = window_titles(self.process_name)
+        labels = accessibility_labels(self.process_name)
+        accessibility_signal = self._running_signal(labels)
+        activity_ms = self._activity_ms()
+        current_ms = now_ms()
+        status_file_mtime_ms = self._status_file_mtime_ms()
+        local_status_fresh = bool(
+            status_file_mtime_ms
+            and self.local_running_stale_ms > 0
+            and current_ms - status_file_mtime_ms < self.local_running_stale_ms
+        )
+        local_statuses = self._local_status_summary()
+        local_running_record = any(
+            local_statuses.get(status, 0) > 0
+            for status in ("running", "active", "in_progress", "in-progress")
+        )
+        runtime_state = self._runtime_state_summary()
+        runtime_updated_ms = safe_int(runtime_state.get("updated_ms"))
+        runtime_fresh = bool(
+            runtime_updated_ms
+            and self.local_running_stale_ms > 0
+            and current_ms - runtime_updated_ms < self.local_running_stale_ms
+        )
+        runtime_active = runtime_fresh and any(
+            safe_int(runtime_state.get(key)) > 0
+            for key in ("active_turns", "active_tools", "active_operations")
+        )
+        runtime_waiting = runtime_fresh and safe_int(
+            runtime_state.get("pending_interactions")
+        ) > 0
+        runtime_supersedes_local = bool(
+            runtime_fresh
+            and status_file_mtime_ms
+            and runtime_updated_ms + 2000 >= status_file_mtime_ms
+        )
+        runtime_idle = runtime_supersedes_local and not runtime_active and not runtime_waiting
+        local_running_signal = local_running_record and local_status_fresh and not runtime_idle
+        renderer_cpu = self._renderer_cpu_percent()
+        if renderer_cpu >= self.renderer_run_cpu > 0 and local_running_signal:
+            self._last_renderer_signal_ms = current_ms
+        elif not local_running_signal:
+            self._last_renderer_signal_ms = 0
+        cpu_running_signal = bool(
+            self._last_renderer_signal_ms
+            and current_ms - self._last_renderer_signal_ms < self.running_hold_ms
+        )
+        running_signal = (
+            accessibility_signal or runtime_active or local_running_signal or cpu_running_signal
+        )
+        status = "waiting" if runtime_waiting else "running" if running_signal else "recent"
+        updated = activity_ms if activity_ms and now_ms() - activity_ms < WEB_AI_ACTIVITY_STALE_MS else now_ms()
+        return [
+            task(
+                task_id=f"{self.source.lower()}-app",
+                source=self.source,
+                title=self._title(titles),
+                status=status,
+                updated_ms=updated,
+                subtitle=(
+                    "app · waiting for input"
+                    if runtime_waiting
+                    else "app · generating"
+                    if running_signal
+                    else "app open · no active turn"
+                ),
+                detail={
+                    "app_running": True,
+                    "running_signal": running_signal,
+                    "accessibility_running_signal": accessibility_signal,
+                    "local_running_signal": local_running_signal,
+                    "local_running_record": local_running_record,
+                    "local_status_fresh": local_status_fresh,
+                    "status_file_mtime_ms": status_file_mtime_ms,
+                    "local_status_counts": local_statuses,
+                    "runtime_state_fresh": runtime_fresh,
+                    "runtime_state_supersedes_local": runtime_supersedes_local,
+                    "runtime_state": runtime_state,
+                    "cpu_running_signal": cpu_running_signal,
+                    "renderer_cpu_percent": round(renderer_cpu, 1),
+                    "renderer_cpu_threshold": self.renderer_run_cpu,
+                    "status_basis": (
+                        "visible stop control"
+                        if accessibility_signal
+                        else "runtime pending interaction"
+                        if runtime_waiting
+                        else "runtime active turn"
+                        if runtime_active
+                        else "runtime idle"
+                        if runtime_idle
+                        else "local conversation status"
+                        if local_running_signal
+                        else "renderer CPU"
+                        if cpu_running_signal
+                        else "app process only"
+                    ),
+                    "metadata_source": "desktop-web-app",
+                },
+                open_action=self.open_action,
+                needs_attention=runtime_waiting,
+            )
+        ]
 
 
 MANUS_LEVEL_HELPER = r"""
@@ -4576,14 +5280,50 @@ class Hub:
         self.discovery_port = discovery_port
         self.bind = bind
         self.external = ExternalTaskAdapter()
+        kimi_support = os.path.expanduser("~/Library/Application Support/kimi-desktop")
         self.adapters = [
             OpenClawAdapter(),
             ClaudeAdapter(),
             CodexAdapter(),
+            WorkBuddyAdapter(),
             ManusAdapter(),
             PerplexityAdapter(),
             GeminiAdapter(),
             LovableAdapter(),
+            DesktopWebAiAdapter(
+                "Kimi",
+                "Kimi",
+                "/Applications/Kimi.app",
+                "Kimi",
+                {"type": "app", "target": "com.moonshot.kimichat"},
+                [
+                    os.path.join(kimi_support, "Session Storage", "*"),
+                    os.path.join(kimi_support, "Local Storage", "leveldb", "*"),
+                    os.path.join(kimi_support, "IndexedDB", "https_www.kimi.com_0.indexeddb.leveldb", "*"),
+                    os.path.join(kimi_support, "kimi-agent", "conversation-statuses.json"),
+                    os.path.join(kimi_support, "kimi-agent", "conversation-context-usage.json"),
+                ],
+                "Kimi Helper (Renderer).app/Contents/MacOS/Kimi Helper (Renderer)",
+                KIMI_RENDERER_RUN_CPU,
+                KIMI_RUNNING_HOLD_MS,
+                os.path.join(kimi_support, "kimi-agent", "conversation-statuses.json"),
+                KIMI_LOCAL_RUNNING_STALE_MS,
+                os.path.join(
+                    kimi_support,
+                    "daimon-share",
+                    "daimon",
+                    "agents",
+                    "main",
+                    "runner.state.json",
+                ),
+            ),
+            DesktopWebAiAdapter(
+                "Grok",
+                "Web App",
+                "Grok.app",
+                "Web App",
+                {"type": "url", "target": "https://grok.com/"},
+            ),
             self.external,
         ]
         self.cache: List[Task] = []
@@ -4597,19 +5337,33 @@ class Hub:
         self.peer_manager = PeerManager(token, http_port, discovery_port)
 
     def _list_adapter_tasks(self, adapter: Any, commands: List[str]) -> List[Task]:
-        if isinstance(adapter, (ClaudeAdapter, CodexAdapter, ManusAdapter, PerplexityAdapter, GeminiAdapter, LovableAdapter, AppAdapter)):
+        if isinstance(
+            adapter,
+            (
+                ClaudeAdapter,
+                CodexAdapter,
+                WorkBuddyAdapter,
+                ManusAdapter,
+                PerplexityAdapter,
+                GeminiAdapter,
+                LovableAdapter,
+                DesktopWebAiAdapter,
+                AppAdapter,
+            ),
+        ):
             return list(adapter.list_tasks(commands))
         return list(adapter.list_tasks())
 
     def _scan_tasks(self, include_remote: bool = True) -> List[Task]:
         commands = ps_commands()
         tasks: List[Task] = []
-        for adapter in self.adapters:
+
+        def scan(adapter: Any) -> List[Task]:
             try:
-                tasks.extend(self._list_adapter_tasks(adapter, commands))
+                return self._list_adapter_tasks(adapter, commands)
             except Exception as exc:
                 traceback.print_exc()
-                tasks.append(
+                return [
                     task(
                         task_id=stable_id("adapter-error", adapter.source),
                         source=adapter.source,
@@ -4618,7 +5372,13 @@ class Hub:
                         subtitle=str(exc)[:96],
                         needs_attention=True,
                     )
-                )
+                ]
+
+        workers = min(ADAPTER_MAX_WORKERS, max(1, len(self.adapters)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="taskhub-adapter") as pool:
+            futures = [pool.submit(scan, adapter) for adapter in self.adapters]
+            for future in as_completed(futures):
+                tasks.extend(future.result())
 
         dedup: Dict[str, Task] = {}
         for item in tasks:
@@ -4695,26 +5455,29 @@ class Hub:
 
     def local_adapter_diagnostics(self) -> Tuple[List[Dict[str, Any]], List[Task]]:
         commands = ps_commands()
-        rows: List[Dict[str, Any]] = []
+        rows_by_index: Dict[int, Dict[str, Any]] = {}
         all_tasks: List[Task] = []
-        for adapter in self.adapters:
+
+        def diagnose(index: int, adapter: Any) -> Tuple[int, Dict[str, Any], List[Task]]:
             source = str(getattr(adapter, "source", adapter.__class__.__name__))
             started = time.monotonic()
             try:
                 tasks = self._list_adapter_tasks(adapter, commands)
                 summary = diagnostic_task_summary(tasks)
-                rows.append(
+                return (
+                    index,
                     {
                         "source": source,
                         "ok": True,
                         "duration_ms": int((time.monotonic() - started) * 1000),
                         **summary,
-                    }
+                    },
+                    tasks,
                 )
-                all_tasks.extend(tasks)
             except Exception as exc:
                 traceback.print_exc()
-                rows.append(
+                return (
+                    index,
                     {
                         "source": source,
                         "ok": False,
@@ -4724,8 +5487,18 @@ class Hub:
                         "attention": 1,
                         "statuses": {"failed": 1},
                         "error": str(exc)[:240],
-                    }
+                    },
+                    [],
                 )
+
+        workers = min(ADAPTER_MAX_WORKERS, max(1, len(self.adapters)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="taskhub-diagnostic") as pool:
+            futures = [pool.submit(diagnose, index, adapter) for index, adapter in enumerate(self.adapters)]
+            for future in as_completed(futures):
+                index, row, tasks = future.result()
+                rows_by_index[index] = row
+                all_tasks.extend(tasks)
+        rows = [rows_by_index[index] for index in range(len(self.adapters))]
         return rows, all_tasks
 
     def diagnostics_snapshot(self, refresh_peers: bool = False) -> Dict[str, Any]:

@@ -200,6 +200,39 @@ class ClaudeTranscriptScan(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_session_metadata_and_custom_title_are_captured(self):
+        path = write_jsonl([
+            {
+                "type": "user",
+                "sessionId": "claude-session-1",
+                "cwd": "/tmp/taskhub",
+                "timestamp": iso_now(-5000),
+                "message": {"role": "user", "content": "Original task prompt"},
+            },
+            {
+                "type": "custom-title",
+                "sessionId": "claude-session-1",
+                "timestamp": iso_now(-4000),
+                "customTitle": "Release TaskHub",
+            },
+            {
+                "type": "assistant",
+                "sessionId": "claude-session-1",
+                "cwd": "/tmp/taskhub",
+                "timestamp": iso_now(),
+                "message": {"role": "assistant", "stop_reason": "end_turn", "content": "done"},
+            },
+        ])
+        try:
+            scan = th._scan_claude_transcript(path)
+            self.assertEqual(scan["session_id"], "claude-session-1")
+            self.assertEqual(scan["cwd"], "/tmp/taskhub")
+            self.assertEqual(scan["custom_title"], "Release TaskHub")
+            self.assertEqual(scan["first_user_text"], "Original task prompt")
+        finally:
+            os.remove(path)
+            th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
+
     def test_text_question_at_turn_end_is_done_not_waiting(self):
         # A turn that ends with question-like prose (but no AskUserQuestion tool)
         # is a completed turn, not a WAIT — WAIT is reserved for explicit asks.
@@ -343,6 +376,30 @@ class CodexSessionScan(unittest.TestCase):
             os.remove(path)
             th._CODEX_SESSION_CACHE.pop(path, None)
 
+    def test_app_server_turn_events_are_supported(self):
+        path = write_jsonl([
+            {"type": "session_meta", "timestamp": iso_now(-5000), "payload": {"id": "s-app", "cwd": "/x"}},
+            {
+                "type": "event_msg",
+                "timestamp": iso_now(-4000),
+                "payload": {"type": "turn_started", "turn": {"id": "turn-app"}},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": iso_now(),
+                "payload": {"type": "turn_completed", "turn": {"id": "turn-app", "status": "completed"}},
+            },
+        ])
+        try:
+            scan = th._scan_codex_session(path)
+            self.assertEqual(scan["latest_turn_id"], "turn-app")
+            self.assertEqual(scan["latest_completed_turn_id"], "turn-app")
+            self.assertFalse(scan["active_turn"])
+            self.assertGreater(scan["latest_completed_ms"], 0)
+        finally:
+            os.remove(path)
+            th._CODEX_SESSION_CACHE.pop(path, None)
+
     def test_pending_request_user_input_is_waiting(self):
         # An explicit request_user_input function call (unanswered) is a WAIT.
         path = write_jsonl([
@@ -460,7 +517,309 @@ class CodexSessionScan(unittest.TestCase):
                     os.environ["HOME"] = old_home
 
 
+class WorkBuddySessionScan(unittest.TestCase):
+    def test_ai_title_is_captured(self):
+        path = write_jsonl([
+            {
+                "type": "ai-title",
+                "sessionId": "wb-title",
+                "cwd": "/tmp/WorkBuddy-2026-07-16-08-07-49",
+                "timestamp": th.now_ms() - 1000,
+                "aiTitle": "Prepare launch report",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "timestamp": th.now_ms(),
+                "content": [{"type": "text", "text": "Done"}],
+            },
+        ])
+        try:
+            scan = th._scan_workbuddy_session(path)
+            self.assertEqual(scan["ai_title"], "Prepare launch report")
+        finally:
+            os.remove(path)
+            th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+    def test_pending_function_call_is_running(self):
+        path = write_jsonl([
+            {
+                "type": "message",
+                "role": "user",
+                "sessionId": "wb-1",
+                "cwd": "/tmp/workbuddy",
+                "timestamp": th.now_ms() - 1000,
+                "content": "Build the project",
+            },
+            {
+                "type": "function_call",
+                "callId": "call-1",
+                "name": "run_command",
+                "timestamp": th.now_ms(),
+            },
+        ])
+        try:
+            scan = th._scan_workbuddy_session(path)
+            self.assertTrue(scan["active_turn"])
+            self.assertFalse(scan["waiting_for_user"])
+            self.assertEqual(scan["pending_calls"], 1)
+            self.assertEqual(th.workbuddy_status(scan), "running")
+        finally:
+            os.remove(path)
+            th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+    def test_final_assistant_message_marks_done(self):
+        now = th.now_ms()
+        path = write_jsonl([
+            {"type": "message", "role": "user", "timestamp": now - 3000, "content": "Run tests"},
+            {"type": "function_call", "callId": "call-2", "name": "run_command", "timestamp": now - 2000},
+            {"type": "function_call_result", "callId": "call-2", "status": "completed", "timestamp": now - 1000},
+            {"type": "message", "role": "assistant", "status": "completed", "timestamp": now, "content": "Tests pass"},
+        ])
+        try:
+            scan = th._scan_workbuddy_session(path)
+            self.assertFalse(scan["active_turn"])
+            self.assertEqual(scan["pending_calls"], 0)
+            self.assertEqual(th.workbuddy_status(scan), "done")
+        finally:
+            os.remove(path)
+            th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+    def test_ask_user_question_is_waiting(self):
+        path = write_jsonl([
+            {"type": "message", "role": "user", "timestamp": th.now_ms() - 1000, "content": "Deploy"},
+            {
+                "type": "function_call",
+                "callId": "call-3",
+                "name": "AskUserQuestion",
+                "timestamp": th.now_ms(),
+            },
+        ])
+        try:
+            scan = th._scan_workbuddy_session(path)
+            self.assertTrue(scan["waiting_for_user"])
+            self.assertEqual(th.workbuddy_status(scan), "waiting")
+        finally:
+            os.remove(path)
+            th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+    def test_old_unmatched_question_is_cleared_by_later_completed_turn(self):
+        now = th.now_ms()
+        path = write_jsonl([
+            {"type": "message", "role": "user", "timestamp": now - 5000, "content": "Start"},
+            {
+                "type": "function_call",
+                "callId": "missing-result",
+                "name": "AskUserQuestion",
+                "timestamp": now - 4000,
+            },
+            {"type": "message", "role": "user", "timestamp": now - 3000, "content": "Continue"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "timestamp": now,
+                "content": "Finished",
+            },
+        ])
+        try:
+            scan = th._scan_workbuddy_session(path)
+            self.assertFalse(scan["waiting_for_user"])
+            self.assertFalse(scan["active_turn"])
+            self.assertEqual(scan["pending_calls"], 0)
+            self.assertEqual(th.workbuddy_status(scan), "done")
+        finally:
+            os.remove(path)
+            th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+    def test_stale_unanswered_question_expires(self):
+        old = th.now_ms() - th.QUESTION_WAITING_STALE_MS - 1000
+        path = write_jsonl([
+            {"type": "message", "role": "user", "timestamp": old - 1000, "content": "Start"},
+            {
+                "type": "function_call",
+                "callId": "stale-question",
+                "name": "AskUserQuestion",
+                "timestamp": old,
+            },
+        ])
+        try:
+            scan = th._scan_workbuddy_session(path)
+            self.assertFalse(scan["waiting_for_user"])
+            self.assertEqual(th.workbuddy_status(scan), "recent")
+        finally:
+            os.remove(path)
+            th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+
+class DesktopWebAiSignals(unittest.TestCase):
+    def test_only_explicit_stop_controls_mean_running(self):
+        adapter = th.DesktopWebAiAdapter("Kimi", "Kimi", "Kimi.app", "Kimi", {})
+        self.assertTrue(adapter._running_signal(["Stop generating"]))
+        self.assertTrue(adapter._running_signal(["停止生成"]))
+        self.assertFalse(adapter._running_signal(["Kimi", "New chat", "Generating ideas"] ))
+
+    def test_kimi_local_conversation_statuses_are_counted(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"conversation-a": "completed", "conversation-b": "running"}, fh)
+            adapter = th.DesktopWebAiAdapter(
+                "Kimi",
+                "Kimi",
+                "Kimi.app",
+                "Kimi",
+                {},
+                status_file=path,
+            )
+            self.assertEqual(adapter._local_status_summary(), {"completed": 1, "running": 1})
+        finally:
+            os.remove(path)
+
+    def test_stale_kimi_running_record_does_not_stay_running(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        original_app_running = th.app_running
+        original_window_titles = th.window_titles
+        original_accessibility_labels = th.accessibility_labels
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"old-conversation": "running"}, fh)
+            old = (th.now_ms() - 7 * 60 * 60 * 1000) / 1000
+            os.utime(path, (old, old))
+            th.app_running = lambda *_args, **_kwargs: True
+            th.window_titles = lambda *_args, **_kwargs: ["Kimi"]
+            th.accessibility_labels = lambda *_args, **_kwargs: []
+            adapter = th.DesktopWebAiAdapter(
+                "Kimi",
+                "Kimi",
+                "Kimi.app",
+                "Kimi",
+                {},
+                activity_globs=[path],
+                renderer_fragment="Kimi Renderer",
+                renderer_run_cpu=8.0,
+                running_hold_ms=15000,
+                status_file=path,
+                local_running_stale_ms=6 * 60 * 60 * 1000,
+            )
+            adapter._renderer_cpu_percent = lambda: 50.0
+            result = adapter.list_tasks(commands=["Kimi.app/Contents/MacOS/Kimi"])[0]
+            self.assertEqual(result["status"], "recent")
+            self.assertTrue(result["detail"]["local_running_record"])
+            self.assertFalse(result["detail"]["local_status_fresh"])
+            self.assertFalse(result["detail"]["cpu_running_signal"])
+        finally:
+            th.app_running = original_app_running
+            th.window_titles = original_window_titles
+            th.accessibility_labels = original_accessibility_labels
+            os.remove(path)
+
+    def test_kimi_runtime_idle_supersedes_stuck_local_running(self):
+        original_app_running = th.app_running
+        original_window_titles = th.window_titles
+        original_accessibility_labels = th.accessibility_labels
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = os.path.join(tmp, "conversation-statuses.json")
+            runtime_path = os.path.join(tmp, "runner.state.json")
+            with open(status_path, "w", encoding="utf-8") as fh:
+                json.dump({"stuck-conversation": "running"}, fh)
+            with open(runtime_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
+                        "kernel": {
+                            "status": "not_started",
+                            "activeTurnCount": 0,
+                            "activeToolCallCount": 0,
+                            "pendingInteractionCount": 0,
+                        },
+                        "activeOperations": [],
+                    },
+                    fh,
+                )
+            try:
+                th.app_running = lambda *_args, **_kwargs: True
+                th.window_titles = lambda *_args, **_kwargs: ["Kimi"]
+                th.accessibility_labels = lambda *_args, **_kwargs: []
+                adapter = th.DesktopWebAiAdapter(
+                    "Kimi",
+                    "Kimi",
+                    "Kimi.app",
+                    "Kimi",
+                    {},
+                    status_file=status_path,
+                    local_running_stale_ms=6 * 60 * 60 * 1000,
+                    runtime_state_file=runtime_path,
+                )
+                result = adapter.list_tasks(commands=["Kimi.app/Contents/MacOS/Kimi"])[0]
+                self.assertEqual(result["status"], "recent")
+                self.assertTrue(result["detail"]["runtime_state_supersedes_local"])
+                self.assertEqual(result["detail"]["status_basis"], "runtime idle")
+            finally:
+                th.app_running = original_app_running
+                th.window_titles = original_window_titles
+                th.accessibility_labels = original_accessibility_labels
+
+    def test_kimi_runtime_active_turn_reports_running(self):
+        original_app_running = th.app_running
+        original_window_titles = th.window_titles
+        original_accessibility_labels = th.accessibility_labels
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = os.path.join(tmp, "runner.state.json")
+            with open(runtime_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
+                        "kernel": {"status": "running", "activeTurnCount": 1},
+                    },
+                    fh,
+                )
+            try:
+                th.app_running = lambda *_args, **_kwargs: True
+                th.window_titles = lambda *_args, **_kwargs: ["Kimi"]
+                th.accessibility_labels = lambda *_args, **_kwargs: []
+                adapter = th.DesktopWebAiAdapter(
+                    "Kimi",
+                    "Kimi",
+                    "Kimi.app",
+                    "Kimi",
+                    {},
+                    local_running_stale_ms=6 * 60 * 60 * 1000,
+                    runtime_state_file=runtime_path,
+                )
+                result = adapter.list_tasks(commands=["Kimi.app/Contents/MacOS/Kimi"])[0]
+                self.assertEqual(result["status"], "running")
+                self.assertEqual(result["detail"]["status_basis"], "runtime active turn")
+            finally:
+                th.app_running = original_app_running
+                th.window_titles = original_window_titles
+                th.accessibility_labels = original_accessibility_labels
+
+
 class OpenClawSessions(unittest.TestCase):
+    def test_cli_fallback_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = os.path.join(tmp, "openclaw")
+            with open(binary, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n")
+
+            adapter = th.OpenClawAdapter()
+            adapter.bin = binary
+            adapter.state_dir = tmp
+            adapter._list_task_runs = lambda: []
+            adapter._list_sessions = lambda: []
+            calls = []
+            adapter._list_cli_fallback = lambda: calls.append(True) or []
+
+            old_fallback = th.OPENCLAW_CLI_FALLBACK
+            th.OPENCLAW_CLI_FALLBACK = False
+            try:
+                self.assertEqual(adapter.list_tasks(), [])
+                self.assertEqual(calls, [])
+            finally:
+                th.OPENCLAW_CLI_FALLBACK = old_fallback
+
     def test_stale_failed_sessions_are_hidden(self):
         now = th.now_ms()
         old_ms = now - th.OPENCLAW_FAILED_TTL_MS - 1000

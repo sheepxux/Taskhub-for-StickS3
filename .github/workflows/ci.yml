@@ -52,3 +52,21 @@ jobs:
             --build-property "compiler.cpp.extra_flags=-DTASKHUB_PUBLIC_BUILD=1 -ffile-prefix-map=$GITHUB_WORKSPACE=/workspace -fmacro-prefix-map=$GITHUB_WORKSPACE=/workspace -fdebug-prefix-map=$GITHUB_WORKSPACE=/workspace" \
             --build-property "compiler.c.extra_flags=-ffile-prefix-map=$GITHUB_WORKSPACE=/workspace -fmacro-prefix-map=$GITHUB_WORKSPACE=/workspace -fdebug-prefix-map=$GITHUB_WORKSPACE=/workspace" \
             firmware/task_monitor
+
+  macos-host-package:
+    name: macOS Host package
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build unsigned Host package
+        run: ./packaging/macos/build_host_pkg.sh
+      - name: Inspect package payload
+        run: |
+          PKG="$(find dist/macos -maxdepth 1 -name 'TaskHub-Host-*.pkg' -print -quit)"
+          test -n "$PKG"
+          pkgutil --payload-files "$PKG" | tee /tmp/taskhub-payload.txt
+          ! grep -E 'secrets\.h|models/|\.git/|task_hub\.log' /tmp/taskhub-payload.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskhub-macos-host-pkg
+          path: dist/macos/TaskHub-Host-*.pkg

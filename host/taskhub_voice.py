@@ -76,13 +76,15 @@ WHISPER_LANGUAGE = os.environ.get("TASK_HUB_WHISPER_LANGUAGE", "auto")
 # Canonical source-name -> macOS app bundle id, so a /voice request can target
 # the app for a task by its source name. Authoritative targeting still prefers
 # the task's own _open action (passed as ?app=<bundle> or resolved from ?task=);
-# this map is the convenience/fallback path. Browser-only sources (Gemini,
-# Lovable) have no desktop bundle and fall back to the frontmost window.
+# this map is the convenience/fallback path. Browser-only sources have no
+# stable desktop bundle and fall back to the frontmost window.
 SOURCE_BUNDLES = {
     "claude": "com.anthropic.claudefordesktop",
     "codex": "com.openai.codex",
+    "kimi": "com.moonshot.kimichat",
     "manus": "im.manus.desktop",
     "perplexity": "ai.perplexity.macv3",
+    "workbuddy": "com.workbuddy.workbuddy",
 }
 
 

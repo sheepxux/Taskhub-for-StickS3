@@ -5,7 +5,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 [简体中文](README.zh-CN.md) | [Installation](INSTALL.md)
 
 [![CI](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml/badge.svg)](https://github.com/sheepxux/Taskhub-for-StickS3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v2.1.0-111827)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v2.2.0-111827)](CHANGELOG.md)
 [![Hardware](https://img.shields.io/badge/hardware-M5StickS3-2563eb)](firmware/task_monitor)
 [![Host](https://img.shields.io/badge/host-macOS-0f766e)](host)
 [![Local First](https://img.shields.io/badge/local--first-yes-16a34a)](#privacy-and-security)
@@ -14,7 +14,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 TaskHub for StickS3 turns an M5StickS3 into a tiny always-nearby status screen
 for AI coding agents, desktop AI apps, and browser-based agent tools. A local
 Mac Host reads task metadata from sources such as Codex, Claude Code, OpenClaw,
-Manus, Perplexity, Gemini, and Lovable, discovers other authorized TaskHub Hosts
+Manus, Perplexity, Gemini, Lovable, Kimi, WorkBuddy, and Grok, discovers other authorized TaskHub Hosts
 on the same LAN, then sends a compact task list to the StickS3 over Wi-Fi.
 
 The device shows which task is running, which one needs your input, what
@@ -59,7 +59,7 @@ resolution. Regenerate them with `python3 docs/render_screens.py`.
 
 ## Current Release
 
-`v2.1.0` is the current public build for developers and hardware makers. The
+`v2.2.0` is the current public build for developers and hardware makers. The
 core pipeline is working: Mac Host, StickS3 firmware, Wi-Fi discovery, compact
 task display, button actions, deep sleep, voice input, and LAN multi-device
 aggregation.
@@ -75,6 +75,7 @@ when a row is exact task tracking versus best-effort local signal detection.
 | StickS3 firmware | Ready | Native 240x135 UI, buttons, Wi-Fi discovery, deep sleep |
 | M5Burner public firmware | Ready | Builds without local secrets; first use is configured over USB into device NVS |
 | macOS Host | Ready | LaunchAgent installer, local HTTP API, UDP discovery |
+| macOS Host package | Preview | Builds a secret-free `.pkg`; public distribution still requires Developer ID signing/notarization |
 | Host diagnostics | Ready | `/diagnostics` checks adapters, voice mode, local permissions, caches, and peers without exposing tokens or task titles |
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnB open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
@@ -91,14 +92,17 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Perplexity adapter | Activity | Local app/browser activity; exact Perplexity Computer tasks are not guaranteed |
 | Gemini adapter | Activity | App/web activity and visible browser title when exposed |
 | Lovable adapter | Activity | App/browser activity, renderer CPU, visible generation controls |
-| Browser web bridge | Optional | `extension/` (Chrome/Edge) reads Gemini/Lovable/Perplexity tab titles and pushes them via `POST /ingest` |
+| Kimi adapter | Activity | Local conversation status plus daemon active-turn state and web title; open app alone is not RUN |
+| WorkBuddy adapter | Detailed | Local session title, tool calls, RUN/WAIT/DONE, folder, token data when present |
+| Grok adapter | Activity | Web/Safari app title and visible Stop control; open app alone is not RUN |
+| Browser web bridge | Optional | `extension/` (Chrome/Edge) reads Gemini/Grok/Kimi/Lovable/Perplexity tab titles and pushes them via `POST /ingest` |
 | External push API | Ready | `POST /ingest` accepts tasks from any local script; entries expire on a TTL |
 
 ## Browser Web Bridge (optional)
 
 Browser-based AI tools keep task data on their servers, so the Host can only see
 them as "active". The optional Chrome/Edge extension in [`extension/`](extension)
-reads the open Gemini / Lovable / Perplexity tab's title and pushes it to the
+reads the open Gemini / Grok / Kimi / Lovable / Perplexity tab's title and pushes it to the
 Host via `POST /ingest`, so those tasks show real titles on the StickS3. It is
 local-only (talks to `127.0.0.1`) and best-effort (page selectors fall back to
 the tab title). See [extension/README.md](extension/README.md) to load it.
@@ -187,6 +191,9 @@ flowchart LR
     Perplexity["Perplexity\nlocal app/browser activity"]
     Gemini["Gemini\nlocal app/browser activity"]
     Lovable["Lovable\napp + browser tabs"]
+    Kimi["Kimi\ndesktop + browser UI"]
+    WorkBuddy["WorkBuddy\nlocal session events"]
+    Grok["Grok\nSafari app + browser UI"]
   end
 
   subgraph "M5StickS3"
@@ -204,6 +211,9 @@ flowchart LR
   Perplexity --> Host
   Gemini --> Host
   Lovable --> Host
+  Kimi --> Host
+  WorkBuddy --> Host
+  Grok --> Host
   Host -- "UDP discovery response" --> Firmware
   Firmware -- "GET /tasks?format=stick" --> Host
   Firmware -- "POST /tasks/:id/open" --> Host
@@ -263,6 +273,15 @@ It also creates or reuses the device token at:
 The setup helper installs or repairs the Host, creates
 `firmware/task_monitor/secrets.h`, syncs the shared token, and prompts for Wi-Fi
 values if needed.
+
+An unsigned development `.pkg` can also be built on macOS:
+
+```bash
+./packaging/macos/build_host_pkg.sh
+```
+
+For public distribution, sign and notarize that package with a Developer ID
+Installer certificate. See [`packaging/macos/README.md`](packaging/macos/README.md).
 
 To install Arduino dependencies and compile firmware:
 
@@ -358,6 +377,7 @@ Useful environment variables:
 | `TASK_HUB_ENABLE_PEERS` | `1` | Set to `0` to disable peer aggregation |
 | `TASK_HUB_PEER_DISCOVERY_MS` | `15000` | UDP peer discovery interval |
 | `TASK_HUB_PEER_CACHE_MS` | `5000` | Remote task cache duration |
+| `TASK_HUB_ADAPTER_MAX_WORKERS` | `8` | Concurrent local adapter scans |
 
 Diagnostics:
 
@@ -447,6 +467,9 @@ disk, through local process state, or through visible browser UI.
 | Perplexity | App/browser activity; exact Perplexity Computer task names may be unavailable |
 | Gemini | App/browser activity; visible tab title when exposed by the browser |
 | Lovable | App/browser activity, project tabs, renderer CPU, visible generation controls |
+| Kimi | Local `running/completed` state cross-checked with daemon active turns, plus browser title |
+| WorkBuddy | Local session title, folder, tool calls, completion state, token data when exposed |
+| Grok | Safari Web App/browser title and visible Stop control; exact title is best with the web bridge |
 
 If an app is open but not actively generating or executing, TaskHub should show
 `REC` or `IDLE`, not `RUN`.
@@ -514,14 +537,14 @@ CHANGELOG.md             Release notes
 
 ## Roadmap
 
-- Signed or packaged Mac installer.
+- Signed and notarized distribution of the current Mac Host package.
 - Recorded local-metadata fixtures to broaden the adapter regression suite.
-- More detailed browser-task extraction for Gemini, Lovable, and Perplexity.
+- More detailed browser-task extraction and recorded fixtures as supported sites evolve.
 - FAIL alert tone distinct from the WAIT alert, plus an optional external buzzer.
 - Better first-run setup flow for non-developer users.
 
 ## Release
 
-Current release: `v2.1.0`.
+Current release: `v2.2.0`.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.

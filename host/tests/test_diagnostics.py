@@ -123,6 +123,29 @@ class DiagnosticsHelpers(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(refreshed_title, "new task")
 
+    def test_adapter_scans_run_in_parallel(self):
+        class SlowAdapter:
+            def __init__(self, source):
+                self.source = source
+
+            def list_tasks(self):
+                time.sleep(0.2)
+                return [th.task(task_id=self.source, source=self.source, title=self.source, status="recent")]
+
+        hub = th.Hub(token="test-token", http_port=5577, discovery_port=5578, bind="127.0.0.1")
+        hub.adapters = [SlowAdapter("One"), SlowAdapter("Two")]
+        original_ps_commands = th.ps_commands
+        th.ps_commands = lambda: []
+        try:
+            started = time.monotonic()
+            tasks = hub._scan_tasks(include_remote=False)
+            elapsed = time.monotonic() - started
+        finally:
+            th.ps_commands = original_ps_commands
+
+        self.assertLess(elapsed, 0.35)
+        self.assertEqual({item["source"] for item in tasks}, {"One", "Two"})
+
 
 if __name__ == "__main__":
     unittest.main()

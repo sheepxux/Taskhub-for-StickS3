@@ -34,7 +34,7 @@
 #define TASK_HUB_HOST   "192.168.1.100"
 #define TASK_HUB_PORT   5577
 #define DEVICE_ID       "sticks3-task-01"
-#define DEVICE_TOKEN    "dev-token"
+#define DEVICE_TOKEN    ""
 #define TASKHUB_LANG    "en"
 #define VOICE_AUTO_SEND 1
 #define AUTO_WAKE_SECONDS 600
@@ -79,6 +79,7 @@ static constexpr int C_GRAY = TFT_DARKGREY;
 static constexpr int C_GREEN = TFT_GREEN;
 static constexpr int C_AMBER = TFT_ORANGE;
 static constexpr int C_RED = TFT_RED;
+static constexpr int C_WORKBUDDY = 0x2EB7;
 static constexpr int C_LOVABLE_RED = 0xFA20;
 static constexpr int C_LOVABLE_ORANGE = 0xFD20;
 static constexpr int C_LOVABLE_SHADOW = 0x5BFF;
@@ -1336,6 +1337,9 @@ static int sourceLogoColor(const String& source) {
   if (s.indexOf("claude") >= 0) return C_AMBER;
   if (s.indexOf("perplexity") >= 0) return C_WHITE;
   if (s.indexOf("gemini") >= 0) return C_BLUE;
+  if (s.indexOf("kimi") >= 0) return C_WHITE;
+  if (s.indexOf("workbuddy") >= 0) return C_WORKBUDDY;
+  if (s.indexOf("grok") >= 0) return C_WHITE;
   if (s.indexOf("lovable") >= 0) return C_LOVABLE_RED;
   if (s.indexOf("manus") >= 0) return C_GREEN;
   if (s.indexOf("openclaw") >= 0 || s.indexOf("claw") >= 0) return C_RED;
@@ -1379,6 +1383,27 @@ static void drawAiSourceIcon(const String& source, int x, int y, int bg) {
     M5.Display.fillTriangle(x + 11, y + 6, x + 7, y + 4, x + 6, y + 6, c);
     M5.Display.fillTriangle(x + 0, y + 6, x + 5, y + 8, x + 6, y + 6, c);
     M5.Display.fillTriangle(x + 11, y + 6, x + 7, y + 8, x + 6, y + 6, c);
+  } else if (s.indexOf("kimi") >= 0) {
+    M5.Display.drawFastVLine(x + 2, y + 1, 10, c);
+    M5.Display.drawLine(x + 3, y + 6, x + 8, y + 1, c);
+    M5.Display.drawLine(x + 3, y + 6, x + 9, y + 11, c);
+    M5.Display.drawLine(x + 4, y + 6, x + 10, y + 11, c);
+    M5.Display.fillCircle(x + 10, y + 1, 1, C_BLUE);
+  } else if (s.indexOf("workbuddy") >= 0) {
+    M5.Display.fillTriangle(x + 1, y + 4, x + 3, y + 0, x + 5, y + 4, c);
+    M5.Display.fillTriangle(x + 7, y + 4, x + 9, y + 0, x + 11, y + 4, c);
+    M5.Display.fillRoundRect(x + 1, y + 3, 10, 8, 3, c);
+    M5.Display.fillCircle(x + 4, y + 6, 2, C_WHITE);
+    M5.Display.fillCircle(x + 8, y + 6, 2, C_WHITE);
+    M5.Display.drawPixel(x + 4, y + 6, C_BG);
+    M5.Display.drawPixel(x + 8, y + 6, C_BG);
+  } else if (s.indexOf("grok") >= 0) {
+    M5.Display.drawCircle(x + 6, y + 6, 5, c);
+    M5.Display.drawCircle(x + 6, y + 6, 4, c);
+    M5.Display.drawLine(x + 1, y + 10, x + 10, y + 1, c);
+    M5.Display.drawLine(x + 2, y + 11, x + 11, y + 2, c);
+    M5.Display.fillRect(x + 1, y + 1, 3, 3, bg);
+    M5.Display.drawLine(x + 8, y + 8, x + 11, y + 11, c);
   } else if (s.indexOf("lovable") >= 0) {
     M5.Display.fillRect(x + 2, y + 8, 7, 3, C_LOVABLE_SHADOW);
     M5.Display.fillCircle(x + 4, y + 4, 3, C_LOVABLE_ORANGE);

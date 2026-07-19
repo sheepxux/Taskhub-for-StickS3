@@ -14,7 +14,8 @@ keeps the existing device token when present, installs the optional Manus LevelD
 reader dependency, writes the LaunchAgent, and restarts the service.
 
 ```bash
-python3 host/task_hub.py --bind 0.0.0.0 --port 5577 --token dev-token
+TOKEN=$(cat "$HOME/Library/Application Support/StickS3TaskHub/token")
+TASK_HUB_TOKEN="$TOKEN" python3 host/task_hub.py --bind 0.0.0.0 --port 5577
 ```
 
 Or run it with the local firmware token from `secrets.h`:
@@ -33,16 +34,17 @@ Useful checks:
 
 ```bash
 curl http://127.0.0.1:5577/health
-curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/tasks?format=stick&limit=8'
-curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/tasks?scope=local&limit=8'
-curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/peers.json'
-curl -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/debug/lovable'
+TOKEN=$(cat "$HOME/Library/Application Support/StickS3TaskHub/token")
+curl -H "X-Device-Token: $TOKEN" 'http://127.0.0.1:5577/tasks?format=stick&limit=8'
+curl -H "X-Device-Token: $TOKEN" 'http://127.0.0.1:5577/tasks?scope=local&limit=8'
+curl -H "X-Device-Token: $TOKEN" 'http://127.0.0.1:5577/peers.json'
+curl -H "X-Device-Token: $TOKEN" 'http://127.0.0.1:5577/debug/lovable'
 ```
 
 Push an external task (e.g. from the browser extension or any script):
 
 ```bash
-curl -X POST -H 'X-Device-Token: dev-token' 'http://127.0.0.1:5577/ingest' \
+curl -X POST -H "X-Device-Token: $TOKEN" 'http://127.0.0.1:5577/ingest' \
   -d '{"source":"Gemini","title":"Refactor pricing page","status":"running","url":"https://gemini.google.com/app/abc"}'
 ```
 
@@ -55,12 +57,12 @@ own when the pusher stops. See `extension/` for the Chrome/Edge web bridge.
 Discovery check:
 
 ```bash
-python3 - <<'PY'
-import json, socket
+TASK_HUB_TOKEN="$TOKEN" python3 - <<'PY'
+import json, os, socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 sock.settimeout(2)
-sock.sendto(json.dumps({"type":"sticks3.discover","device":"test","token":"dev-token"}).encode(), ("255.255.255.255", 5578))
+sock.sendto(json.dumps({"type":"sticks3.discover","device":"test","token":os.environ["TASK_HUB_TOKEN"]}).encode(), ("255.255.255.255", 5578))
 print(sock.recvfrom(2048)[0].decode())
 PY
 ```
@@ -83,9 +85,9 @@ Build and flash:
 
 Button behavior:
 
-- BtnA opens the selected task's original app/source on the Mac.
-- BtnB selects the next task.
-- BtnB hold refreshes immediately.
+- BtnA selects the next task; hold BtnA to refresh immediately.
+- BtnB opens the selected task's original app/source on the Mac.
+- Hold BtnB to record, transcribe, and send voice input.
 
 The local detail page remains available in the browser at `/tasks/:id`.
 
@@ -123,10 +125,16 @@ Current stable build:
 
 - `ENABLE_DEEP_SLEEP` defaults to `1`. The device wakes, fetches the list, stays briefly interactive, then sleeps again. Override `ENABLE_DEEP_SLEEP` to `0` in `secrets.h` for UI/network debugging.
 - Codex, Claude Code, and OpenClaw tasks include local token/turn or session usage when their logs expose it. OpenClaw uses its local task registry and session status instead of process-open detection.
+- OpenClaw's CLI fallback is disabled by default because unavailable CLI
+  subcommands can block a refresh for several seconds. Set
+  `TASK_HUB_OPENCLAW_CLI_FALLBACK=1` only when local OpenClaw state stores are
+  unavailable and CLI-only discovery is required.
 - Codex and Claude Code can mark recent assistant questions or explicit confirmation prompts as `WAIT`; the StickS3 keeps the display on and refreshes while a visible `WAIT` task exists.
 - Claude Code status is based on transcript turn state plus the matching `claude --resume` process. Active tool-use turns stay `RUN` even when a long tool call does not append transcript lines for several minutes. The compact subtitle uses `folder · tN · state` to fit the StickS3 screen.
 - Manus is read from local app storage (`Local Storage/leveldb`) when the `classic-level` Node dependency is available to the hub. It uses local `sessions_detail`, `task_finished`, timestamps, and session usage counters; no message body or auth token is returned by the API. To keep the StickS3 list usable, Manus history is capped by `TASK_HUB_MANUS_MAX_SESSIONS` (default `3`).
 - Perplexity uses local preferences for query counters when macOS allows the background hub to read them, and WebKit cache/WAL mtimes for recent activity. It marks `RUN` only when the hub observes those local signals change during polling; otherwise it stays `REC` or `IDLE` because no stable local task transcript or task database has been found yet.
 - Gemini uses the local Gemini app process plus settings/log/cache mtimes, and also scans browser tabs for `gemini.google.com` in Safari, Chrome, Arc, Edge, Brave, and Chromium. When a Gemini tab is visible in Safari, accessibility headings can provide the current page/task title; background tabs and Chromium browsers fall back to the tab title, often just `Gemini`. It only marks `RUN` when a visible browser signal such as a stop-generation control is exposed.
 - Lovable detects `Lovable.app` (`dev.lovable.build`) through its app process, renderer CPU, and local `lovable-desktop` storage/cache mtimes, and also scans browser tabs for `lovable.dev` in Safari, Chrome, Arc, Edge, Brave, and Chromium. It shows up to `TASK_HUB_LOVABLE_MAX_TABS=3` open Lovable project tabs, opens the original app or tab URL from BtnA, and marks `RUN` when a visible page exposes generation/building controls or when the Lovable renderer exceeds `TASK_HUB_LOVABLE_RENDERER_RUN_CPU=8.0`; app-only local cache activity stays `REC`.
+- WorkBuddy reads `~/.workbuddy/projects/*/*.jsonl` directly. Pending tools mark `RUN`, an unanswered `AskUserQuestion` marks `WAIT`, and a final completed assistant message marks `DONE`; merely opening WorkBuddy does not mark a task running.
+- Kimi combines `conversation-statuses.json` with its local daemon's active-turn counters. A newer idle runtime state clears abandoned `running` records immediately; a six-hour guard handles stale files after crashes, and renderer CPU never creates `RUN` by itself. Grok uses a conservative visible-control fallback. An open app alone stays `REC`; the Chrome/Edge Web Bridge adds precise browser conversation titles.
 - StickS3 hides old display-only tasks without deleting them on the Mac. Defaults: `DONE`/`IDLE` after 10 minutes, `REC` after 1 hour, `RUN`/`WAIT`/`FAIL` never. Override with `STICK_HIDE_DONE_AFTER_SEC`, `STICK_HIDE_IDLE_AFTER_SEC`, `STICK_HIDE_RECENT_AFTER_SEC`, and `STICK_HIDE_UNKNOWN_AFTER_SEC`.

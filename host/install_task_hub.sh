@@ -32,14 +32,23 @@ if [ ! -s "$TOKEN_FILE" ]; then
   elif [ -f "$ROOT/firmware/voice_recorder/secrets.h" ]; then
     TOKEN="$(awk '/#define[[:space:]]+DEVICE_TOKEN[[:space:]]+"/ { sub(/^.*"/, ""); sub(/".*$/, ""); print; exit }' "$ROOT/firmware/voice_recorder/secrets.h" || true)"
   fi
+  if [ "$TOKEN" = "dev-token" ]; then
+    TOKEN=""
+  fi
   if [ -z "$TOKEN" ]; then
     TOKEN="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24 || true)"
   fi
-  if [ -z "$TOKEN" ]; then
-    TOKEN="dev-token"
-  fi
+  [ -n "$TOKEN" ] || {
+    echo "Task Hub install failed: could not generate a secure device token." >&2
+    exit 1
+  }
   umask 077
   printf '%s' "$TOKEN" > "$TOKEN_FILE"
+fi
+chmod 600 "$TOKEN_FILE"
+if [ "$(cat "$TOKEN_FILE")" = "dev-token" ]; then
+  echo "Warning: the existing installation uses dev-token. Connect the StickS3 and run:" >&2
+  echo "  ./scripts/setup.sh --rotate-token --provision" >&2
 fi
 
 cat > "$APP_DIR/run_task_hub.sh" <<'SH'
@@ -48,8 +57,12 @@ set -eu
 
 ROOT="$HOME/Library/Application Support/StickS3TaskHub"
 TOKEN="$(cat "$ROOT/token" 2>/dev/null || true)"
+[ -n "$TOKEN" ] || {
+  echo "Task Hub token is missing: $ROOT/token" >&2
+  exit 1
+}
 
-export TASK_HUB_TOKEN="${TOKEN:-dev-token}"
+export TASK_HUB_TOKEN="$TOKEN"
 export PATH="$HOME/.local/node/bin:$HOME/.local/node-v22.22.1-darwin-arm64/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -z "${TASK_HUB_WHISPER_MODEL:-}" ] && [ -f "$ROOT/models/ggml-large-v3-turbo-q5_0.bin" ]; then
   export TASK_HUB_WHISPER_MODEL="$ROOT/models/ggml-large-v3-turbo-q5_0.bin"

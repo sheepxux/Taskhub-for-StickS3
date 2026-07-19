@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+URL="http://127.0.0.1:5577/diagnostics"
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+  if /usr/bin/curl -fsS "http://127.0.0.1:5577/health" >/dev/null 2>&1; then
+    /usr/bin/open "$URL"
+    exit 0
+  fi
+  attempt=$((attempt + 1))
+  sleep 0.25
+done
+
+/usr/bin/osascript <<'APPLESCRIPT'
+display dialog "TaskHub Host did not start. Check ~/Library/Application Support/StickS3TaskHub/task_hub.log, then reinstall or open the GitHub troubleshooting guide." with title "TaskHub Host" buttons {"OK"} default button "OK"
+APPLESCRIPT
+exit 1

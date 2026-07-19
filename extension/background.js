@@ -7,7 +7,7 @@
 // tab (heartbeat stops) and it ages out of the Host on its own.
 "use strict";
 
-const DEFAULTS = { host: "127.0.0.1", port: 5577, token: "dev-token" };
+const DEFAULTS = { host: "127.0.0.1", port: 5577, token: "" };
 const TTL_SEC = 60;        // task expires on the Host this long after the last push
 const HEARTBEAT_MS = 30000; // re-push live tabs well within TTL (Chrome alarm min is 30s)
 
@@ -25,6 +25,7 @@ async function config() {
 
 async function pushTask(tabId, payload) {
   const cfg = await config();
+  if (!cfg.token) return false;
   const body = {
     id: "ext-" + payload.source.toLowerCase() + "-" + tabId,
     source: payload.source,

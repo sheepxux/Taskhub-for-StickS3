@@ -1,6 +1,6 @@
 // TaskHub Web Bridge — shared content-script machinery.
 //
-// A per-site script (gemini.js / lovable.js / perplexity.js) calls
+// A per-site script (gemini.js / kimi.js / grok.js / etc.) calls
 // window.__TASKHUB_REGISTER(config). This module then watches the page and,
 // whenever the derived {title, status} changes, sends it to the background
 // service worker, which forwards it to the local TaskHub Host via POST /ingest.
@@ -50,6 +50,8 @@
         label.includes("stop generating") ||
         label.includes("stop response") ||
         label.includes("stop streaming") ||
+        label.includes("stop thinking") ||
+        label.includes("cancel generation") ||
         label.includes("正在生成") ||
         label.includes("停止")
       ) {

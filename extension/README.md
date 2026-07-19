@@ -1,6 +1,6 @@
 # TaskHub Web Bridge (Chrome/Edge extension)
 
-Browser-based AI tools (Gemini, Lovable, Perplexity) keep task data on their
+Browser-based AI tools (Gemini, Grok, Kimi, Lovable, Perplexity) keep task data on their
 servers, so the Mac Host can't read a real task title locally — it only sees the
 app/browser as "active". This extension runs inside those tabs, reads the
 conversation/project title from the page, and pushes it to your local TaskHub
@@ -21,7 +21,7 @@ to match the extension's scoped permissions — only the device token is editabl
    and set the **device token** to match
    `~/Library/Application Support/StickS3TaskHub/token`. Click **Test
    connection** — it should say `Connected ✓`.
-5. Open Gemini / Lovable / Perplexity. Within a few seconds the tab's task
+5. Open Gemini / Grok / Kimi / Lovable / Perplexity. Within a few seconds the tab's task
    appears in `/tasks` and on the StickS3.
 
 ## How it behaves
@@ -37,6 +37,8 @@ to match the extension's scoped permissions — only the device token is editabl
 | Site | Title source | Notes |
 | --- | --- | --- |
 | Gemini | selected conversation, else tab title | |
+| Grok | active conversation, heading, else tab title | also supports the Grok Safari Web App fallback |
+| Kimi | selected conversation, heading, else tab title | also supports the Kimi desktop app fallback |
 | Lovable | header project name, else tab title | |
 | Perplexity | thread heading, else tab title | complements the Host's local Perplexity adapter |
 

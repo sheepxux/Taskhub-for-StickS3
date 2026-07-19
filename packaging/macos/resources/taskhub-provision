@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec "/Library/Application Support/TaskHubHost/scripts/provision_sticks3.sh" --skip-host "$@"

@@ -48,6 +48,24 @@ By default this will:
 It will **not** install Arduino dependencies or flash the device unless you ask
 for that explicitly.
 
+## macOS Host Package (preview)
+
+On macOS, build a secret-free Host installer with:
+
+```bash
+./packaging/macos/build_host_pkg.sh
+```
+
+The resulting `dist/macos/TaskHub-Host-<version>.pkg` contains only an explicit
+Host-code allowlist. It does not include firmware `secrets.h`, Wi-Fi values,
+tokens, models, logs, caches, or repository metadata. Installation creates a
+random per-user token, starts the Host LaunchAgent, installs the TaskHub Host
+diagnostics app, and adds the `taskhub-provision` command.
+
+The development package is unsigned. Public distribution requires a Developer
+ID Installer certificate and Apple notarization; see
+[`packaging/macos/README.md`](packaging/macos/README.md).
+
 ## M5Burner / Public Firmware Setup
 
 M5Burner should use the public firmware build, not a binary compiled from your
@@ -100,6 +118,15 @@ Reset the runtime config on a plugged-in StickS3:
 ```bash
 ./scripts/provision_sticks3.sh --reset
 ```
+
+Rotate an old/default shared token only while the StickS3 is connected:
+
+```bash
+./scripts/setup.sh --skip-firmware --rotate-token --provision
+```
+
+The helper updates the physical device first and replaces the Host token only
+after USB provisioning succeeds.
 
 You can also clear runtime config by holding both StickS3 buttons during boot.
 On public builds that returns the device to the `USB Setup` screen.

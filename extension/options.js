@@ -7,7 +7,7 @@ async function load() {
   const v = await chrome.storage.local.get(["host", "port", "token"]);
   $("host").value = v.host || "127.0.0.1";
   $("port").value = v.port || "5577";
-  $("token").value = v.token || "dev-token";
+  $("token").value = v.token || "";
 }
 
 function setStatus(text, cls) {
@@ -30,13 +30,18 @@ async function save() {
     setStatus("Host must be 127.0.0.1 or localhost — reset to 127.0.0.1.", "err");
   }
   $("port").value = String(FIXED_PORT);
-  const token = $("token").value.trim() || "dev-token";
+  const token = $("token").value.trim();
+  if (!token) {
+    setStatus("Enter the token from the local TaskHub Host.", "err");
+    return false;
+  }
   await chrome.storage.local.set({ host, port: FIXED_PORT, token });
   if ($("status").className !== "err") setStatus("Saved.", "ok");
+  return true;
 }
 
 async function test() {
-  await save();
+  if (!(await save())) return;
   const host = $("host").value.trim();
   const port = $("port").value.trim();
   const token = $("token").value.trim();

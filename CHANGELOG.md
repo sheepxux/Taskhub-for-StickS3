@@ -2,7 +2,52 @@
 
 ## Unreleased
 
+## v2.2.0 — 2026-07-19
+
+### Added
+
+- Added a detailed WorkBuddy adapter that reads local session transcripts,
+  task titles, working folders, pending tool calls, explicit user questions,
+  completion state, and token data when present.
+- Added Kimi local conversation-state tracking with renderer CPU and visible
+  controls as fallbacks, plus a conservative Grok desktop-app fallback. An
+  open app alone reports `REC`.
+- Extended the Chrome/Edge Web Bridge with Kimi and Grok conversation-title
+  extraction and generation-state reporting.
+- Added 12x12 StickS3 source icons for Kimi, WorkBuddy, and Grok.
+- Added a secret-free macOS Host `.pkg` build pipeline with a diagnostics app,
+  random per-user token creation, LaunchAgent registration, optional Developer
+  ID signing/notarization, and a `taskhub-provision` command.
+- Added `setup.sh --rotate-token`, which writes a newly generated token to the
+  connected StickS3 before replacing the Host token, avoiding a half-rotated
+  installation when USB provisioning fails.
+
 ### Changed
+
+- WorkBuddy now clears unmatched calls from older resolved turns and expires
+  stale questions, preventing completed sessions from remaining in `WAIT`.
+- Updated the StickS3 WorkBuddy icon from generic green to its teal brand color.
+- Local adapter scans now run concurrently, and OpenClaw's slow CLI fallback is
+  opt-in. Warm full scans on the reference Mac dropped from several seconds to
+  roughly 500ms while preserving the StickS3 stale-while-revalidate fast path.
+- New Host installs no longer fall back to the public `dev-token`; generated
+  token files are permissioned to the current user, and provisioning passes
+  Wi-Fi/token values through the environment instead of process arguments.
+- Public M5Burner firmware and `secrets.h.example` now compile with an empty
+  token until setup generates a random one, so no shared default credential is
+  shipped in release binaries.
+
+- Claude Code now discovers recent CLI transcripts directly, including custom
+  conversation titles and working folders, even when no Claude Desktop session
+  metadata record exists.
+- Codex detection now recognizes the ChatGPT-embedded Codex runtime and the
+  current app-server `turn_started`, `turn_completed`, `turn_interrupted`, and
+  `turn_failed` events while retaining compatibility with older rollout events.
+- WorkBuddy task titles now use the transcript's dedicated `ai-title` event
+  instead of falling back to date-based working-directory names.
+- Kimi now cross-checks persisted conversation status with the app daemon's
+  active-turn state, so a completed task cannot stay pinned in `RUN`; renderer
+  CPU no longer creates a running state by itself.
 
 - StickS3 now shows the last successful compact task snapshot immediately after
   deep-sleep wake, then replaces it with fresh Host data when Wi-Fi sync
