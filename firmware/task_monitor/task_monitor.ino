@@ -1333,6 +1333,7 @@ static void drawTaskHubMiniMark(int x, int y, int color) {
 static int sourceLogoColor(const String& source) {
   String s = source;
   s.toLowerCase();
+  if (s.indexOf("cursor") >= 0) return C_WHITE;
   if (s.indexOf("codex") >= 0) return C_BLUE;
   if (s.indexOf("claude") >= 0) return C_AMBER;
   if (s.indexOf("perplexity") >= 0) return C_WHITE;
@@ -1352,7 +1353,20 @@ static void drawAiSourceIcon(const String& source, int x, int y, int bg) {
   int c = sourceLogoColor(source);
   M5.Display.fillRect(x, y, 12, 12, bg);
 
-  if (s.indexOf("codex") >= 0) {
+  if (s.indexOf("cursor") >= 0) {
+    // Isometric cube: hexagon outline, filled top face, center seams.
+    M5.Display.drawLine(x + 6, y + 0, x + 11, y + 3, c);
+    M5.Display.drawLine(x + 6, y + 0, x + 1, y + 3, c);
+    M5.Display.drawFastVLine(x + 11, y + 3, 6, c);
+    M5.Display.drawFastVLine(x + 1, y + 3, 6, c);
+    M5.Display.drawLine(x + 11, y + 9, x + 6, y + 11, c);
+    M5.Display.drawLine(x + 1, y + 9, x + 6, y + 11, c);
+    M5.Display.fillTriangle(x + 6, y + 0, x + 11, y + 3, x + 6, y + 6, c);
+    M5.Display.fillTriangle(x + 6, y + 0, x + 1, y + 3, x + 6, y + 6, c);
+    M5.Display.drawFastVLine(x + 6, y + 6, 6, c);
+    M5.Display.drawLine(x + 1, y + 3, x + 6, y + 6, c);
+    M5.Display.drawLine(x + 11, y + 3, x + 6, y + 6, c);
+  } else if (s.indexOf("codex") >= 0) {
     M5.Display.fillCircle(x + 4, y + 5, 3, c);
     M5.Display.fillCircle(x + 7, y + 5, 4, c);
     M5.Display.fillCircle(x + 8, y + 8, 3, c);

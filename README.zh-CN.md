@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/badge/license-MIT-374151)](LICENSE)
 
 TaskHub for StickS3 可以把 M5StickS3 变成一个小型 AI Agent 状态屏。
-Mac 上的 TaskHub Host 会读取 Codex、Claude Code、OpenClaw、Manus、
+Mac 上的 TaskHub Host 会读取 Codex、Claude Code、Cursor、OpenClaw、Manus、
 Perplexity、Gemini、Lovable、Kimi、WorkBuddy、Grok 等工具的本地任务状态，发现同一局域网内
 其他授权 Host，然后把精简后的任务列表通过 Wi-Fi 发送给 StickS3。
 
@@ -85,7 +85,8 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | 自动旋转 | Ready | IMU 重力感应按握持方向旋转屏幕；竖屏显示多任务列表（`ROTATE_*` 可调） |
 | 语音输入 | Ready | 长按 BtnB 说话（普通话/英文）→ 本地 whisper.cpp 转写 → 文字填入并发送到选中任务对应 App（`POST /voice?enter=1`） |
 | Codex 适配器 | Detailed | 标题、文件夹、回合、token、运行/等待状态 |
-| Claude Code 适配器 | Detailed | transcript 状态、等待提示、usage、resume 进程 |
+| Claude Code 适配器 | Detailed | transcript 状态、等待提示、方案批准、usage、resume 进程 |
+| Cursor 适配器 | Detailed | 会话标题/文件夹、基于活性计数的 RUN、待批准 WAIT、上下文 token 用量 |
 | OpenClaw 适配器 | Detailed | 本地任务和 session 存储 |
 | Manus 适配器 | Best effort | 本地 app storage 和 usage 计数 |
 | Perplexity 适配器 | Activity | 本地 App/浏览器活动，Computer 任务标题不保证稳定 |
@@ -122,7 +123,7 @@ mkdir -p host/models && curl -L -o host/models/ggml-large-v3-turbo-q5_0.bin \
 辅助功能），它才能向其它 App 粘贴。可调：`TASK_HUB_WHISPER_MODEL`、
 `TASK_HUB_WHISPER_LANGUAGE`（`auto`/`zh`/`en`）。设备端默认自动发送；如果想先检查文字再手动发送，
 可以设 `VOICE_AUTO_SEND 0`、`TASKHUB_VOICE_SEND=0`，或 USB 配置时传 `--voice-send off`。
-定向支持 Claude、Codex、Manus、Perplexity 桌面 App。
+定向支持 Claude、Codex、Cursor、Manus、Perplexity 桌面 App。
 
 ## 状态模型
 
@@ -148,6 +149,7 @@ flowchart LR
     Peer["其他 TaskHub Host\nscope=local"]
     Codex["Codex\nsessions + usage"]
     Claude["Claude Code\ntranscripts + resume process"]
+    Cursor["Cursor\ncomposer index + transcripts"]
     OpenClaw["OpenClaw\nlocal tasks + sessions"]
     Manus["Manus\nlocal app storage"]
     Perplexity["Perplexity\nlocal app/browser activity"]
@@ -168,6 +170,7 @@ flowchart LR
   Peer <-->|"UDP discovery + token"| Host
   Codex --> Host
   Claude --> Host
+  Cursor --> Host
   OpenClaw --> Host
   Manus --> Host
   Perplexity --> Host
@@ -384,7 +387,8 @@ TaskHub 只读取本地数据。准确性取决于对应 AI 工具是否暴露�
 | 来源 | 通常能读取到的信息 |
 | --- | --- |
 | Codex | 任务标题、文件夹、回合状态、token、RUN/WAIT |
-| Claude Code | transcript 状态、等待提示、usage、resume 进程 |
+| Claude Code | transcript 状态、等待提示、方案批准、usage、resume 进程 |
+| Cursor | 会话标题、工作区文件夹、回合状态、待批准、上下文 token 用量 |
 | OpenClaw | 本地任务 registry、session 标题、任务状态 |
 | Manus | 本地 session 元数据、时间戳、状态码、usage |
 | Perplexity | App/浏览器活动，精确任务标题不保证 |

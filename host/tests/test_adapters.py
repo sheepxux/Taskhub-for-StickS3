@@ -266,6 +266,23 @@ class ClaudeTranscriptScan(unittest.TestCase):
             os.remove(path)
             th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
 
+    def test_pending_exit_plan_mode_is_waiting(self):
+        # Claude Code 2.x plan approval: the agent stops on an ExitPlanMode
+        # tool call until the user approves the plan — that's a WAIT.
+        path = write_jsonl([
+            {"type": "user", "timestamp": iso_now(-5000), "message": {"role": "user", "content": "plan the refactor"}},
+            {"type": "assistant", "timestamp": iso_now(), "message": {
+                "role": "assistant", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": "..."}}],
+            }},
+        ])
+        try:
+            scan = th._scan_claude_transcript(path)
+            self.assertTrue(scan["waiting_for_user"])
+        finally:
+            os.remove(path)
+            th._CLAUDE_TRANSCRIPT_CACHE.pop(path, None)
+
     def test_stale_human_input_tool_is_cleared_by_later_end_turn(self):
         path = write_jsonl([
             {"type": "user", "timestamp": iso_now(-9000), "message": {"role": "user", "content": "go"}},
@@ -516,6 +533,47 @@ class CodexSessionScan(unittest.TestCase):
                 else:
                     os.environ["HOME"] = old_home
 
+    def test_state_records_fall_back_to_new_name_column(self):
+        # Newer Codex builds add `name`/`first_user_message` columns and can
+        # leave `title` empty; the record should fall back to them instead of
+        # breaking on either the old or the new schema.
+        old_home = os.environ.get("HOME")
+        now = th.now_ms()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                db_path = os.path.join(tmp, ".codex", "state_5.sqlite")
+                os.makedirs(os.path.dirname(db_path), exist_ok=True)
+                con = sqlite3.connect(db_path)
+                try:
+                    con.execute(
+                        """
+                        create table threads (
+                          id text, rollout_path text, title text, cwd text,
+                          updated_at_ms integer, tokens_used integer, model text,
+                          reasoning_effort text, archived integer, source text,
+                          thread_source text, preview text,
+                          name text, first_user_message text
+                        )
+                        """
+                    )
+                    con.execute(
+                        "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ("t-new", "", "", "/tmp/x", now, 42, "gpt-test", "", 0, "vscode", "user",
+                         "", "Named thread", "First user message text"),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+                records = th.codex_state_records(max_threads=4)
+                self.assertEqual(records[0]["title"], "Named thread")
+                self.assertEqual(records[0]["preview"], "First user message text")
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
 
 class WorkBuddySessionScan(unittest.TestCase):
     def test_ai_title_is_captured(self):
@@ -651,6 +709,241 @@ class WorkBuddySessionScan(unittest.TestCase):
         finally:
             os.remove(path)
             th._WORKBUDDY_SESSION_CACHE.pop(path, None)
+
+
+def write_cursor_db(path, headers, kv=None):
+    """Minimal replica of Cursor's global-storage DB: composerHeaders rows
+    (composerId, createdAt, lastUpdatedAt, checkpointAt, isArchived,
+    isSubagent, value-json) plus optional cursorDiskKV entries."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            """
+            create table composerHeaders (
+              composerId text primary key, workspaceId text,
+              createdAt integer, lastUpdatedAt integer,
+              isArchived integer, isSubagent integer,
+              recency integer, checkpointAt integer, value text
+            )
+            """
+        )
+        con.execute("create table cursorDiskKV (key text primary key, value text)")
+        for row in headers:
+            con.execute(
+                "insert into composerHeaders (composerId, createdAt, lastUpdatedAt, checkpointAt, isArchived, isSubagent, value) values (?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+        for key, value in (kv or {}).items():
+            con.execute("insert into cursorDiskKV (key, value) values (?, ?)", (key, value))
+        con.commit()
+    finally:
+        con.close()
+
+
+CURSOR_COMMANDS = ["  123   0.0 /Applications/Cursor.app/Contents/MacOS/Cursor"]
+
+
+class CursorSessionScan(unittest.TestCase):
+    def _cleanup(self, path):
+        os.remove(path)
+        th._CURSOR_TRANSCRIPT_CACHE.pop(path, None)
+
+    def test_tool_use_tail_is_active_turn(self):
+        path = write_jsonl([
+            {"role": "user", "message": {"content": [{"type": "text", "text": "<user_query>\nfix the bug\n</user_query>"}]}},
+            {"role": "assistant", "message": {"content": [
+                {"type": "text", "text": "Looking at it."},
+                {"type": "tool_use", "name": "Shell", "input": {}},
+            ]}},
+        ])
+        try:
+            scan = th._scan_cursor_transcript(path)
+            self.assertTrue(scan["active_turn"])
+            self.assertFalse(scan["completed"])
+            self.assertEqual(scan["first_user_text"], "fix the bug")
+            self.assertEqual(scan["turns"], 1)
+            self.assertEqual(th.cursor_status(scan, {}, app_is_running=True), "running")
+            # Without the Cursor process a fresh mtime alone must not RUN.
+            self.assertNotEqual(th.cursor_status(scan, {}, app_is_running=False), "running")
+        finally:
+            self._cleanup(path)
+
+    def test_final_text_message_is_done(self):
+        path = write_jsonl([
+            {"role": "user", "message": {"content": [{"type": "text", "text": "do it"}]}},
+            {"role": "assistant", "message": {"content": [{"type": "text", "text": "Done. Everything passes."}]}},
+        ])
+        try:
+            scan = th._scan_cursor_transcript(path)
+            self.assertFalse(scan["active_turn"])
+            self.assertTrue(scan["completed"])
+            self.assertEqual(th.cursor_status(scan, {}, app_is_running=True), "done")
+        finally:
+            self._cleanup(path)
+
+    def test_turn_ended_error_is_failed_but_abort_is_not(self):
+        path = write_jsonl([
+            {"role": "user", "message": {"content": [{"type": "text", "text": "go"}]}},
+            {"type": "turn_ended", "status": "error", "error": "Model not available"},
+        ])
+        try:
+            scan = th._scan_cursor_transcript(path)
+            self.assertTrue(scan["failed"])
+            self.assertEqual(th.cursor_status(scan, {}, app_is_running=True), "failed")
+        finally:
+            self._cleanup(path)
+
+        path = write_jsonl([
+            {"role": "user", "message": {"content": [{"type": "text", "text": "go"}]}},
+            {"type": "turn_ended", "status": "error", "error": "User aborted request"},
+        ])
+        try:
+            scan = th._scan_cursor_transcript(path)
+            self.assertFalse(scan["failed"])
+            self.assertTrue(scan["completed"])
+        finally:
+            self._cleanup(path)
+
+    def test_pending_ask_question_waits_only_after_stall(self):
+        path = write_jsonl([
+            {"role": "user", "message": {"content": [{"type": "text", "text": "help"}]}},
+            {"role": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "AskQuestion", "input": {}},
+            ]}},
+        ])
+        try:
+            scan = th._scan_cursor_transcript(path)
+            self.assertTrue(scan["waiting_for_user"])
+            self.assertFalse(scan["active_turn"])
+            # Fresh activity → the stall hasn't been confirmed yet, no WAIT.
+            self.assertNotEqual(th.cursor_status(scan, {}, app_is_running=True), "waiting")
+            stalled = (th.now_ms() - th.CURSOR_WAIT_CONFIRM_MS - 5000) / 1000
+            os.utime(path, (stalled, stalled))
+            th._CURSOR_TRANSCRIPT_CACHE.pop(path, None)
+            scan = th._scan_cursor_transcript(path)
+            self.assertEqual(th.cursor_status(scan, {}, app_is_running=True), "waiting")
+        finally:
+            self._cleanup(path)
+
+    def test_user_reply_clears_pending_question(self):
+        path = write_jsonl([
+            {"role": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "AskQuestion", "input": {}},
+            ]}},
+            {"role": "user", "message": {"content": [{"type": "text", "text": "option B"}]}},
+        ])
+        try:
+            scan = th._scan_cursor_transcript(path)
+            self.assertFalse(scan["waiting_for_user"])
+            self.assertTrue(scan["active_turn"])
+        finally:
+            self._cleanup(path)
+
+    def test_blocking_pending_actions_wait_requires_stall(self):
+        # hasBlockingPendingActions is also true while tools merely execute;
+        # ticking counters (fresh activity_ms) must suppress the WAIT.
+        scan = {"active_turn": True, "latest_event_ms": th.now_ms() - 10 * 60 * 1000}
+        header = {
+            "has_blocking_pending_actions": True,
+            "updated_ms": th.now_ms() - 10 * 60 * 1000,
+            "activity_ms": th.now_ms(),
+        }
+        self.assertEqual(th.cursor_status(scan, header, app_is_running=True), "running")
+        header["activity_ms"] = th.now_ms() - th.CURSOR_WAIT_CONFIRM_MS - 5000
+        self.assertEqual(th.cursor_status(scan, header, app_is_running=True), "waiting")
+
+    def test_headers_and_adapter_end_to_end(self):
+        now = th.now_ms()
+        original_db = th.CURSOR_GLOBAL_STORAGE_DB
+        original_root = th.CURSOR_PROJECTS_ROOT
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                db_path = os.path.join(tmp, "state.vscdb")
+                composer_id = "11111111-2222-3333-4444-555555555555"
+                value = json.dumps({
+                    "type": "head",
+                    "composerId": composer_id,
+                    "name": "Fix the flaky test",
+                    "unifiedMode": "agent",
+                    "hasBlockingPendingActions": False,
+                    "contextUsagePercent": 12.5,
+                    "filesChangedCount": 2,
+                    "totalLinesAdded": 10,
+                    "totalLinesRemoved": 3,
+                    "workspaceIdentifier": {"id": "w1", "uri": {"fsPath": "/tmp/MyProj"}},
+                })
+                draft = json.dumps({"composerId": "empty-state-draft", "isDraft": True})
+                write_cursor_db(
+                    db_path,
+                    [
+                        (composer_id, now - 60000, now - 5000, now - 4000, 0, 0, value),
+                        ("empty-state-draft", now, now, None, 0, 0, draft),
+                        ("archived-one", now, now, None, 1, 0, value),
+                    ],
+                    kv={
+                        f"composerData:{composer_id}": json.dumps({
+                            "contextTokensUsed": 12345,
+                            "contextTokenLimit": 100000,
+                            "conversationCheckpointLastUpdatedAt": now - 3000,
+                            "status": "aborted",
+                            "queueItems": [],
+                        }),
+                        f"bubbleId:{composer_id}:b1": "{}",
+                        f"bubbleId:{composer_id}:b2": "{}",
+                    },
+                )
+                transcript_dir = os.path.join(tmp, "projects", "tmp-MyProj", "agent-transcripts", composer_id)
+                os.makedirs(transcript_dir)
+                transcript = os.path.join(transcript_dir, f"{composer_id}.jsonl")
+                with open(transcript, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": "<user_query>fix it</user_query>"}]}}) + "\n")
+                    fh.write(json.dumps({"role": "assistant", "message": {"content": [{"type": "tool_use", "name": "Shell", "input": {}}]}}) + "\n")
+
+                th.CURSOR_GLOBAL_STORAGE_DB = db_path
+                th.CURSOR_PROJECTS_ROOT = os.path.join(tmp, "projects")
+
+                headers = th.cursor_composer_headers(10)
+                self.assertEqual(len(headers), 1)  # draft + archived filtered out
+                self.assertEqual(headers[0]["name"], "Fix the flaky test")
+                self.assertEqual(headers[0]["cwd"], "/tmp/MyProj")
+
+                tasks = th.CursorAdapter().list_tasks(CURSOR_COMMANDS)
+                self.assertEqual(len(tasks), 1)
+                result = tasks[0]
+                self.assertEqual(result["title"], "Fix the flaky test")
+                self.assertEqual(result["status"], "running")
+                self.assertTrue(result["id"].startswith("cursor-"))
+                self.assertIn("MyProj", result["subtitle"])
+                self.assertEqual(result["usage"]["total_tokens"], 12345)
+                self.assertEqual(result["_open"], {"type": "app", "target": "com.todesktop.230313mzl4w4u92"})
+                th._CURSOR_TRANSCRIPT_CACHE.pop(transcript, None)
+            finally:
+                th.CURSOR_GLOBAL_STORAGE_DB = original_db
+                th.CURSOR_PROJECTS_ROOT = original_root
+
+    def test_transcript_fallback_when_db_missing(self):
+        original_db = th.CURSOR_GLOBAL_STORAGE_DB
+        original_root = th.CURSOR_PROJECTS_ROOT
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                composer_id = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+                transcript_dir = os.path.join(tmp, "projects", "proj", "agent-transcripts", composer_id)
+                os.makedirs(transcript_dir)
+                transcript = os.path.join(transcript_dir, f"{composer_id}.jsonl")
+                with open(transcript, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": "<user_query>build the app</user_query>"}]}}) + "\n")
+                    fh.write(json.dumps({"role": "assistant", "message": {"content": [{"type": "text", "text": "Done."}]}}) + "\n")
+                th.CURSOR_GLOBAL_STORAGE_DB = os.path.join(tmp, "missing.vscdb")
+                th.CURSOR_PROJECTS_ROOT = os.path.join(tmp, "projects")
+                tasks = th.CursorAdapter().list_tasks(CURSOR_COMMANDS)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0]["title"], "build the app")
+                self.assertEqual(tasks[0]["status"], "done")
+                self.assertEqual(tasks[0]["detail"]["metadata_source"], "cursor-transcript")
+                th._CURSOR_TRANSCRIPT_CACHE.pop(transcript, None)
+            finally:
+                th.CURSOR_GLOBAL_STORAGE_DB = original_db
+                th.CURSOR_PROJECTS_ROOT = original_root
 
 
 class DesktopWebAiSignals(unittest.TestCase):

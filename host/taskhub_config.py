@@ -54,7 +54,10 @@ CLAUDE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLAUDE_RUNNING_STALE_MS",
 CLAUDE_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CLAUDE_DONE_WINDOW_MS", "300000"))
 CLAUDE_MAX_TRANSCRIPTS = int(os.environ.get("TASK_HUB_CLAUDE_MAX_TRANSCRIPTS", "12"))
 CLAUDE_TERMINAL_STOP_REASONS = {"end_turn", "stop_sequence", "max_tokens"}
-CLAUDE_HUMAN_INPUT_TOOLS = {"AskUserQuestion"}
+# Tools whose unanswered tool_use blocks the turn on user input. ExitPlanMode
+# is Claude Code's plan-approval prompt (2.x): the agent stops and waits for
+# the user to approve the plan, which is a WAIT on the device, not a RUN.
+CLAUDE_HUMAN_INPUT_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
 CODEX_HUMAN_INPUT_FUNCTIONS = {"request_user_input"}
 OPENCLAW_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_OPENCLAW_RUNNING_STALE_MS", "1800000"))
@@ -83,6 +86,36 @@ LOVABLE_DOMAINS = tuple(
     if part.strip()
 )
 LOVABLE_MAX_TABS = int(os.environ.get("TASK_HUB_LOVABLE_MAX_TABS", "3"))
+# Cursor IDE agent sessions, read from Cursor's global composer index plus the
+# per-project agent transcripts under ~/.cursor/projects.
+CURSOR_MAX_SESSIONS = int(os.environ.get("TASK_HUB_CURSOR_MAX_SESSIONS", "6"))
+# Transcript lines carry no timestamps, so RUN freshness rides on file mtime /
+# composer lastUpdatedAt. Cursor flushes transcripts lazily during a long turn,
+# so keep this generous (like Codex); the Cursor-process gate already ends RUN
+# immediately when the app quits.
+CURSOR_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CURSOR_RUNNING_STALE_MS", "900000"))
+CURSOR_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CURSOR_DONE_WINDOW_MS", "300000"))
+CURSOR_FAILED_TTL_MS = int(os.environ.get("TASK_HUB_CURSOR_FAILED_TTL_MS", "600000"))
+# Cursor sets hasBlockingPendingActions while tool calls are merely in flight,
+# not only when an approval is pending, so a WAIT signal counts only after the
+# composer's checkpoint activity has stalled for this long. Checkpoints update
+# continuously during generation and stall when the agent is actually blocked.
+CURSOR_WAIT_CONFIRM_MS = int(os.environ.get("TASK_HUB_CURSOR_WAIT_CONFIRM_MS", "120000"))
+# Cursor sets hasBlockingPendingActions while tools are merely executing, not
+# only when an approval is pending. Only report WAIT once composer activity
+# (lastUpdatedAt/checkpointAt) has stalled for this long — a generating agent
+# keeps bumping those, a blocked approval does not.
+CURSOR_WAIT_CONFIRM_MS = int(os.environ.get("TASK_HUB_CURSOR_WAIT_CONFIRM_MS", "180000"))
+# Transcripts flush lazily (often only at turn end). If the composer index is
+# newer than the transcript by more than this, there is an unflushed turn in
+# progress and the transcript's end-of-file verdict is outdated.
+CURSOR_TRANSCRIPT_LAG_MS = int(os.environ.get("TASK_HUB_CURSOR_TRANSCRIPT_LAG_MS", "15000"))
+CURSOR_GLOBAL_STORAGE_DB = os.environ.get(
+    "TASK_HUB_CURSOR_GLOBAL_STORAGE_DB",
+    "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+)
+CURSOR_PROJECTS_ROOT = os.environ.get("TASK_HUB_CURSOR_PROJECTS_ROOT", "~/.cursor/projects")
+CURSOR_HUMAN_INPUT_TOOLS = {"AskQuestion"}
 WORKBUDDY_MAX_SESSIONS = int(os.environ.get("TASK_HUB_WORKBUDDY_MAX_SESSIONS", "6"))
 WORKBUDDY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_WORKBUDDY_RUNNING_STALE_MS", "600000"))
 WORKBUDDY_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_WORKBUDDY_DONE_WINDOW_MS", "300000"))

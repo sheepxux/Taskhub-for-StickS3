@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- Added a detailed Cursor adapter. It reads Cursor's composer index
+  (`state.vscdb`) and the per-project agent transcripts under
+  `~/.cursor/projects` for chat titles, workspace folders, turn state,
+  real context-token usage, and DONE/FAIL turn endings. WAIT (pending
+  approval or an unanswered AskQuestion) is confirmed by a live-counter
+  stall, so an agent that is still generating is never mis-flagged while
+  a genuinely blocked one alerts within about two minutes. BtnB opens the
+  Cursor app and voice input can target it.
+
+### Changed
+
+- Claude Code plan approvals (`ExitPlanMode`) now count as WAIT, same as
+  `AskUserQuestion` — Claude Code 2.x stops and waits for the user to approve
+  the plan, which is attention, not RUN.
+- Codex state-DB reads now probe the newer optional columns (`name`,
+  `first_user_message`) added around 0.146 and fall back to them when
+  `title`/`preview` are empty, while remaining compatible with older schemas.
+
 ## v2.2.0 — 2026-07-19
 
 ### Added

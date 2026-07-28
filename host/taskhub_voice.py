@@ -81,6 +81,7 @@ WHISPER_LANGUAGE = os.environ.get("TASK_HUB_WHISPER_LANGUAGE", "auto")
 SOURCE_BUNDLES = {
     "claude": "com.anthropic.claudefordesktop",
     "codex": "com.openai.codex",
+    "cursor": "com.todesktop.230313mzl4w4u92",
     "kimi": "com.moonshot.kimichat",
     "manus": "im.manus.desktop",
     "perplexity": "ai.perplexity.macv3",

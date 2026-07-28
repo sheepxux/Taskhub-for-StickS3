@@ -13,8 +13,8 @@ A pocket hardware dashboard for AI agent work across your Macs.
 
 TaskHub for StickS3 turns an M5StickS3 into a tiny always-nearby status screen
 for AI coding agents, desktop AI apps, and browser-based agent tools. A local
-Mac Host reads task metadata from sources such as Codex, Claude Code, OpenClaw,
-Manus, Perplexity, Gemini, Lovable, Kimi, WorkBuddy, and Grok, discovers other authorized TaskHub Hosts
+Mac Host reads task metadata from sources such as Codex, Claude Code, Cursor,
+OpenClaw, Manus, Perplexity, Gemini, Lovable, Kimi, WorkBuddy, and Grok, discovers other authorized TaskHub Hosts
 on the same LAN, then sends a compact task list to the StickS3 over Wi-Fi.
 
 The device shows which task is running, which one needs your input, what
@@ -86,7 +86,8 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Auto-rotation | Ready | IMU gravity rotates the screen to match how it's held; portrait shows a multi-task list (`ROTATE_*` tunable) |
 | Voice input | Ready | Hold BtnB to dictate (Mandarin/English) → local whisper.cpp → text pasted and sent in the selected task's app (`POST /voice?enter=1`) |
 | Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
-| Claude Code adapter | Detailed | Tracks transcript turn state, prompts, usage, resume process |
+| Claude Code adapter | Detailed | Tracks transcript turn state, prompts, plan approvals, usage, resume process |
+| Cursor adapter | Detailed | Composer title/folder, RUN via live counters, pending-approval WAIT, context token usage |
 | OpenClaw adapter | Detailed | Reads local task/session stores |
 | Manus adapter | Best effort | Reads local app storage and usage counters when available |
 | Perplexity adapter | Activity | Local app/browser activity; exact Perplexity Computer tasks are not guaranteed |
@@ -143,7 +144,7 @@ Accessibility) so it can paste into other apps. Tunables: `TASK_HUB_WHISPER_MODE
 `TASK_HUB_WHISPER_LANGUAGE` (`auto`/`zh`/`en`). Device-side auto-send is on by
 default; set `VOICE_AUTO_SEND 0`, `TASKHUB_VOICE_SEND=0`, or provision with
 `--voice-send off` if you want paste-only review before sending. Targeting works
-for Claude, Codex, Manus, and Perplexity desktop apps.
+for Claude, Codex, Cursor, Manus, and Perplexity desktop apps.
 
 ## Status Model
 
@@ -186,6 +187,7 @@ flowchart LR
     Peer["Peer TaskHub Host\nscope=local"]
     Codex["Codex\nsessions + usage"]
     Claude["Claude Code\ntranscripts + resume process"]
+    Cursor["Cursor\ncomposer index + transcripts"]
     OpenClaw["OpenClaw\nlocal tasks + sessions"]
     Manus["Manus\nlocal app storage"]
     Perplexity["Perplexity\nlocal app/browser activity"]
@@ -206,6 +208,7 @@ flowchart LR
   Peer <-->|"UDP discovery + token"| Host
   Codex --> Host
   Claude --> Host
+  Cursor --> Host
   OpenClaw --> Host
   Manus --> Host
   Perplexity --> Host
@@ -461,7 +464,8 @@ disk, through local process state, or through visible browser UI.
 | Source | What is usually available |
 | --- | --- |
 | Codex | Task title, folder, turn state, token usage, running/wait status |
-| Claude Code | Transcript state, prompt/wait detection, usage, resume process |
+| Claude Code | Transcript state, prompt/wait detection, plan approvals, usage, resume process |
+| Cursor | Composer title, workspace folder, turn state, pending approvals, context token usage |
 | OpenClaw | Local task registry, session title, task state |
 | Manus | Local session metadata, timestamps, status codes, usage counters |
 | Perplexity | App/browser activity; exact Perplexity Computer task names may be unavailable |

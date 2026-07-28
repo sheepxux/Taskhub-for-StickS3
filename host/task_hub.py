@@ -48,6 +48,16 @@ from taskhub_config import (
     CODEX_HUMAN_INPUT_FUNCTIONS,
     CODEX_MAX_THREADS,
     CODEX_RUNNING_STALE_MS,
+    CURSOR_DONE_WINDOW_MS,
+    CURSOR_FAILED_TTL_MS,
+    CURSOR_GLOBAL_STORAGE_DB,
+    CURSOR_HUMAN_INPUT_TOOLS,
+    CURSOR_MAX_SESSIONS,
+    CURSOR_PROJECTS_ROOT,
+    CURSOR_RUNNING_STALE_MS,
+    CURSOR_WAIT_CONFIRM_MS,
+    CURSOR_TRANSCRIPT_LAG_MS,
+    CURSOR_WAIT_CONFIRM_MS,
     DEFAULT_BIND,
     DEFAULT_DISCOVERY_PORT,
     DEFAULT_PORT,
@@ -108,6 +118,7 @@ _CLAUDE_TRANSCRIPT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # Same idea for Codex session rollouts; codex_usage_records() walks up to 80
 # *.jsonl files per /tasks request, so memoising makes idle sessions free.
 _CODEX_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_CURSOR_TRANSCRIPT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _WORKBUDDY_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # ThreadingHTTPServer serves /tasks from multiple threads, and the bounded-cache
 # helpers below mutate the OrderedDict in several steps (set → move_to_end →
@@ -1273,10 +1284,23 @@ def codex_state_records(max_threads: int = CODEX_MAX_THREADS) -> List[Dict[str, 
             con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
             con.row_factory = sqlite3.Row
             try:
+                # Newer Codex builds (0.146+) add columns like `name` and
+                # `first_user_message`; older DBs lack them, so probe first
+                # instead of hard-coding a schema that breaks either way.
+                available = {
+                    str(row[1])
+                    for row in con.execute("pragma table_info(threads)").fetchall()
+                }
+                optional = [col for col in ("name", "first_user_message") if col in available]
+                columns = (
+                    "id, rollout_path, title, cwd, updated_at_ms, tokens_used, "
+                    "model, reasoning_effort, archived, source, thread_source, preview"
+                )
+                if optional:
+                    columns += ", " + ", ".join(optional)
                 rows = con.execute(
-                    """
-                    select id, rollout_path, title, cwd, updated_at_ms, tokens_used,
-                           model, reasoning_effort, archived, source, thread_source, preview
+                    f"""
+                    select {columns}
                     from threads
                     where archived = 0
                     order by updated_at_ms desc
@@ -1325,8 +1349,8 @@ def codex_state_records(max_threads: int = CODEX_MAX_THREADS) -> List[Dict[str, 
                 "id": thread_id,
                 "cwd": str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else "")),
                 "folder": folder_label(str(item.get("cwd") or (scan.get("cwd") if isinstance(scan, dict) else ""))),
-                "title": str(item.get("title") or ""),
-                "preview": str(item.get("preview") or ""),
+                "title": str(item.get("title") or item.get("name") or ""),
+                "preview": str(item.get("preview") or item.get("first_user_message") or ""),
                 "updated_ms": updated_ms,
                 "latest_event_ms": safe_int(scan.get("latest_event_ms") if isinstance(scan, dict) else 0) or updated_ms,
                 "latest_turn_id": scan.get("latest_turn_id") if isinstance(scan, dict) else "",
@@ -2132,6 +2156,444 @@ class CodexAdapter:
                     usage=usage,
                     open_action={"type": "app", "target": "com.openai.codex"},
                     needs_attention=bool(record.get("waiting_for_user")),
+                )
+            )
+        return tasks
+
+
+def cursor_user_query_text(value: Any) -> str:
+    """Cursor transcripts wrap the user's actual prompt in a <user_query> tag
+    alongside injected context (timestamps, attached files). Pull out just the
+    query so task titles don't show markup."""
+    text = extract_text(value) if not isinstance(value, str) else value
+    match = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.DOTALL)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _scan_cursor_transcript(path: str) -> Optional[Dict[str, Any]]:
+    """Walk a Cursor agent transcript once and memoise by (mtime, size).
+
+    Lines are either chat messages ({"role": ..., "message": {"content": [...]}})
+    or turn markers ({"type": "turn_ended", "status": "success"|"error"}).
+    Lines carry no timestamps, so activity freshness rides on file mtime."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cache_key = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = bounded_cache_get(_CURSOR_TRANSCRIPT_CACHE, path, cache_key)
+    if cached:
+        return cached
+
+    first_user_text = ""
+    user_turns = 0
+    last_kind = ""
+    last_error = ""
+    question_pending = False
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "") == "turn_ended":
+                    status = str(item.get("status") or "").lower()
+                    last_kind = "error" if status == "error" else "done"
+                    last_error = str(item.get("error") or "")
+                    continue
+                role = str(item.get("role") or "")
+                message = item.get("message")
+                content = (message or {}).get("content") if isinstance(message, dict) else None
+                if role == "user":
+                    # Any user line (a reply, an answer to AskQuestion, a new
+                    # prompt) resolves a pending question.
+                    question_pending = False
+                    last_kind = "user"
+                    text = extract_text(content)
+                    if text:
+                        user_turns += 1
+                        if not first_user_text:
+                            first_user_text = cursor_user_query_text(text)
+                elif role == "assistant":
+                    names = tool_use_names(content)
+                    if any(name in CURSOR_HUMAN_INPUT_TOOLS for name in names):
+                        question_pending = True
+                    last_kind = "assistant_tool" if names else "assistant_text"
+    except OSError:
+        return None
+
+    # A user-aborted turn is logged as turn_ended error; that's the user's own
+    # action, not a failure worth a red FAIL row on the device.
+    aborted = "abort" in last_error.lower()
+    scan = {
+        "_key": cache_key,
+        "first_user_text": first_user_text,
+        "turns": user_turns,
+        "latest_event_ms": int(st.st_mtime * 1000),
+        "last_kind": last_kind,
+        "last_error": last_error,
+        "waiting_for_user": question_pending,
+        # Mid-turn: the agent still owes a response (fresh user prompt) or is
+        # mid tool loop (assistant message ending in tool_use).
+        "active_turn": last_kind in {"user", "assistant_tool"} and not question_pending,
+        "completed": last_kind in {"assistant_text", "done"} or (last_kind == "error" and aborted),
+        "failed": last_kind == "error" and not aborted,
+    }
+    bounded_cache_set(_CURSOR_TRANSCRIPT_CACHE, path, scan)
+    return scan
+
+
+def cursor_composer_headers(limit: int) -> List[Dict[str, Any]]:
+    """Read Cursor's composer index (composerHeaders in the global-storage
+    SQLite DB). This is the authoritative recent-session list: chat title,
+    workspace folder, pending-approval flag, and context usage."""
+    path = os.path.expanduser(CURSOR_GLOBAL_STORAGE_DB)
+    if not os.path.isfile(path):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                select composerId, createdAt, lastUpdatedAt, checkpointAt, value
+                from composerHeaders
+                where coalesce(isArchived, 0) = 0 and coalesce(isSubagent, 0) = 0
+                order by coalesce(lastUpdatedAt, 0) desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+    headers: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            value = json.loads(item.get("value") or "{}")
+        except json.JSONDecodeError:
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        composer_id = str(item.get("composerId") or value.get("composerId") or "")
+        if not composer_id or composer_id == "empty-state-draft" or value.get("isDraft"):
+            continue
+        workspace = value.get("workspaceIdentifier") if isinstance(value.get("workspaceIdentifier"), dict) else {}
+        uri = workspace.get("uri") if isinstance(workspace.get("uri"), dict) else {}
+        headers.append(
+            {
+                "composer_id": composer_id,
+                "name": str(value.get("name") or ""),
+                "cwd": str(uri.get("fsPath") or ""),
+                "updated_ms": max(
+                    safe_int(item.get("lastUpdatedAt")),
+                    safe_int(item.get("checkpointAt")),
+                    safe_int(value.get("conversationCheckpointLastUpdatedAt")),
+                ),
+                "created_ms": safe_int(item.get("createdAt")),
+                "has_blocking_pending_actions": bool(value.get("hasBlockingPendingActions")),
+                "has_pending_plan": bool(value.get("hasPendingPlan")),
+                "has_unread_messages": bool(value.get("hasUnreadMessages")),
+                "context_usage_percent": safe_float(value.get("contextUsagePercent")),
+                "mode": str(value.get("unifiedMode") or ""),
+                "last_edits": str(value.get("subtitle") or ""),
+                "files_changed": safe_int(value.get("filesChangedCount")),
+                "lines_added": safe_int(value.get("totalLinesAdded")),
+                "lines_removed": safe_int(value.get("totalLinesRemoved")),
+            }
+        )
+    return headers
+
+
+def cursor_composer_live(composer_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Per-composer live counters from Cursor's KV store: bubble (message)
+    count and the composerData blob's token/checkpoint fields. These are the
+    values that keep moving while an agent generates, so together they form a
+    change signature that distinguishes RUN (still ticking) from a genuinely
+    blocked WAIT (frozen)."""
+    path = os.path.expanduser(CURSOR_GLOBAL_STORAGE_DB)
+    if not composer_ids or not os.path.isfile(path):
+        return {}
+    live: Dict[str, Dict[str, Any]] = {}
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        try:
+            for composer_id in composer_ids:
+                info: Dict[str, Any] = {}
+                # ';' sorts right after ':', making this a pure index range scan.
+                row = con.execute(
+                    "select count(*) from cursorDiskKV where key >= ? and key < ?",
+                    (f"bubbleId:{composer_id}:", f"bubbleId:{composer_id};"),
+                ).fetchone()
+                info["bubble_count"] = safe_int(row[0] if row else 0)
+                row = con.execute(
+                    "select value from cursorDiskKV where key = ?",
+                    (f"composerData:{composer_id}",),
+                ).fetchone()
+                if row and row[0]:
+                    try:
+                        data = json.loads(row[0])
+                    except (json.JSONDecodeError, TypeError):
+                        data = {}
+                    if isinstance(data, dict):
+                        info["tokens_used"] = safe_int(data.get("contextTokensUsed"))
+                        info["token_limit"] = safe_int(data.get("contextTokenLimit"))
+                        info["checkpoint_ms"] = safe_int(data.get("conversationCheckpointLastUpdatedAt"))
+                        info["composer_status"] = str(data.get("status") or "")
+                        queue = data.get("queueItems")
+                        info["queued"] = len(queue) if isinstance(queue, list) else 0
+                live[composer_id] = info
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return live
+    return live
+
+
+def cursor_transcript_index() -> Dict[str, str]:
+    """Map composerId -> main transcript path. Subagent transcripts live one
+    directory deeper (…/subagents/*.jsonl) and are intentionally not matched."""
+    root = os.path.expanduser(CURSOR_PROJECTS_ROOT)
+    index: Dict[str, str] = {}
+    for path in glob.glob(os.path.join(root, "*", "agent-transcripts", "*", "*.jsonl")):
+        composer_id = os.path.splitext(os.path.basename(path))[0]
+        if os.path.basename(os.path.dirname(path)) != composer_id:
+            continue
+        current = index.get(composer_id)
+        try:
+            if not current or os.path.getmtime(path) > os.path.getmtime(current):
+                index[composer_id] = path
+        except OSError:
+            continue
+    return index
+
+
+def cursor_status(scan: Dict[str, Any], header: Dict[str, Any], app_is_running: bool = False) -> str:
+    latest = max(
+        safe_int(scan.get("latest_event_ms")),
+        safe_int(header.get("updated_ms")),
+        safe_int(header.get("checkpoint_ms")),
+        safe_int(header.get("activity_ms")),
+    )
+    age = now_ms() - latest if latest else None
+    waiting = bool(
+        scan.get("waiting_for_user")
+        or header.get("has_blocking_pending_actions")
+        or header.get("has_pending_plan")
+    )
+    # WAIT only once activity has stalled: hasBlockingPendingActions is also
+    # true while tools are merely executing. While the agent generates, its
+    # bubble/token counters keep changing (tracked as activity_ms); a genuinely
+    # blocked agent goes quiet, so require the stall before alerting.
+    if waiting and age is not None and CURSOR_WAIT_CONFIRM_MS <= age <= QUESTION_WAITING_STALE_MS:
+        return "waiting"
+    # RUN requires the Cursor process. The transcript flushes lazily at turn
+    # boundaries, so mid-turn its tail can still show the previous turn's
+    # ending; ticking live counters (activity_ms) override that stale tail.
+    activity_ms = safe_int(header.get("activity_ms"))
+    activity_fresh = bool(activity_ms and now_ms() - activity_ms < CURSOR_WAIT_CONFIRM_MS)
+    if (
+        app_is_running
+        and (activity_fresh or scan.get("active_turn"))
+        and not scan.get("completed")
+        and age is not None
+        and age < CURSOR_RUNNING_STALE_MS
+    ):
+        return "running"
+    if scan.get("failed") and age is not None and age < CURSOR_FAILED_TTL_MS:
+        return "failed"
+    if (scan.get("completed") or header.get("composer_status") == "completed") and age is not None and age < CURSOR_DONE_WINDOW_MS:
+        return "done"
+    if age is not None and age < ACTIVE_MINUTES * 60 * 1000:
+        return "recent"
+    return "idle"
+
+
+def cursor_turn_state(status: str) -> str:
+    return {
+        "waiting": "wait",
+        "running": "active",
+        "done": "done",
+        "failed": "fail",
+    }.get(status, "")
+
+
+class CursorAdapter:
+    source = "Cursor"
+
+    def __init__(self) -> None:
+        self.bundle_id = "com.todesktop.230313mzl4w4u92"
+        # composer_id -> {"sig": tuple, "changed_ms": int}. Tracks when each
+        # composer's live counters last moved so cursor_status can tell a
+        # generating agent (counters ticking) from a blocked one (frozen).
+        self._activity: Dict[str, Dict[str, Any]] = {}
+        self._activity_lock = threading.Lock()
+
+    def _mark_activity(self, composer_id: str, signature: Tuple, baseline_ms: int) -> int:
+        with self._activity_lock:
+            entry = self._activity.get(composer_id)
+            if not entry:
+                # First observation says nothing about change: anchor to the
+                # composer's own timestamps, otherwise a Host (re)start would
+                # make every old chat look freshly active for a while.
+                entry = {"sig": signature, "changed_ms": baseline_ms}
+                self._activity[composer_id] = entry
+            elif entry.get("sig") != signature:
+                entry = {"sig": signature, "changed_ms": now_ms()}
+                self._activity[composer_id] = entry
+            while len(self._activity) > 64:
+                self._activity.pop(next(iter(self._activity)))
+            return safe_int(entry.get("changed_ms"))
+
+    def _build_task(
+        self,
+        composer_id: str,
+        header: Dict[str, Any],
+        scan: Dict[str, Any],
+        status: str,
+        updated: int,
+        metadata_source: str,
+    ) -> Task:
+        cwd = str(header.get("cwd") or "")
+        title = task_title_text(
+            header.get("name") or scan.get("first_user_text"),
+            folder_label(cwd) or "Cursor agent",
+        )
+        turns = safe_int(scan.get("turns"))
+        context_percent = safe_float(header.get("context_usage_percent"))
+        usage = build_usage(
+            total_tokens=safe_int(header.get("tokens_used")),
+            turns=turns,
+            rate_percent=context_percent if context_percent and context_percent > 0 else None,
+            fields={
+                "source": "cursor-composer",
+                "context_usage_percent": context_percent,
+                "context_token_limit": safe_int(header.get("token_limit")),
+                "files_changed": safe_int(header.get("files_changed")),
+                "lines_added": safe_int(header.get("lines_added")),
+                "lines_removed": safe_int(header.get("lines_removed")),
+            },
+        )
+        return task(
+            task_id=stable_id("cursor", composer_id),
+            source=self.source,
+            title=title,
+            status=status,
+            updated_ms=updated or None,
+            subtitle=join_parts(
+                [
+                    folder_label(cwd),
+                    f"t{turns}" if turns else "",
+                    cursor_turn_state(status),
+                ]
+            )
+            or "Cursor agent",
+            detail={
+                "composer_id": composer_id,
+                "cwd": cwd,
+                "mode": header.get("mode"),
+                "last_edits": header.get("last_edits"),
+                "has_blocking_pending_actions": bool(header.get("has_blocking_pending_actions")),
+                "has_pending_plan": bool(header.get("has_pending_plan")),
+                "waiting_for_user": bool(scan.get("waiting_for_user")),
+                "active_turn": bool(scan.get("active_turn")),
+                "last_kind": scan.get("last_kind"),
+                "last_error": scan.get("last_error"),
+                "metadata_source": metadata_source,
+            },
+            usage=usage,
+            open_action={"type": "app", "target": self.bundle_id},
+            needs_attention=status == "waiting",
+        )
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        app_is_running = app_running(commands, "/Applications/Cursor.app", "Cursor") or any(
+            ci_contains("cursor-agent", line) for line in commands
+        )
+        cutoff = now_ms() - ACTIVE_MINUTES * 60 * 1000
+        transcripts = cursor_transcript_index()
+        headers = cursor_composer_headers(max(CURSOR_MAX_SESSIONS * 4, CURSOR_MAX_SESSIONS))
+
+        # Live counters only matter for composers that could still be RUN/WAIT;
+        # skip the KV reads for clearly stale rows.
+        candidate_ids = [
+            str(header.get("composer_id") or "")
+            for header in headers
+            if safe_int(header.get("updated_ms")) >= cutoff
+        ]
+        live = cursor_composer_live(candidate_ids[: max(CURSOR_MAX_SESSIONS * 2, CURSOR_MAX_SESSIONS)])
+
+        tasks: List[Task] = []
+        seen: set = set()
+        for header in headers:
+            composer_id = str(header.get("composer_id") or "")
+            seen.add(composer_id)
+            path = transcripts.get(composer_id, "")
+            scan = (_scan_cursor_transcript(path) if path else None) or {}
+            header.update(live.get(composer_id) or {})
+            updated = max(
+                safe_int(header.get("updated_ms")),
+                safe_int(header.get("checkpoint_ms")),
+                safe_int(scan.get("latest_event_ms")),
+            )
+            if not updated:
+                # Placeholder/cleared composers keep a header row with no
+                # timestamps and no transcript; they are not tasks.
+                continue
+            if composer_id in live:
+                signature = (
+                    safe_int(header.get("bubble_count")),
+                    safe_int(header.get("tokens_used")),
+                    safe_int(header.get("checkpoint_ms")),
+                    safe_int(header.get("updated_ms")),
+                    safe_int(scan.get("latest_event_ms")),
+                )
+                header["activity_ms"] = self._mark_activity(composer_id, signature, updated)
+            status = cursor_status(scan, header, app_is_running)
+            if status in {"recent", "idle", "done"} and updated and updated < cutoff:
+                continue
+            tasks.append(self._build_task(composer_id, header, scan, status, updated, "cursor-composer"))
+            if len(tasks) >= CURSOR_MAX_SESSIONS:
+                break
+
+        # Fallback: Cursor's global-storage DB can be unreadable (locked or
+        # missing); transcripts alone still give title/turn state via mtime.
+        if not tasks:
+            ordered = sorted(
+                (item for item in transcripts.items() if item[0] not in seen),
+                key=lambda item: os.path.getmtime(item[1]) if os.path.isfile(item[1]) else 0,
+                reverse=True,
+            )
+            for composer_id, path in ordered[:CURSOR_MAX_SESSIONS]:
+                scan = _scan_cursor_transcript(path)
+                if not scan:
+                    continue
+                updated = safe_int(scan.get("latest_event_ms"))
+                status = cursor_status(scan, {}, app_is_running)
+                if status in {"recent", "idle", "done"} and updated and updated < cutoff:
+                    continue
+                tasks.append(self._build_task(composer_id, {}, scan, status, updated, "cursor-transcript"))
+
+        if not tasks and app_is_running:
+            tasks.append(
+                task(
+                    task_id="cursor-app",
+                    source=self.source,
+                    title="Cursor",
+                    status="recent",
+                    subtitle="app open · no recent agent session",
+                    detail={"app_running": True, "metadata_source": "app-fallback"},
+                    open_action={"type": "app", "target": self.bundle_id},
                 )
             )
         return tasks
@@ -5285,6 +5747,7 @@ class Hub:
             OpenClawAdapter(),
             ClaudeAdapter(),
             CodexAdapter(),
+            CursorAdapter(),
             WorkBuddyAdapter(),
             ManusAdapter(),
             PerplexityAdapter(),
@@ -5342,6 +5805,7 @@ class Hub:
             (
                 ClaudeAdapter,
                 CodexAdapter,
+                CursorAdapter,
                 WorkBuddyAdapter,
                 ManusAdapter,
                 PerplexityAdapter,
@@ -5548,6 +6012,7 @@ class Hub:
                 "task_stick_stale_cache_ms": TASK_STICK_STALE_CACHE_MS,
                 "claude_transcript_cache": len(_CLAUDE_TRANSCRIPT_CACHE),
                 "codex_session_cache": len(_CODEX_SESSION_CACHE),
+                "cursor_transcript_cache": len(_CURSOR_TRANSCRIPT_CACHE),
                 "max_entries": TRANSCRIPT_CACHE_MAX,
             },
         }
@@ -5587,6 +6052,8 @@ class Hub:
             return open_action({"type": "app", "target": "com.anthropic.claudefordesktop"})
         if task_id.startswith("codex-"):
             return open_action({"type": "app", "target": "com.openai.codex"})
+        if task_id.startswith("cursor-"):
+            return open_action({"type": "app", "target": "com.todesktop.230313mzl4w4u92"})
         if task_id.startswith("openclaw-"):
             return open_action({"type": "url", "target": "http://127.0.0.1:18789/"})
         if task_id.startswith("manus-"):
