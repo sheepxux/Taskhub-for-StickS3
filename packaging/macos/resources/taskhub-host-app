@@ -1,18 +1,45 @@
 #!/bin/sh
+# TaskHub Host.app launcher: pair a StickS3 (native dialogs) or open diagnostics.
 set -eu
 
-URL="http://127.0.0.1:5577/diagnostics"
+BASE="http://127.0.0.1:5577"
+PAIR="/Library/Application Support/TaskHubHost/host/taskhub_pair.py"
+
 attempt=0
 while [ "$attempt" -lt 20 ]; do
-  if /usr/bin/curl -fsS "http://127.0.0.1:5577/health" >/dev/null 2>&1; then
-    /usr/bin/open "$URL"
-    exit 0
+  if /usr/bin/curl -fsS --noproxy '*' "$BASE/health" >/dev/null 2>&1; then
+    break
   fi
   attempt=$((attempt + 1))
   sleep 0.25
 done
-
-/usr/bin/osascript <<'APPLESCRIPT'
+if [ "$attempt" -ge 20 ]; then
+  /usr/bin/osascript <<'APPLESCRIPT'
 display dialog "TaskHub Host did not start. Check ~/Library/Application Support/StickS3TaskHub/task_hub.log, then reinstall or open the GitHub troubleshooting guide." with title "TaskHub Host" buttons {"OK"} default button "OK"
 APPLESCRIPT
-exit 1
+  exit 1
+fi
+
+# A StickS3 is already asking to pair: go straight to the code prompt.
+PENDING="$(/usr/bin/curl -fsS --noproxy '*' "$BASE/pair/pending" 2>/dev/null || true)"
+case "$PENDING" in
+  *'"device_id"'*)
+    exec /usr/bin/python3 "$PAIR" --gui --timeout 600
+    ;;
+esac
+
+CHOICE="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
+display dialog "TaskHub Host is running.
+
+To add a StickS3: burn the TaskHub firmware with M5Burner, power it on, join its 'TaskHub-XXXX' Wi-Fi from your phone to pick your network, then choose Pair and type the code on its screen." with title "TaskHub Host" buttons {"Diagnostics", "Pair StickS3"} default button "Pair StickS3"
+APPLESCRIPT
+)"
+case "$CHOICE" in
+  *"Pair StickS3"*)
+    exec /usr/bin/python3 "$PAIR" --gui --timeout 900
+    ;;
+  *"Diagnostics"*)
+    exec /usr/bin/open "$BASE/diagnostics"
+    ;;
+esac
+exit 0

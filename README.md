@@ -14,6 +14,7 @@ A pocket hardware dashboard for AI agent work across your Macs.
 TaskHub for StickS3 turns an M5StickS3 into a tiny always-nearby status screen
 for AI coding agents, desktop AI apps, and browser-based agent tools. A local
 Mac Host reads task metadata from sources such as Codex, Claude Code, Cursor,
+Cline / Roo Code / Kilo Code, Gemini CLI, Qwen Code, GitHub Copilot CLI,
 OpenClaw, Manus, Perplexity, Gemini, Lovable, Kimi, WorkBuddy, and Grok, discovers other authorized TaskHub Hosts
 on the same LAN, then sends a compact task list to the StickS3 over Wi-Fi.
 
@@ -73,16 +74,17 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Area | Status | Notes |
 | --- | --- | --- |
 | StickS3 firmware | Ready | Native 240x135 UI, buttons, Wi-Fi discovery, deep sleep |
-| M5Burner public firmware | Ready | Builds without local secrets; first use is configured over USB into device NVS |
+| M5Burner public firmware | Ready | No secrets in the binary; first boot opens a Wi-Fi captive portal, then pairs with the Host by a 4-digit code |
 | macOS Host | Ready | LaunchAgent installer, local HTTP API, UDP discovery |
 | macOS Host package | Preview | Builds a secret-free `.pkg`; public distribution still requires Developer ID signing/notarization |
 | Host diagnostics | Ready | `/diagnostics` checks adapters, voice mode, local permissions, caches, and peers without exposing tokens or task titles |
 | Multi-Mac aggregation | Ready | Authorized Hosts discover peers and merge task lists |
 | BtnB open source | Ready | Opens local source app; remote tasks forward to the origin Mac |
 | WAIT attention mode | Ready | Wakes and holds the display briefly when input is needed, then sleeps and keeps checking |
-| WAIT alert | Ready | Edge-triggered screen wake + short double beep when a task first needs input (`ALERT_*` tunable) |
-| DONE alert | Ready | Edge-triggered softer rising chime when a running task finishes |
-| Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness |
+| WAIT alert | Ready | Per-task edge: screen wake + short double beep each time a task enters WAIT, even while another is already waiting (`ALERT_*` tunable) |
+| DONE alert | Ready | Per-task edge: softer rising chime when a running task finishes |
+| FAIL alert | Ready | Per-task edge: falling two-note buzz when a task errors out |
+| Battery-aware operation | Ready | Sleeps by default, short timer-wake screen time, low brightness, charging bolt on the battery icon |
 | Auto-rotation | Ready | IMU gravity rotates the screen to match how it's held; portrait shows a multi-task list (`ROTATE_*` tunable) |
 | Voice input | Ready | Hold BtnB to dictate (Mandarin/English) → local whisper.cpp → text pasted and sent in the selected task's app (`POST /voice?enter=1`) |
 | Codex adapter | Detailed | Tracks title, folder, turns, token usage, running/wait state |
@@ -95,6 +97,9 @@ when a row is exact task tracking versus best-effort local signal detection.
 | Lovable adapter | Activity | App/browser activity, renderer CPU, visible generation controls |
 | Kimi adapter | Activity | Local conversation status plus daemon active-turn state and web title; open app alone is not RUN |
 | WorkBuddy adapter | Detailed | Local session title, tool calls, RUN/WAIT/DONE, folder, token data when present |
+| Cline / Roo Code / Kilo Code adapter | Detailed | Extension task transcripts inside VS Code, Cursor, Windsurf, VSCodium, Antigravity, Trae; unanswered approval/question is an exact WAIT, request in flight is RUN, completion is DONE, token/cost usage |
+| Gemini CLI / Qwen Code adapter | Detailed | Chat recordings under `~/.gemini` / `~/.qwen`: RUN while the model answers or tools execute, WAIT on a tool awaiting approval, DONE on a finished reply, folder from `projects.json` (fixture-verified; real-world reports welcome) |
+| GitHub Copilot CLI adapter | Best effort | `~/.copilot/session-state/*/events.jsonl` turn events: RUN/DONE/FAIL, WAIT on a pending permission event, workspace summary as title (fixture-verified; real-world reports welcome) |
 | Grok adapter | Activity | Web/Safari app title and visible Stop control; open app alone is not RUN |
 | Browser web bridge | Optional | `extension/` (Chrome/Edge) reads Gemini/Grok/Kimi/Lovable/Perplexity tab titles and pushes them via `POST /ingest` |
 | External push API | Ready | `POST /ingest` accepts tasks from any local script; entries expire on a TTL |
@@ -227,130 +232,46 @@ flowchart LR
 
 ## Quick Start
 
-For the full installation guide, see [INSTALL.md](INSTALL.md).
+Two things, no terminal required for the Stick: **firmware from M5Burner**
+(M5Stack's official burning tool) and the **Mac Host from GitHub**.
 
-There are two supported install paths:
+### 1. Burn the firmware
 
-- **Developer/source flash**: clone the repo, create `secrets.h`, compile, and
-  upload from Arduino CLI.
-- **M5Burner/public firmware**: burn the public firmware, install the Mac Host,
-  then run USB provisioning once to store Wi-Fi and the shared token on the
-  StickS3.
+Open [M5Burner](https://docs.m5stack.com/en/download), search **TaskHub for
+StickS3**, plug the StickS3 in over USB-C and click **Burn**.
 
-### 1. Install requirements
+### 2. Put the Stick on your Wi-Fi
 
-- macOS
-- M5StickS3
-- Python 3
-- `arduino-cli`
-- ESP32 Arduino core
-- Arduino libraries: `M5Unified`, `ArduinoJson`
-- Optional: Node.js, used by the Host to read some local LevelDB app stores
+Power it on. The screen shows a QR code and a Wi-Fi name like `TaskHub-3F2A`.
+Join that network from your phone (scan the QR or pick it in Wi-Fi settings),
+choose your home Wi-Fi in the page that pops up, and enter its password. The
+Stick joins and shows a **4-digit pairing code**.
 
-### 2. Install the Mac Host
+### 3. Install the Mac Host and pair
+
+Paste this in Terminal (Spotlight → "Terminal"):
 
 ```bash
-git clone https://github.com/sheepxux/Taskhub-for-StickS3.git
-cd Taskhub-for-StickS3
-./scripts/setup.sh
+curl -fsSL https://raw.githubusercontent.com/sheepxux/Taskhub-for-StickS3/main/scripts/install.sh | bash
 ```
 
-Check the Host:
+It installs the Host as a login item, then asks for the code on the Stick.
+Type it, and the Stick restarts into your task list. From now on it finds the
+Host on its own (UDP discovery on port `5578`), so your Mac's IP can change.
 
-```bash
-curl http://127.0.0.1:5577/health
-```
+Pair another Stick later with `python3 ~/Library/Application\ Support/StickS3TaskHub/taskhub_pair.py`,
+or open **TaskHub Host.app** if you installed the `.pkg`. Holding both buttons
+while powering on wipes the Stick's Wi-Fi and token; holding **A** on the
+pairing screen redoes only the Wi-Fi.
 
-The installer copies the Host to:
+### Other install paths
 
-```text
-~/Library/Application Support/StickS3TaskHub
-```
-
-It also creates or reuses the device token at:
-
-```text
-~/Library/Application Support/StickS3TaskHub/token
-```
-
-The setup helper installs or repairs the Host, creates
-`firmware/task_monitor/secrets.h`, syncs the shared token, and prompts for Wi-Fi
-values if needed.
-
-An unsigned development `.pkg` can also be built on macOS:
-
-```bash
-./packaging/macos/build_host_pkg.sh
-```
-
-For public distribution, sign and notarize that package with a Developer ID
-Installer certificate. See [`packaging/macos/README.md`](packaging/macos/README.md).
-
-To install Arduino dependencies and compile firmware:
-
-```bash
-./scripts/setup.sh --deps --compile
-```
-
-To compile and upload while the StickS3 is plugged in:
-
-```bash
-./scripts/setup.sh --deps --upload
-```
-
-### 3. M5Burner / public firmware setup
-
-The M5Burner build does **not** compile `secrets.h` into the binary. After
-burning it, the StickS3 shows `USB Setup` until you provision it:
-
-```bash
-./scripts/setup.sh --skip-firmware --provision
-```
-
-That installs or repairs the Mac Host, reads the Host token, prompts for Wi-Fi
-if needed, and sends the config to the StickS3 over USB. The firmware saves it
-to NVS and restarts.
-
-The device UI defaults to English. To switch fixed UI text to Chinese during
-USB provisioning:
-
-```bash
-./scripts/setup.sh --skip-firmware --provision --lang zh
-```
-
-Build a public firmware artifact set for M5Burner publishing with:
-
-```bash
-./firmware/build_m5burner_public.sh
-```
-
-### 4. Configure the firmware manually
-
-```bash
-cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
-```
-
-Edit `firmware/task_monitor/secrets.h`:
-
-```cpp
-#define WIFI_SSID       "your-wifi-ssid"
-#define WIFI_PASSWORD   "your-wifi-password"
-#define DEVICE_TOKEN    "same-token-as-the-mac-host"
-#define TASKHUB_LANG    "en"  // or "zh"
-```
-
-`TASK_HUB_HOST` is only a fallback. The firmware first tries UDP discovery on
-port `5578`, so the Mac IP can change.
-
-### 5. Flash the StickS3
-
-```bash
-./firmware/flash_task_monitor.sh all
-```
-
-After flashing, the StickS3 boots into the TaskHub logo screen, connects to
-Wi-Fi, discovers the Mac Host, fetches tasks, then enters deep sleep after the
-interactive timeout.
+- **macOS `.pkg`**: a double-click installer that ends in the pairing dialog.
+  Until the package is signed with a Developer ID, macOS blocks it on first
+  open (System Settings → Privacy & Security → *Open Anyway*).
+- **Developers**: build and flash from source with `arduino-cli`, bake Wi-Fi
+  and token into `secrets.h`, or provision over USB serial. See
+  [INSTALL.md](INSTALL.md).
 
 ## Controls
 
@@ -403,6 +324,8 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 | `/tasks/:id/open` | Open selected source from the StickS3 |
 | `/tasks/:id/open-native` | Host-to-host remote open forwarding |
 | `/voice` | Transcribe a posted audio clip and paste it into a target app (voice mode) |
+| `POST /pair` | Unauthenticated pairing poll from an unprovisioned StickS3; answers `pending` until the code is approved |
+| `/pair/pending`, `POST /pair/approve` | Loopback-only: list devices asking to pair, approve a code (used by `taskhub_pair.py`) |
 | `/diagnostics` | Human-readable Host health, adapter, voice, cache, and peer diagnostics |
 | `/diagnostics.json` | Machine-readable diagnostics without token values or task titles |
 | `/peers` | Human-readable multi-device diagnostics |
@@ -439,14 +362,19 @@ new WAIT can go unnoticed to about two minutes while cutting radio wakeups in
 half versus the old 60-second default. Set `WAIT_ATTENTION_TIMEOUT_MS=0` if you
 want the old always-on WAIT behavior.
 
-The on-device WAIT/DONE alerts are tunable in `firmware/task_monitor/secrets.h`:
+The on-device WAIT/DONE/FAIL alerts are tunable in `firmware/task_monitor/secrets.h`.
+Transitions are detected per task (by id) against the previous refresh, so a
+second session entering WAIT still rings; when several edges land in one
+refresh only the most urgent plays (WAIT > FAIL > DONE) and the screen jumps to
+that task.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `ALERT_ON_WAIT` | `1` | Master switch for the WAIT alert |
 | `ALERT_ON_DONE` | `1` | Master switch for the DONE chime |
+| `ALERT_ON_FAIL` | `1` | Master switch for the FAIL buzz |
 | `ALERT_BEEP` | `1` | Speaker beep/chime; set `0` for silent screen-only alerts |
-| `ALERT_WAIT_HZ` / `ALERT_DONE_HZ` | `2400` / `1500` | WAIT double-beep pitch and DONE base pitch |
+| `ALERT_WAIT_HZ` / `ALERT_DONE_HZ` / `ALERT_FAIL_HZ` | `2400` / `1500` / `1800` | WAIT double-beep pitch, DONE base pitch, FAIL starting pitch |
 | `ALERT_BEEP_VOLUME` | `150` | Shared speaker loudness |
 
 > Vibration: the M5StickS3 is not driven as a motor by the pinned M5Unified, so
@@ -473,6 +401,9 @@ disk, through local process state, or through visible browser UI.
 | Lovable | App/browser activity, project tabs, renderer CPU, visible generation controls |
 | Kimi | Local `running/completed` state cross-checked with daemon active turns, plus browser title |
 | WorkBuddy | Local session title, folder, tool calls, completion state, token data when exposed |
+| Cline / Roo Code / Kilo Code | Task prompt, host editor, workspace folder, pending approval/question (WAIT), request in flight (RUN), completion, tokens and cost |
+| Gemini CLI / Qwen Code | First prompt, project folder, model/tool turn state, tool awaiting approval (WAIT), token usage |
+| GitHub Copilot CLI | Workspace summary, folder, turn start/end and tool events, pending permission (WAIT) |
 | Grok | Safari Web App/browser title and visible Stop control; exact title is best with the web bridge |
 
 If an app is open but not actively generating or executing, TaskHub should show
@@ -495,9 +426,11 @@ TaskHub is local-first.
 
 | Problem | Check |
 | --- | --- |
-| StickS3 cannot find the Host | Confirm Mac and StickS3 are on the same Wi-Fi, then check `/health` |
-| `401` from the Host | Confirm `DEVICE_TOKEN` matches the Host token file |
+| StickS3 cannot find the Host | Confirm Mac and StickS3 are on the same Wi-Fi, then check `/health`. A VPN/proxy (Clash, Surge, Tailscale) used to make the Host advertise its tunnel IP; the Host now picks the LAN interface facing the Stick |
+| Pairing screen says "looking for Mac Host" forever | Same Wi-Fi as the Mac? Guest networks and "AP isolation" block the UDP discovery on port `5578`. Is the Host running (`/health`)? |
+| `401` from the Host | Confirm `DEVICE_TOKEN` matches the Host token file, or re-pair: hold both buttons while powering on, then run `taskhub_pair.py` |
 | Task status looks stale or wrong | Open `/diagnostics` and check the source adapter row |
+| Cursor (or another source) shows 0 tasks with a "Full Disk Access" adapter error | macOS TCC blocks the launchd Host from other apps' data; grant Full Disk Access to the Python that runs the Host (see [INSTALL.md](INSTALL.md#full-disk-access-macos-15)) |
 | No peer Macs show up | Open `/peers.json?refresh=1`, check token match and UDP port `5578` |
 | An app only shows `REC` | The app may expose activity but no active task signal |
 | Lovable running state looks wrong | Open `/debug/lovable` and inspect renderer CPU/browser basis |
@@ -544,7 +477,7 @@ CHANGELOG.md             Release notes
 - Signed and notarized distribution of the current Mac Host package.
 - Recorded local-metadata fixtures to broaden the adapter regression suite.
 - More detailed browser-task extraction and recorded fixtures as supported sites evolve.
-- FAIL alert tone distinct from the WAIT alert, plus an optional external buzzer.
+- Optional external buzzer / vibration motor for alerts.
 - Better first-run setup flow for non-developer users.
 
 ## Release

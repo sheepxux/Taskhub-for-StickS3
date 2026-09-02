@@ -123,6 +123,61 @@ class DiagnosticsHelpers(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(refreshed_title, "new task")
 
+    def test_cold_stick_request_piggybacks_on_startup_warmup(self):
+        class SlowAdapter:
+            source = "Slow"
+            calls = 0
+
+            def list_tasks(self):
+                SlowAdapter.calls += 1
+                time.sleep(0.3)
+                return [th.task(task_id="slow-1", source="Slow", title="warm", status="running")]
+
+        hub = th.Hub(token="test-token", http_port=5577, discovery_port=5578, bind="127.0.0.1")
+        hub.adapters = [SlowAdapter()]
+        hub.peer_manager.remote_tasks = lambda: []  # type: ignore[method-assign]
+
+        hub.warm_cache()
+        time.sleep(0.05)
+        self.assertTrue(hub.is_refreshing())
+
+        # A Stick request arriving while the warm-up scans must not start a
+        # second full scan; it waits for the warm-up and returns its result.
+        rows = hub.list_tasks(include_remote=True, allow_stale=True, stale_ms=60000)
+        self.assertEqual([r["title"] for r in rows], ["warm"])
+        self.assertEqual(SlowAdapter.calls, 1)
+        self.assertFalse(hub.is_refreshing())
+
+    def test_cold_stick_request_returns_empty_when_warmup_outlasts_wait(self):
+        class VerySlowAdapter:
+            source = "VerySlow"
+
+            def list_tasks(self):
+                time.sleep(0.4)
+                return [th.task(task_id="vs-1", source="VerySlow", title="late", status="running")]
+
+        hub = th.Hub(token="test-token", http_port=5577, discovery_port=5578, bind="127.0.0.1")
+        hub.adapters = [VerySlowAdapter()]
+        hub.peer_manager.remote_tasks = lambda: []  # type: ignore[method-assign]
+
+        old_wait = th.TASK_COLD_START_WAIT_MS
+        th.TASK_COLD_START_WAIT_MS = 50
+        try:
+            hub.warm_cache()
+            time.sleep(0.02)
+            started = time.monotonic()
+            rows = hub.list_tasks(include_remote=True, allow_stale=True, stale_ms=60000)
+            elapsed = time.monotonic() - started
+        finally:
+            th.TASK_COLD_START_WAIT_MS = old_wait
+
+        # Answered quickly and empty; the Stick sees syncing=true and re-polls.
+        self.assertEqual(rows, [])
+        self.assertLess(elapsed, 0.3)
+        self.assertTrue(hub.is_refreshing())
+        hub._wait_for_refresh(2000)
+        self.assertEqual([r["title"] for r in hub.list_tasks(include_remote=True, allow_stale=True, stale_ms=60000)], ["late"])
+
     def test_adapter_scans_run_in_parallel(self):
         class SlowAdapter:
             def __init__(self, source):

@@ -29,11 +29,24 @@ PEER_DISCOVERY_TIMEOUT_MS = int(os.environ.get("TASK_HUB_PEER_DISCOVERY_TIMEOUT_
 PEER_HTTP_TIMEOUT_MS = int(os.environ.get("TASK_HUB_PEER_HTTP_TIMEOUT_MS", "1200"))
 PEER_MAX = int(os.environ.get("TASK_HUB_PEER_MAX", "8"))
 
+# Device pairing (first-run flow for M5Burner firmware). An unpaired StickS3
+# finds the Host over UDP discovery, shows a short code on its screen and POSTs
+# it to /pair; the token is only handed out after that exact code is approved
+# on the Mac (loopback-only /pair/approve). Pending requests expire quickly.
+PAIR_PENDING_TTL_MS = int(os.environ.get("TASK_HUB_PAIR_PENDING_TTL_MS", "300000"))
+PAIR_APPROVED_TTL_MS = int(os.environ.get("TASK_HUB_PAIR_APPROVED_TTL_MS", "120000"))
+PAIR_MAX_PENDING = int(os.environ.get("TASK_HUB_PAIR_MAX_PENDING", "8"))
+
 MAX_TASKS = int(os.environ.get("TASK_HUB_MAX_TASKS", "40"))
 ACTIVE_MINUTES = int(os.environ.get("TASK_HUB_ACTIVE_MINUTES", "1440"))
 TASK_CACHE_MS = int(os.environ.get("TASK_HUB_CACHE_MS", "3000"))
 TASK_STICK_STALE_CACHE_MS = int(os.environ.get("TASK_HUB_STICK_STALE_CACHE_MS", "1800000"))
 TASK_BACKGROUND_REFRESH_MIN_MS = int(os.environ.get("TASK_HUB_BACKGROUND_REFRESH_MIN_MS", "5000"))
+# How long a request may wait for an in-flight cache refresh when the cache is
+# still empty (Host just started). Kept under the StickS3's 8s HTTP timeout so
+# a cold Host answers with `syncing: true` instead of letting the Stick time
+# out; the Stick then re-fetches a moment later.
+TASK_COLD_START_WAIT_MS = int(os.environ.get("TASK_HUB_COLD_START_WAIT_MS", "6000"))
 TRANSCRIPT_CACHE_MAX = int(os.environ.get("TASK_HUB_TRANSCRIPT_CACHE_MAX", "200"))
 ADAPTER_MAX_WORKERS = max(1, int(os.environ.get("TASK_HUB_ADAPTER_MAX_WORKERS", "8")))
 
@@ -119,6 +132,21 @@ CURSOR_HUMAN_INPUT_TOOLS = {"AskQuestion"}
 WORKBUDDY_MAX_SESSIONS = int(os.environ.get("TASK_HUB_WORKBUDDY_MAX_SESSIONS", "6"))
 WORKBUDDY_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_WORKBUDDY_RUNNING_STALE_MS", "600000"))
 WORKBUDDY_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_WORKBUDDY_DONE_WINDOW_MS", "300000"))
+# Cline / Roo Code / Kilo Code (VS Code-family extensions). Every task rewrites
+# its ui_messages.json on each message, so file mtime is a reliable freshness
+# signal and an unanswered `ask` message is an exact WAIT.
+CLINE_MAX_TASKS = int(os.environ.get("TASK_HUB_CLINE_MAX_TASKS", "6"))
+CLINE_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLINE_RUNNING_STALE_MS", "900000"))
+CLINE_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CLINE_DONE_WINDOW_MS", "300000"))
+CLINE_FAILED_TTL_MS = int(os.environ.get("TASK_HUB_CLINE_FAILED_TTL_MS", "600000"))
+# Terminal coding agents (Gemini CLI / Qwen Code / GitHub Copilot CLI). Their
+# transcripts carry per-message timestamps; RUN needs a live CLI process and a
+# fresh turn, or (if the process is not visible to ps) a very recent event.
+CLI_AGENT_MAX_SESSIONS = int(os.environ.get("TASK_HUB_CLI_AGENT_MAX_SESSIONS", "6"))
+CLI_AGENT_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLI_AGENT_RUNNING_STALE_MS", "900000"))
+CLI_AGENT_NO_PROCESS_RUNNING_STALE_MS = int(os.environ.get("TASK_HUB_CLI_AGENT_NO_PROCESS_RUNNING_STALE_MS", "120000"))
+CLI_AGENT_DONE_WINDOW_MS = int(os.environ.get("TASK_HUB_CLI_AGENT_DONE_WINDOW_MS", "300000"))
+CLI_AGENT_FAILED_TTL_MS = int(os.environ.get("TASK_HUB_CLI_AGENT_FAILED_TTL_MS", "600000"))
 WEB_AI_ACTIVITY_STALE_MS = int(
     os.environ.get("TASK_HUB_WEB_AI_ACTIVITY_STALE_MS", str(ACTIVE_MINUTES * 60 * 1000))
 )

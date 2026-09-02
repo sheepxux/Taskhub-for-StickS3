@@ -19,6 +19,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <WebServer.h>          // first-run Wi-Fi captive portal
+#include <DNSServer.h>
 #include <esp_sleep.h>
 #include <esp_wifi.h>           // for esp_wifi_set_ps (deeper modem sleep than WiFi.setSleep default)
 #include <esp32-hal-cpu.h>
@@ -67,6 +69,9 @@
 #if !defined(TASK_HUB_DISCOVERY_PORT)
 #define TASK_HUB_DISCOVERY_PORT 5578
 #endif
+
+// Reported to the Host during pairing and used to name the M5Burner artifact.
+#define TASKHUB_FW_VERSION "2.3.0"
 
 // Battery-first default. Override to 0 in secrets.h while debugging UI/network behavior.
 #ifndef ENABLE_DEEP_SLEEP
@@ -240,6 +245,10 @@ static constexpr size_t RTC_DEVICE_LEN = 12;
 // row renders amber on its own, so there is no full-screen flash.
 //   - WAIT: a session is asking for human input (two urgent high beeps).
 //   - DONE: a running task just finished, i.e. a turn completed (rising chime).
+//   - FAIL: a task errored out (falling two-note buzz).
+// Edges are detected per task (by id) against the status seen at the previous
+// refresh, so a second session entering WAIT while another is already waiting
+// still rings. At most one alert plays per refresh: WAIT > FAIL > DONE.
 // Beeps use the StickS3 speaker (M5.Speaker). Vibration is left as a future
 // hook: the pinned M5Unified does NOT drive a motor on board_M5StickS3
 // (setVibration is a no-op there), so it stays off by default.
@@ -249,6 +258,9 @@ static constexpr size_t RTC_DEVICE_LEN = 12;
 #if !defined(ALERT_ON_DONE)
 #define ALERT_ON_DONE 1
 #endif
+#if !defined(ALERT_ON_FAIL)
+#define ALERT_ON_FAIL 1
+#endif
 #if !defined(ALERT_BEEP)
 #define ALERT_BEEP 1
 #endif
@@ -257,6 +269,9 @@ static constexpr size_t RTC_DEVICE_LEN = 12;
 #endif
 #if !defined(ALERT_DONE_HZ)
 #define ALERT_DONE_HZ 1500
+#endif
+#if !defined(ALERT_FAIL_HZ)
+#define ALERT_FAIL_HZ 1800
 #endif
 #if !defined(ALERT_BEEP_VOLUME)
 #define ALERT_BEEP_VOLUME 150
@@ -350,6 +365,17 @@ static const char* CONFIG_NAMESPACE = "taskhub";
 static const char* PLACEHOLDER_WIFI_SSID = "your-wifi-ssid";
 static const char* PLACEHOLDER_WIFI_PASSWORD = "your-wifi-password";
 
+// First-run setup (M5Burner firmware ships without Wi-Fi or a token):
+//   1. no Wi-Fi  -> open AP "TaskHub-XXXX" + captive portal to pick a network
+//   2. no token  -> join Wi-Fi, find the Host over UDP, show a 4-digit code,
+//                   poll POST /pair until someone approves the code on the Mac
+// USB serial provisioning keeps working in both stages for developers.
+static constexpr uint32_t PORTAL_STA_JOIN_TIMEOUT_MS = 20000;   // password check budget
+static constexpr uint32_t PORTAL_LINGER_AFTER_JOIN_MS = 180000; // keep the AP so the phone sees the result
+static constexpr uint32_t PAIR_POLL_MS = 2500;
+static constexpr uint32_t PAIR_STA_RETRY_MS = 15000;
+static constexpr uint32_t SETUP_RESET_HOLD_MS = 3000;           // hold BtnA in pairing to redo Wi-Fi
+
 // Persisted across deep sleep in RTC slow memory (~8KB available, free).
 // After a successful join we stash the AP's BSSID + channel; on the next wake
 // WiFi.begin() can target the radio directly instead of doing a full
@@ -357,15 +383,25 @@ static const char* PLACEHOLDER_WIFI_PASSWORD = "your-wifi-password";
 // single biggest awake-time win on a battery-bound device.
 RTC_DATA_ATTR static uint8_t  rtcCachedBssid[6] = {0};
 RTC_DATA_ATTR static int32_t  rtcCachedChannel = 0;
-// Tracks whether a WAIT was present at the last refresh, persisted across deep
-// sleep so the empty->WAIT edge alert fires once even when the transition is
-// first observed on a timer wake (rather than re-alerting every refresh).
-RTC_DATA_ATTR static bool     rtcWaitWasActive = false;
-// Tracks whether a task was running at the last refresh, so a running->finished
-// transition (turn complete) can fire a one-shot DONE chime, persisted across
-// deep sleep like the WAIT edge above.
-RTC_DATA_ATTR static bool     rtcWasRunning = false;
 RTC_DATA_ATTR static bool     rtcHasCachedBssid = false;
+
+// Per-task status as of the last successful refresh, keyed by task id and
+// persisted across deep sleep. Alerts are edge-triggered against this table so
+// each WAIT/FAIL/DONE transition rings exactly once, even when it is first
+// observed on a timer wake, and even when another task is already waiting.
+// Status is stored as a single char (see statusCode()); 0 = never seen.
+struct RtcTaskAlertState {
+  char id[RTC_ID_LEN];
+  char status;
+};
+RTC_DATA_ATTR static RtcTaskAlertState rtcPrevTasks[MAX_TASKS] = {};
+RTC_DATA_ATTR static int      rtcPrevTaskCount = 0;
+RTC_DATA_ATTR static bool     rtcPrevTasksValid = false;
+
+// Alert decided by the latest fetchTasks(), consumed by updateAlerts().
+enum AlertKind : uint8_t { ALERT_NONE = 0, ALERT_DONE = 1, ALERT_FAIL = 2, ALERT_WAIT = 3 };
+static AlertKind pendingAlert = ALERT_NONE;
+static int pendingAlertTask = -1;
 
 struct AiTask {
   String id;
@@ -413,7 +449,7 @@ static int selected = 0;
 static int activeCount = 0;
 static int attentionCount = 0;
 static int waitCount = 0;
-static int runCount = 0;   // tasks with status "run" (used to detect turn completion)
+static int runCount = 0;   // tasks with status "run" (top-bar metric dot)
 static int displayRotation = 1;       // currently applied M5.Display rotation
 static int pendingRotation = 1;       // candidate rotation awaiting the stability window
 static uint32_t pendingRotationSince = 0;
@@ -421,6 +457,7 @@ static uint32_t lastRotatePollAt = 0;
 static int totalCount = 0;
 static int hiddenCount = 0;
 static int battPct = 100;
+static bool battCharging = false;
 static bool wifiOk = false;
 static bool wokeByTimer = false;
 static bool wokeFromSleep = false;
@@ -443,9 +480,33 @@ static String cfgDeviceToken;
 static String cfgLang;
 static bool cfgVoiceAutoSend = VOICE_AUTO_SEND != 0;
 static bool cfgReady = false;
+static bool cfgWifiReady = false;
 static bool setupMode = false;
 static String serialConfigLine;
 static uint32_t lastSetupStatusAt = 0;
+
+enum SetupStage { SETUP_NONE, SETUP_WIFI_PORTAL, SETUP_PAIRING };
+static SetupStage setupStage = SETUP_NONE;
+static WebServer* portalServer = nullptr;
+static DNSServer* portalDns = nullptr;
+static bool portalActive = false;
+static String apSsid;
+static String portalScanOptions;          // <option> list from the last scan
+static String portalPendingSsid;
+static String portalPendingPassword;
+static String portalPendingLang;
+static bool portalStaConnecting = false;
+static bool portalStaFailed = false;
+static uint32_t portalStaStartedAt = 0;
+static uint32_t portalJoinedAt = 0;
+static String pairCode;
+static String pairName;
+static String pairDeviceId;
+static String pairHostName;
+static String pairStatus;
+static uint32_t lastPairPollAt = 0;
+static uint32_t lastPairStaAttemptAt = 0;
+static bool pairDone = false;
 static String lastError;
 static bool btnBReadingPressed = false;
 static bool btnBStablePressed = false;
@@ -469,12 +530,13 @@ static String bootStatusText;
 static void setBootStatus(const String& text, int color);
 static void topBar();
 static void centerText(const String& text, int y, int color, const lgfx::IFont* font);
-static void drawSetupScreen(const String& status);
 static void handleSerialConfig();
+static bool uiZh();
 static void sendSerialConfigStatus(const char* type, bool ok, const char* message);
 static void clearRtcTaskSnapshot();
 static void saveRtcTaskSnapshot();
 static bool restoreRtcTaskSnapshot();
+static void copyRtcField(char* dst, size_t len, const String& value);
 
 static bool isPlaceholder(const String& value, const char* placeholder) {
   return !value.length() || value == placeholder;
@@ -500,31 +562,40 @@ static bool jsonBoolOrDefault(JsonVariantConst value, bool fallback) {
 }
 
 static bool loadRuntimeConfig() {
+  // Two NVS layers: "wifi_saved" (captive portal wrote ssid/password/lang)
+  // and "configured" (full config incl. token, from pairing or USB). A device
+  // can have Wi-Fi but no token yet; that is the pairing stage.
   bool fromNvs = false;
+  bool wifiSaved = false;
   Preferences prefs;
   if (prefs.begin(CONFIG_NAMESPACE, true)) {
     fromNvs = prefs.getBool("configured", false);
-    if (fromNvs) {
+    wifiSaved = fromNvs || prefs.getBool("wifi_saved", false);
+    if (wifiSaved) {
       cfgWifiSsid = prefs.getString("ssid", "");
       cfgWifiPassword = prefs.getString("password", "");
+      cfgLang = normalizeLang(prefs.getString("lang", TASKHUB_LANG));
+    }
+    if (fromNvs) {
       cfgHubHost = prefs.getString("host", "");
       cfgHubPort = prefs.getInt("port", TASK_HUB_PORT);
       cfgDeviceId = prefs.getString("device_id", DEVICE_ID);
       cfgDeviceToken = prefs.getString("token", "");
-      cfgLang = normalizeLang(prefs.getString("lang", TASKHUB_LANG));
       cfgVoiceAutoSend = prefs.getBool("voice_send", VOICE_AUTO_SEND != 0);
     }
     prefs.end();
   }
 
-  if (!fromNvs) {
+  if (!wifiSaved) {
     cfgWifiSsid = String(WIFI_SSID);
     cfgWifiPassword = String(WIFI_PASSWORD);
+    cfgLang = normalizeLang(String(TASKHUB_LANG));
+  }
+  if (!fromNvs) {
     cfgHubHost = String(TASK_HUB_HOST);
     cfgHubPort = TASK_HUB_PORT;
     cfgDeviceId = String(DEVICE_ID);
     cfgDeviceToken = String(DEVICE_TOKEN);
-    cfgLang = normalizeLang(String(TASKHUB_LANG));
     cfgVoiceAutoSend = VOICE_AUTO_SEND != 0;
   }
 
@@ -534,10 +605,24 @@ static bool loadRuntimeConfig() {
   if (!cfgDeviceId.length()) cfgDeviceId = String(DEVICE_ID);
 
   bool ssidOk = !isPlaceholder(cfgWifiSsid, PLACEHOLDER_WIFI_SSID);
-  bool passwordOk = fromNvs || cfgWifiPassword != PLACEHOLDER_WIFI_PASSWORD;
+  bool passwordOk = wifiSaved || cfgWifiPassword != PLACEHOLDER_WIFI_PASSWORD;
   bool tokenOk = cfgDeviceToken.length() > 0;
-  cfgReady = ssidOk && passwordOk && tokenOk && cfgHubPort > 0;
+  cfgWifiReady = ssidOk && passwordOk;
+  cfgReady = cfgWifiReady && tokenOk && cfgHubPort > 0;
   return cfgReady;
+}
+
+static bool saveWifiConfig(const String& ssid, const String& password, const String& lang) {
+  if (isPlaceholder(ssid, PLACEHOLDER_WIFI_SSID)) return false;
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NAMESPACE, false)) return false;
+  prefs.putString("ssid", ssid);
+  prefs.putString("password", password);
+  prefs.putString("lang", normalizeLang(lang.length() ? lang : cfgLang));
+  prefs.putBool("wifi_saved", true);
+  prefs.end();
+  loadRuntimeConfig();
+  return cfgWifiReady;
 }
 
 static bool saveRuntimeConfig(const String& ssid, const String& password, const String& host,
@@ -556,6 +641,7 @@ static bool saveRuntimeConfig(const String& ssid, const String& password, const 
   prefs.putString("token", token);
   prefs.putString("lang", normalizeLang(lang));
   prefs.putBool("voice_send", voiceAutoSend);
+  prefs.putBool("wifi_saved", true);
   prefs.putBool("configured", true);
   prefs.end();
 
@@ -579,6 +665,10 @@ static void sendSerialConfigStatus(const char* type, bool ok, const char* messag
   doc["type"] = type;
   doc["ok"] = ok;
   doc["configured"] = cfgReady;
+  doc["wifi_configured"] = cfgWifiReady;
+  doc["stage"] = setupStage == SETUP_WIFI_PORTAL ? "wifi" : (setupStage == SETUP_PAIRING ? "pair" : "ready");
+  if (setupStage == SETUP_WIFI_PORTAL) doc["ap_ssid"] = apSsid;
+  if (setupStage == SETUP_PAIRING) doc["pair_code"] = pairCode;
   doc["message"] = message;
   doc["ssid"] = cfgReady ? cfgWifiSsid : "";
   doc["host"] = cfgHubHost;
@@ -759,6 +849,10 @@ static const char* uiText(const char* en, const char* zh) {
   return uiZh() ? zh : en;
 }
 
+static String uiText(const String& en, const String& zh) {
+  return uiZh() ? zh : en;
+}
+
 // Connect with the cached BSSID/channel hint if we have one; on failure fall
 // back to a full scan. Picks the deepest modem-sleep level once associated so
 // the brief idle awake window also draws less current.
@@ -841,7 +935,11 @@ static bool discoverHub(bool force) {
   JsonDocument req;
   req["type"] = "sticks3.discover";
   req["device"] = cfgDeviceId;
-  req["token"] = cfgDeviceToken;
+  if (cfgDeviceToken.length()) {
+    req["token"] = cfgDeviceToken;
+  } else {
+    req["pair"] = true;   // unpaired: the Host answers with its address only
+  }
   String packet;
   serializeJson(req, packet);
 
@@ -893,6 +991,7 @@ static bool discoverHub(bool force) {
 static void updateBattery() {
   int b = M5.Power.getBatteryLevel();
   if (b >= 0 && b <= 100) battPct = b;
+  battCharging = M5.Power.isCharging() == m5::Power_Class::is_charging;
   applyDisplayBrightness();
 }
 
@@ -953,12 +1052,20 @@ static String displaySourceLabel(const AiTask& t) {
   return label;
 }
 
-static void drawBatteryGlyph(int x, int y, int pct) {
+// 19x9 battery outline with a level bar; while on USB power the bar turns blue
+// and a small white bolt is drawn over it so charging is visible at a glance.
+static void drawBatteryGlyph(int x, int y, int pct, bool charging = false) {
   int col = pct <= LOW_BATTERY_THRESHOLD_PCT ? C_RED : (pct < 60 ? C_AMBER : C_GREEN);
+  if (charging) col = C_BLUE;
   M5.Display.drawRoundRect(x, y, 19, 9, 2, C_LINE);
   M5.Display.fillRect(x + 19, y + 3, 2, 3, C_LINE);
   int fillW = map(pct < 0 ? 0 : (pct > 100 ? 100 : pct), 0, 100, 0, 15);
   if (fillW > 0) M5.Display.fillRect(x + 2, y + 2, fillW, 5, col);
+  if (charging) {
+    M5.Display.drawLine(x + 10, y + 1, x + 8, y + 4, C_WHITE);
+    M5.Display.drawFastHLine(x + 8, y + 4, 4, C_WHITE);
+    M5.Display.drawLine(x + 11, y + 4, x + 9, y + 7, C_WHITE);
+  }
 }
 
 static void drawIndexRail(int x, int y, int w, int h) {
@@ -1116,23 +1223,88 @@ static void alertDone() {
   alertVibrateHook();
 }
 
-// Edge detector for both alerts. WAIT fires on empty->WAIT; DONE fires when a
-// running task disappears with nothing now waiting (a turn just finished).
+// Task errored: a falling two-note buzz, clearly different from WAIT/DONE.
+static void alertFail() {
+  M5.Display.wakeup();
+  applyDisplayBrightness();
+  alertBeep2(ALERT_FAIL_HZ, 120, 60, ALERT_FAIL_HZ - 600, 220);
+  alertVibrateHook();
+}
+
+// Compact status code for the RTC alert table. 0 is reserved for "never seen".
+static char statusCode(const String& status) {
+  if (status == "wait") return 'w';
+  if (status == "run") return 'r';
+  if (status == "fail") return 'f';
+  if (status == "done") return 'd';
+  if (status == "rec") return 'c';
+  if (status == "idle") return 'i';
+  return 'u';
+}
+
+static char prevStatusFor(const String& id) {
+  if (!rtcPrevTasksValid || !id.length()) return 0;
+  for (int i = 0; i < rtcPrevTaskCount; i++) {
+    if (strncmp(rtcPrevTasks[i].id, id.c_str(), RTC_ID_LEN - 1) == 0) return rtcPrevTasks[i].status;
+  }
+  return 0;
+}
+
+// Diff the freshly fetched task list against the per-task status table from the
+// previous refresh and pick the single most important transition to announce:
+//   WAIT: task is waiting now and was not waiting before (incl. brand-new tasks)
+//   FAIL: task failed now and was not failed before
+//   DONE: task was running and is now done/recent (a turn completed)
+// Then remember the current statuses for the next diff. Called from
+// fetchTasks() on success only, so a failed fetch never masks a transition.
+static void detectAlertEdges() {
+  pendingAlert = ALERT_NONE;
+  pendingAlertTask = -1;
+  for (int i = 0; i < taskCount; i++) {
+    char now = statusCode(tasks[i].status);
+    char prev = prevStatusFor(tasks[i].id);
+    AlertKind kind = ALERT_NONE;
+    if (now == 'w' && prev != 'w') kind = ALERT_WAIT;
+    else if (now == 'f' && prev != 'f') kind = ALERT_FAIL;
+    else if ((now == 'd' || now == 'c') && prev == 'r') kind = ALERT_DONE;
+    if (kind > pendingAlert) {
+      pendingAlert = kind;
+      pendingAlertTask = i;
+    }
+  }
+
+  rtcPrevTaskCount = min(taskCount, MAX_TASKS);
+  for (int i = 0; i < rtcPrevTaskCount; i++) {
+    copyRtcField(rtcPrevTasks[i].id, sizeof(rtcPrevTasks[i].id), tasks[i].id);
+    rtcPrevTasks[i].status = statusCode(tasks[i].status);
+  }
+  rtcPrevTasksValid = true;
+}
+
+// Play the alert decided by the last fetchTasks(), if any (one-shot).
 static void updateAlerts() {
-  bool waitActive = waitCount > 0;
-  bool running = runCount > 0;
+  AlertKind kind = pendingAlert;
+  pendingAlert = ALERT_NONE;
+  pendingAlertTask = -1;
+  switch (kind) {
+    case ALERT_WAIT:
 #if ALERT_ON_WAIT
-  if (waitActive && !rtcWaitWasActive) {
-    alertWait();
-  }
+      alertWait();
 #endif
+      break;
+    case ALERT_FAIL:
+#if ALERT_ON_FAIL
+      alertFail();
+#endif
+      break;
+    case ALERT_DONE:
 #if ALERT_ON_DONE
-  if (rtcWasRunning && !running && !waitActive && taskCount > 0) {
-    alertDone();
-  }
+      alertDone();
 #endif
-  rtcWaitWasActive = waitActive;
-  rtcWasRunning = running;
+      break;
+    default:
+      break;
+  }
 }
 
 static uint32_t hideAfterSec(const String& status) {
@@ -1344,6 +1516,9 @@ static int sourceLogoColor(const String& source) {
   if (s.indexOf("lovable") >= 0) return C_LOVABLE_RED;
   if (s.indexOf("manus") >= 0) return C_GREEN;
   if (s.indexOf("openclaw") >= 0 || s.indexOf("claw") >= 0) return C_RED;
+  if (s.indexOf("cline") >= 0 || s.indexOf("roo") >= 0 || s.indexOf("kilo") >= 0) return C_WHITE;
+  if (s.indexOf("copilot") >= 0) return C_WHITE;
+  if (s.indexOf("qwen") >= 0) return C_BLUE;
   return C_GRAY;
 }
 
@@ -1442,6 +1617,26 @@ static void drawAiSourceIcon(const String& source, int x, int y, int bg) {
     M5.Display.fillRect(x + 7, y + 10, 2, 2, c);
     M5.Display.fillCircle(x + 4, y + 5, 1, C_BG);
     M5.Display.fillCircle(x + 8, y + 5, 1, C_BG);
+  } else if (s.indexOf("cline") >= 0 || s.indexOf("roo") >= 0 || s.indexOf("kilo") >= 0) {
+    // Robot head (Cline family: Cline / Roo Code / Kilo Code): antenna, visor, two eyes.
+    M5.Display.drawFastVLine(x + 6, y + 0, 2, c);
+    M5.Display.fillRoundRect(x + 1, y + 2, 10, 9, 2, c);
+    M5.Display.fillRect(x + 3, y + 5, 2, 2, bg);
+    M5.Display.fillRect(x + 7, y + 5, 2, 2, bg);
+    M5.Display.drawFastHLine(x + 4, y + 9, 4, bg);
+  } else if (s.indexOf("copilot") >= 0) {
+    // Goggles: two lenses joined by a bridge, strap at the sides.
+    M5.Display.drawFastHLine(x + 0, y + 5, 12, c);
+    M5.Display.fillCircle(x + 3, y + 6, 3, c);
+    M5.Display.fillCircle(x + 8, y + 6, 3, c);
+    M5.Display.fillRect(x + 2, y + 5, 2, 2, bg);
+    M5.Display.fillRect(x + 7, y + 5, 2, 2, bg);
+  } else if (s.indexOf("qwen") >= 0) {
+    // Ring with a tail (Q).
+    M5.Display.drawCircle(x + 5, y + 5, 4, c);
+    M5.Display.drawCircle(x + 5, y + 5, 3, c);
+    M5.Display.drawLine(x + 7, y + 7, x + 11, y + 11, c);
+    M5.Display.drawLine(x + 8, y + 7, x + 11, y + 10, c);
   } else {
     M5.Display.drawRect(x + 1, y + 1, 10, 10, c);
     M5.Display.drawLine(x + 3, y + 9, x + 6, y + 2, c);
@@ -1482,25 +1677,376 @@ static void drawWakeSyncScreen(const String& status) {
   setBootStatus(status, C_GRAY);
 }
 
-static void drawSetupScreen(const String& status) {
+// ---------------------------------------------------------------------------
+// First-run setup: captive-portal Wi-Fi, then code pairing with the Mac Host.
+// ---------------------------------------------------------------------------
+
+static String deviceSuffix(bool upper) {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[8];
+  snprintf(buf, sizeof(buf), upper ? "%04X" : "%04x", (unsigned)((mac >> 32) & 0xFFFF));
+  return String(buf);
+}
+
+static String htmlEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
+static void drawWifiPortalScreen(const String& status) {
   bootScreenActive = true;
   bootStatusText = "";
   M5.Display.fillScreen(C_BG);
-  int scale = 2;
-  int iconW = 24 * scale;
-  int iconH = 22 * scale;
-  int iconX = (M5.Display.width() - iconW) / 2;
-  int iconY = 8;
-  drawTaskHubMark(iconX, iconY, scale, C_BLUE);
+  int H = M5.Display.height();
+  int qrSize = 92;
+  int qrX = 6;
+  int qrY = (H - 22 - qrSize) / 2 + 2;
+  String qr = "WIFI:T:nopass;S:" + apSsid + ";;";
+  M5.Display.qrcode(qr.c_str(), qrX, qrY, qrSize, 3);
 
+  int x = qrX + qrSize + 10;
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setFont(&fonts::efontCN_16);
+  M5.Display.setTextColor(C_BLUE, C_BG);
+  M5.Display.drawString(uiText("Wi-Fi Setup", "配置 Wi-Fi"), x, 8);
+  M5.Display.setFont(&fonts::efontCN_12);
+  M5.Display.setTextColor(C_GRAY, C_BG);
+  M5.Display.drawString(uiText("1. Phone: join Wi-Fi", "1. 手机连接热点"), x, 32);
+  M5.Display.setTextColor(C_WHITE, C_BG);
+  M5.Display.drawString(apSsid, x + 8, 46);
+  M5.Display.setTextColor(C_GRAY, C_BG);
+  M5.Display.drawString(uiText("2. Pick your network", "2. 在弹出页面选网络"), x, 64);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.drawString(uiText("no popup? open 192.168.4.1", "没弹出? 打开 192.168.4.1"), x, 80);
+  M5.Display.drawString(uiText("Scan the QR to join", "扫码即可加入热点"), x, 92);
+  setBootStatus(status, C_AMBER);
+}
+
+static void drawPairScreen() {
+  bootScreenActive = true;
+  bootStatusText = "";
+  M5.Display.fillScreen(C_BG);
+  int W = M5.Display.width();
   M5.Display.setTextDatum(middle_center);
   M5.Display.setFont(&fonts::efontCN_16);
   M5.Display.setTextColor(C_BLUE, C_BG);
-  M5.Display.drawString("USB Setup", M5.Display.width() / 2, iconY + iconH + 17);
-  M5.Display.setFont(&fonts::Font0);
+  M5.Display.drawString(uiText("Pair with Mac", "与 Mac 配对"), W / 2, 14);
+  M5.Display.setFont(&fonts::Font7);
+  M5.Display.setTextColor(C_WHITE, C_BG);
+  M5.Display.drawString(pairCode, W / 2, 58);
+  M5.Display.setFont(&fonts::efontCN_12);
   M5.Display.setTextColor(C_GRAY, C_BG);
-  M5.Display.drawString("Run scripts/provision_sticks3.sh", M5.Display.width() / 2, iconY + iconH + 34);
-  setBootStatus(status, C_AMBER);
+  M5.Display.drawString(uiText("Enter this code on your Mac", "在 Mac 上输入这个配对码"), W / 2, 92);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.drawString(pairName + "  " + uiText("hold A: redo Wi-Fi", "长按A: 重配Wi-Fi"), W / 2, 106);
+  setBootStatus(pairStatus, C_AMBER);
+}
+
+static void setPairStatus(const String& text, int color) {
+  pairStatus = text;
+  setBootStatus(text, color);
+}
+
+static String generatePairCode() {
+  uint32_t n = 1000 + (esp_random() % 9000);   // 4 digits, no leading zero
+  return String(n);
+}
+
+static const char PORTAL_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>TaskHub Setup</title>
+<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e8edf2;margin:0;padding:24px}
+.card{max-width:420px;margin:0 auto;background:#141b24;border-radius:14px;padding:22px}
+h1{font-size:20px;margin:0 0 4px}p{color:#9aa7b4;margin:6px 0 16px;font-size:14px}
+label{display:block;font-size:13px;color:#9aa7b4;margin:14px 0 6px}
+select,input{width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:10px;border:1px solid #2a3542;background:#0b0f14;color:#fff}
+button{width:100%;margin-top:20px;font-size:17px;padding:14px;border:0;border-radius:10px;background:#3b82f6;color:#fff}
+.row{display:flex;gap:10px}.row label{flex:1;margin:0;display:flex;align-items:center;gap:6px;color:#e8edf2}
+.row input{width:auto}small{color:#6b7885}#other{display:none}</style></head><body><div class="card">
+<h1>TaskHub · StickS3</h1><p>Choose the Wi-Fi your Mac is on. / 选择你的 Mac 所在的 Wi-Fi。</p>
+<form method="post" action="/save">
+<label>Wi-Fi network / 网络 <a href="/scan" style="float:right;color:#3b82f6;text-decoration:none">rescan</a></label>
+<select name="ssid" id="ssid" onchange="document.getElementById('other').style.display=this.value=='__other__'?'block':'none'">
+%OPTIONS%<option value="__other__">Other… / 手动输入</option></select>
+<input id="other" name="ssid_other" placeholder="SSID" autocapitalize="off" autocorrect="off">
+<label>Password / 密码</label><input name="password" type="password" autocapitalize="off" autocorrect="off">
+<label>Device language / 设备语言</label>
+<div class="row"><label><input type="radio" name="lang" value="en" %EN%>English</label><label><input type="radio" name="lang" value="zh" %ZH%>中文</label></div>
+<button type="submit">Connect / 连接</button></form>
+<p style="margin-top:18px"><small>Developers: USB serial provisioning still works (taskhub-provision).</small></p>
+</div></body></html>)HTML";
+
+static const char PORTAL_WAIT_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>TaskHub Setup</title>
+<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e8edf2;margin:0;padding:24px}
+.card{max-width:420px;margin:0 auto;background:#141b24;border-radius:14px;padding:22px}
+h1{font-size:20px;margin:0 0 10px}p{color:#9aa7b4;font-size:15px;line-height:1.5}
+.code{font-size:44px;letter-spacing:8px;text-align:center;margin:18px 0;color:#fff;font-weight:700}
+a{color:#3b82f6}.ok{color:#22c55e}.bad{color:#ef4444}</style></head><body><div class="card">
+<h1>TaskHub · StickS3</h1><div id="s"><p>Connecting to <b>%SSID%</b>… / 正在连接…</p></div>
+<script>
+function tick(){fetch('/status').then(r=>r.json()).then(j=>{var s=document.getElementById('s');
+if(j.state=='connected'){s.innerHTML='<p class="ok">Connected to <b>'+j.ssid+'</b> ✓</p><p>Now on your Mac: install TaskHub Host, then type this code when it asks.<br>现在在 Mac 上安装 TaskHub Host，出现提示时输入这个配对码：</p><div class="code">'+j.code+'</div><p>The code is also on the StickS3 screen. / 配对码也显示在 StickS3 屏幕上。</p>';return;}
+if(j.state=='failed'){s.innerHTML='<p class="bad">Could not join <b>'+j.ssid+'</b>. Wrong password? / 连接失败，密码是否正确？</p><p><a href="/">Try again / 重试</a></p>';return;}
+setTimeout(tick,1500);}).catch(function(){setTimeout(tick,2000);});}
+setTimeout(tick,1500);</script></div></body></html>)HTML";
+
+static void portalScanNetworks() {
+  // Blocking scan (~2s). Runs before the AP comes up and again on /scan.
+  int n = WiFi.scanNetworks(false, false);
+  String options;
+  for (int i = 0; i < n && i < 20; i++) {
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length()) continue;
+    if (options.indexOf("value=\"" + htmlEscape(ssid) + "\"") >= 0) continue;   // dedupe BSSIDs
+    options += "<option value=\"" + htmlEscape(ssid) + "\">" + htmlEscape(ssid);
+    options += String(" (") + WiFi.RSSI(i) + " dBm)</option>";
+  }
+  WiFi.scanDelete();
+  portalScanOptions = options;
+}
+
+static void portalSendPage() {
+  String page = FPSTR(PORTAL_PAGE);
+  page.replace("%OPTIONS%", portalScanOptions);
+  page.replace("%EN%", uiZh() ? "" : "checked");
+  page.replace("%ZH%", uiZh() ? "checked" : "");
+  portalServer->sendHeader("Cache-Control", "no-store");
+  portalServer->send(200, "text/html; charset=utf-8", page);
+}
+
+static void portalRedirectHome() {
+  // Captive-portal probes (iOS hotspot-detect, Android generate_204, Windows
+  // connecttest) all land here; a redirect to our page makes the OS pop it up.
+  portalServer->sendHeader("Location", "http://192.168.4.1/", true);
+  portalServer->send(302, "text/plain", "");
+}
+
+static void portalHandleSave() {
+  String ssid = portalServer->arg("ssid");
+  if (ssid == "__other__" || !ssid.length()) ssid = portalServer->arg("ssid_other");
+  ssid.trim();
+  if (!ssid.length()) {
+    portalServer->send(400, "text/plain; charset=utf-8", "SSID required");
+    return;
+  }
+  portalPendingSsid = ssid;
+  portalPendingPassword = portalServer->arg("password");
+  portalPendingLang = normalizeLang(portalServer->arg("lang"));
+  cfgLang = portalPendingLang;   // so screens switch language right away
+  portalStaConnecting = true;
+  portalStaFailed = false;
+  portalStaStartedAt = millis();
+  WiFi.disconnect(false, false);
+  delay(50);
+  WiFi.begin(portalPendingSsid.c_str(), portalPendingPassword.c_str());
+  drawWifiPortalScreen(uiText("Joining " + portalPendingSsid + "...", "正在连接 " + portalPendingSsid + "..."));
+
+  String page = FPSTR(PORTAL_WAIT_PAGE);
+  page.replace("%SSID%", htmlEscape(portalPendingSsid));
+  portalServer->sendHeader("Cache-Control", "no-store");
+  portalServer->send(200, "text/html; charset=utf-8", page);
+}
+
+static void portalHandleStatus() {
+  JsonDocument doc;
+  const char* state = "idle";
+  if (portalStaConnecting) state = "connecting";
+  else if (portalStaFailed) state = "failed";
+  else if (WiFi.status() == WL_CONNECTED && cfgWifiReady) state = "connected";
+  doc["state"] = state;
+  doc["ssid"] = portalPendingSsid.length() ? portalPendingSsid : cfgWifiSsid;
+  doc["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
+  doc["code"] = pairCode;
+  doc["name"] = pairName;
+  String body;
+  serializeJson(doc, body);
+  portalServer->sendHeader("Cache-Control", "no-store");
+  portalServer->send(200, "application/json", body);
+}
+
+static void stopWifiPortal() {
+  if (!portalActive) return;
+  if (portalServer) { portalServer->stop(); delete portalServer; portalServer = nullptr; }
+  if (portalDns) { portalDns->stop(); delete portalDns; portalDns = nullptr; }
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalActive = false;
+  Serial.println("[task-monitor] setup: portal stopped");
+}
+
+static void startWifiPortal() {
+  setupStage = SETUP_WIFI_PORTAL;
+  apSsid = "TaskHub-" + deviceSuffix(true);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(false, false);
+  delay(100);
+  drawWifiPortalScreen(uiText("scanning networks...", "正在扫描网络..."));
+  portalScanNetworks();
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(apSsid.c_str());
+  delay(100);
+
+  portalDns = new DNSServer();
+  portalDns->setErrorReplyCode(DNSReplyCode::NoError);
+  portalDns->start(53, "*", WiFi.softAPIP());
+
+  portalServer = new WebServer(80);
+  portalServer->on("/", HTTP_GET, portalSendPage);
+  portalServer->on("/scan", HTTP_GET, []() { portalScanNetworks(); portalSendPage(); });
+  portalServer->on("/save", HTTP_POST, portalHandleSave);
+  portalServer->on("/status", HTTP_GET, portalHandleStatus);
+  portalServer->onNotFound(portalRedirectHome);
+  portalServer->begin();
+  portalActive = true;
+  drawWifiPortalScreen(uiText("waiting for phone", "等待手机连接"));
+  Serial.printf("[task-monitor] setup: AP %s up, portal at 192.168.4.1\n", apSsid.c_str());
+}
+
+static void startPairing() {
+  setupStage = SETUP_PAIRING;
+  if (!pairCode.length()) pairCode = generatePairCode();
+  pairName = "StickS3-" + deviceSuffix(true);
+  pairDeviceId = (cfgDeviceId == String(DEVICE_ID)) ? "sticks3-" + deviceSuffix(false) : cfgDeviceId;
+  hubDiscovered = false;
+  lastPairPollAt = 0;
+  lastPairStaAttemptAt = 0;
+  pairStatus = uiText("connecting Wi-Fi...", "连接 Wi-Fi...");
+  drawPairScreen();
+  Serial.printf("[task-monitor] setup: pairing as %s code=%s\n", pairDeviceId.c_str(), pairCode.c_str());
+}
+
+static void runPairing() {
+  if (pairDone) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    hubDiscovered = false;
+    if (millis() - lastPairStaAttemptAt > PAIR_STA_RETRY_MS) {
+      lastPairStaAttemptAt = millis();
+      if (!portalActive) WiFi.mode(WIFI_STA);
+      WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
+      setPairStatus(uiText("connecting Wi-Fi...", "连接 Wi-Fi..."), C_BLUE);
+    }
+    return;
+  }
+  if (millis() - lastPairPollAt < PAIR_POLL_MS) return;
+  lastPairPollAt = millis();
+
+  if (!hubDiscovered && !discoverHub(true)) {
+    setPairStatus(uiText("looking for Mac Host...", "正在寻找 Mac Host..."), C_AMBER);
+    return;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(4000);
+  String url = "http://" + hubHost + ":" + String(hubPort) + "/pair";
+  if (!http.begin(url)) {
+    hubDiscovered = false;
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  JsonDocument req;
+  req["device_id"] = pairDeviceId;
+  req["name"] = pairName;
+  req["code"] = pairCode;
+  req["version"] = TASKHUB_FW_VERSION;
+  String body;
+  serializeJson(req, body);
+  int status = http.POST(body);
+  if (status <= 0) {
+    http.end();
+    hubDiscovered = false;
+    setPairStatus(uiText("Host lost, searching...", "Host 失联，重新寻找..."), C_AMBER);
+    return;
+  }
+  JsonDocument resp;
+  DeserializationError err = deserializeJson(resp, http.getString());
+  http.end();
+  if (err || !(bool)(resp["ok"] | false)) {
+    String msg = resp["error"].as<String>();
+    setPairStatus(msg.length() ? msg : uiText("pairing rejected", "配对被拒绝"), C_RED);
+    return;
+  }
+  pairHostName = resp["host_name"].as<String>();
+  String state = resp["status"].as<String>();
+  if (state == "approved") {
+    String token = resp["token"].as<String>();
+    String host = resp["host"].as<String>();
+    int port = resp["port"] | hubPort;
+    if (!host.length()) host = hubHost;
+    bool saved = saveRuntimeConfig(cfgWifiSsid, cfgWifiPassword, host, port, pairDeviceId, token,
+                                   cfgLang, cfgVoiceAutoSend);
+    if (!saved) {
+      setPairStatus(uiText("save failed", "保存失败"), C_RED);
+      return;
+    }
+    pairDone = true;
+    M5.Display.fillScreen(C_BG);
+    centerText(uiText("Paired!", "配对成功！"), M5.Display.height() * 40 / 100, C_GREEN, &fonts::efontCN_16);
+    centerText(pairHostName.length() ? pairHostName : host, M5.Display.height() * 62 / 100, C_GRAY, &fonts::efontCN_12);
+    Serial.printf("[task-monitor] setup: paired with %s (%s:%d), restarting\n", pairHostName.c_str(), host.c_str(), port);
+    delay(1800);
+    ESP.restart();
+    return;
+  }
+  String hostLabel = pairHostName.length() ? pairHostName : hubHost;
+  setPairStatus(uiText("Mac: " + hostLabel + "  - enter code", "Mac: " + hostLabel + "  请输入配对码"), C_GREEN);
+}
+
+static void runSetupMode() {
+  // Serial provisioning status heartbeat (scripts/provision_sticks3.sh waits for it).
+  if (millis() - lastSetupStatusAt > 3000) {
+    lastSetupStatusAt = millis();
+    sendSerialConfigStatus("taskhub.status", true, "setup required");
+  }
+
+  if (portalActive) {
+    portalDns->processNextRequest();
+    portalServer->handleClient();
+
+    if (portalStaConnecting) {
+      if (WiFi.status() == WL_CONNECTED) {
+        portalStaConnecting = false;
+        portalJoinedAt = millis();
+        if (saveWifiConfig(portalPendingSsid, portalPendingPassword, portalPendingLang)) {
+          Serial.printf("[task-monitor] setup: joined %s ip=%s\n", portalPendingSsid.c_str(), WiFi.localIP().toString().c_str());
+          startPairing();
+        }
+      } else if (millis() - portalStaStartedAt > PORTAL_STA_JOIN_TIMEOUT_MS) {
+        portalStaConnecting = false;
+        portalStaFailed = true;
+        WiFi.disconnect(false, false);
+        drawWifiPortalScreen(uiText("join failed - retry on phone", "连接失败，请在手机上重试"));
+      }
+    }
+    // Keep the AP a while after joining so the phone page can show the code,
+    // then drop it: a lone STA is quieter and draws less.
+    if (setupStage == SETUP_PAIRING && portalJoinedAt && millis() - portalJoinedAt > PORTAL_LINGER_AFTER_JOIN_MS) {
+      stopWifiPortal();
+    }
+  }
+
+  if (setupStage == SETUP_PAIRING) {
+    runPairing();
+    if (M5.BtnA.pressedFor(SETUP_RESET_HOLD_MS)) {
+      Serial.println("[task-monitor] setup: BtnA held, clearing Wi-Fi");
+      clearRuntimeConfig();
+      delay(200);
+      ESP.restart();
+    }
+  }
 }
 
 static void setBootStatus(const String& text, int color) {
@@ -1526,7 +2072,7 @@ static void topBar() {
   if (W > 170) drawMetricDots(76, 10);
 
   int battX = W - 25;
-  drawBatteryGlyph(battX, 6, battPct);
+  drawBatteryGlyph(battX, 6, battPct, battCharging);
   int wifiX = battX - 12;
   int wifiCol = wifiOk ? C_GREEN : C_AMBER;
   M5.Display.fillCircle(wifiX, 14, 2, wifiCol);
@@ -1839,9 +2385,10 @@ static bool fetchTasks() {
     if (t.status == "wait") waitCount++;
     if (t.status == "run") runCount++;
   }
-  Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d syncing=%d wifi=%s ip=%s\n",
-                taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount, (int)hostSyncing,
-                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+  detectAlertEdges();
+  Serial.printf("[task-monitor] fetch ok tasks=%d hidden=%d total=%d active=%d attention=%d wait=%d alert=%d syncing=%d wifi=%s ip=%s\n",
+                taskCount, hiddenCount, totalCount, activeCount, attentionCount, waitCount, (int)pendingAlert,
+                (int)hostSyncing, WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
   setBootStatus(uiText("ready", "就绪"), C_GREEN);
   if (taskCount == 0) {
     selected = 0;
@@ -1849,6 +2396,9 @@ static bool fetchTasks() {
     int prev = findTaskById(previousSelectedId);
     if (prev >= 0) selected = prev;
     else if (selected >= taskCount) selected = taskCount - 1;
+  } else if (pendingAlertTask >= 0 && pendingAlertTask < taskCount) {
+    // Show the task that just changed, so the beep and the screen agree.
+    selected = pendingAlertTask;
   } else {
     int priority = firstPriorityTask();
     selected = priority >= 0 ? priority : 0;
@@ -2213,12 +2763,23 @@ void setup() {
   wokeFromSleep = wakeCause == ESP_SLEEP_WAKEUP_TIMER || wakeCause == ESP_SLEEP_WAKEUP_EXT1;
 
   if (!cfgReady) {
+    // First run (or config cleared): no deep sleep, fixed landscape, and the
+    // captive portal / pairing flow. USB serial provisioning stays available.
     setupMode = true;
-    drawSetupScreen("waiting for USB config");
-    sendSerialConfigStatus("taskhub.status", true, "setup required");
+    M5.Display.setRotation(1);
+    displayRotation = 1;
+    pendingRotation = 1;
     activeTimeoutMs = UINT32_MAX;
     lastInputAt = millis();
-    Serial.println("[task-monitor] setup required: waiting for serial provisioning");
+    Serial.printf("[task-monitor] setup required: wifi=%d token=%d\n", (int)cfgWifiReady, (int)(cfgDeviceToken.length() > 0));
+    if (cfgWifiReady) {
+      WiFi.persistent(false);
+      startPairing();
+    } else {
+      startWifiPortal();
+    }
+    sendSerialConfigStatus("taskhub.status", true, "setup required");
+    lastSetupStatusAt = millis();
     return;
   }
 
@@ -2259,12 +2820,8 @@ void loop() {
       lastSetupBattAt = millis();
       updateBattery();
     }
-    if (millis() - lastSetupStatusAt > 3000) {
-      lastSetupStatusAt = millis();
-      sendSerialConfigStatus("taskhub.status", true, "setup required");
-      setBootStatus("waiting for USB config", C_AMBER);
-    }
-    delay(25);
+    runSetupMode();
+    delay(10);
     return;
   }
 
@@ -2283,10 +2840,11 @@ void loop() {
   if (millis() - lastBattAt > 2000) {
     lastBattAt = millis();
     int old = battPct;
+    bool oldCharging = battCharging;
     bool oldWifi = wifiOk;
     updateBattery();
     wifiOk = WiFi.status() == WL_CONNECTED;
-    if (old != battPct || oldWifi != wifiOk) drawList();
+    if (old != battPct || oldCharging != battCharging || oldWifi != wifiOk) drawList();
   }
 
   if (hostSyncing && nextSyncFollowupAt != 0 && (int32_t)(millis() - nextSyncFollowupAt) >= 0) {

@@ -54,6 +54,20 @@ and `title` are required; optional `id`, `status`, `subtitle`, `url`,
 Each pushed task expires after its TTL unless re-pushed, so it disappears on its
 own when the pusher stops. See `extension/` for the Chrome/Edge web bridge.
 
+Pair a StickS3 that was burned with the public (M5Burner) firmware: once it is
+on the Wi-Fi it shows a 4-digit code and polls this Host's `POST /pair`. Approve
+it from this Mac:
+
+```bash
+python3 host/taskhub_pair.py          # prompts for the code in the terminal
+python3 host/taskhub_pair.py --gui    # native dialogs (what TaskHub Host.app uses)
+curl 'http://127.0.0.1:5577/pair/pending'   # who is asking (loopback only)
+```
+
+`/pair` never returns the token until `/pair/approve` (loopback only) received
+the exact code; pending requests expire after `TASK_HUB_PAIR_PENDING_TTL_MS`
+(5 min). `taskhub_pair.py` is also copied into the Host install directory.
+
 Discovery check:
 
 ```bash
@@ -135,6 +149,9 @@ Current stable build:
 - Perplexity uses local preferences for query counters when macOS allows the background hub to read them, and WebKit cache/WAL mtimes for recent activity. It marks `RUN` only when the hub observes those local signals change during polling; otherwise it stays `REC` or `IDLE` because no stable local task transcript or task database has been found yet.
 - Gemini uses the local Gemini app process plus settings/log/cache mtimes, and also scans browser tabs for `gemini.google.com` in Safari, Chrome, Arc, Edge, Brave, and Chromium. When a Gemini tab is visible in Safari, accessibility headings can provide the current page/task title; background tabs and Chromium browsers fall back to the tab title, often just `Gemini`. It only marks `RUN` when a visible browser signal such as a stop-generation control is exposed.
 - Lovable detects `Lovable.app` (`dev.lovable.build`) through its app process, renderer CPU, and local `lovable-desktop` storage/cache mtimes, and also scans browser tabs for `lovable.dev` in Safari, Chrome, Arc, Edge, Brave, and Chromium. It shows up to `TASK_HUB_LOVABLE_MAX_TABS=3` open Lovable project tabs, opens the original app or tab URL from BtnA, and marks `RUN` when a visible page exposes generation/building controls or when the Lovable renderer exceeds `TASK_HUB_LOVABLE_RENDERER_RUN_CPU=8.0`; app-only local cache activity stays `REC`.
+- Cline, Roo Code and Kilo Code are read from each host editor's `User/globalStorage/<extension>/tasks/<id>/ui_messages.json` (VS Code, VS Code Insiders, Cursor, Windsurf, VSCodium, Antigravity, Trae). The last message decides the state: an unanswered `ask` (tool/command approval, follow-up question, plan review) is `WAIT`, `api_req_started` or a streaming partial is `RUN`, `completion_result` is `DONE`, `api_req_failed` / `error` is `FAIL`, `resume_task` is a parked task. If the host editor process is gone nothing can be `RUN`/`WAIT`. `TASK_HUB_CLINE_*` tune the windows.
+- Gemini CLI (`~/.gemini`) and Qwen Code (`~/.qwen`) are read from `tmp/<projectHash>/chats/session-*.json`. A trailing user message or an executing tool call is `RUN`, a tool call in `awaiting_approval` is `WAIT`, a trailing model reply is `DONE`, an `error` message is `FAIL`. `RUN` needs a live `gemini`/`qwen` process unless the event is under `TASK_HUB_CLI_AGENT_NO_PROCESS_RUNNING_STALE_MS` old. Folder names come from `projects.json` (sha256 of the project path).
+- GitHub Copilot CLI is read from `~/.copilot/session-state/<id>/events.jsonl` plus `workspace.yaml` (`cwd`, `summary`). Turn start / tool execution events are `RUN`, `assistant.turn_end` is `DONE`, `session.shutdown` parks the session, `*.error` is `FAIL`, and a trailing `permission*`/`approval*` event is `WAIT`. The event vocabulary is matched loosely because the CLI's format is not documented; report mismatches with a redacted `events.jsonl` excerpt.
 - WorkBuddy reads `~/.workbuddy/projects/*/*.jsonl` directly. Pending tools mark `RUN`, an unanswered `AskUserQuestion` marks `WAIT`, and a final completed assistant message marks `DONE`; merely opening WorkBuddy does not mark a task running.
 - Kimi combines `conversation-statuses.json` with its local daemon's active-turn counters. A newer idle runtime state clears abandoned `running` records immediately; a six-hour guard handles stale files after crashes, and renderer CPU never creates `RUN` by itself. Grok uses a conservative visible-control fallback. An open app alone stays `REC`; the Chrome/Edge Web Bridge adds precise browser conversation titles.
 - StickS3 hides old display-only tasks without deleting them on the Mac. Defaults: `DONE`/`IDLE` after 10 minutes, `REC` after 1 hour, `RUN`/`WAIT`/`FAIL` never. Override with `STICK_HIDE_DONE_AFTER_SEC`, `STICK_HIDE_IDLE_AFTER_SEC`, `STICK_HIDE_RECENT_AFTER_SEC`, and `STICK_HIDE_UNKNOWN_AFTER_SEC`.

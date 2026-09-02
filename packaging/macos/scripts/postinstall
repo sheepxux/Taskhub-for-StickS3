@@ -71,5 +71,8 @@ launchctl bootstrap "gui/$USER_ID" "$PLIST"
 launchctl kickstart -k "gui/$USER_ID/$LABEL"
 
 echo "TaskHub Host installed for $CONSOLE_USER."
-echo "Open /Applications/TaskHub Host.app for diagnostics."
-echo "Run taskhub-provision after burning the public StickS3 firmware."
+echo "Open /Applications/TaskHub Host.app to pair a StickS3 or view diagnostics."
+
+# Hand off to the pairing dialog in the user's session so the install ends
+# with "type the code on your StickS3" instead of a silent finish.
+launchctl asuser "$USER_ID" sudo -u "$CONSOLE_USER" /usr/bin/open "/Applications/TaskHub Host.app" >/dev/null 2>&1 || true

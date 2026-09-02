@@ -37,9 +37,11 @@ mkdir -p "$INSTALL_ROOT/host" "$INSTALL_ROOT/scripts" "$APP_ROOT/MacOS" "$SCRIPT
 cp "$ROOT/host/task_hub.py" "$INSTALL_ROOT/host/task_hub.py"
 cp "$ROOT/host/taskhub_config.py" "$INSTALL_ROOT/host/taskhub_config.py"
 cp "$ROOT/host/taskhub_voice.py" "$INSTALL_ROOT/host/taskhub_voice.py"
+cp "$ROOT/host/taskhub_pair.py" "$INSTALL_ROOT/host/taskhub_pair.py"
 cp "$ROOT/scripts/provision_sticks3.sh" "$INSTALL_ROOT/scripts/provision_sticks3.sh"
 cp "$ROOT/packaging/macos/resources/run_task_hub.sh" "$INSTALL_ROOT/run_task_hub.sh"
 cp "$ROOT/packaging/macos/resources/taskhub-provision" "$PAYLOAD/usr-local-taskhub-provision"
+cp "$ROOT/packaging/macos/resources/taskhub-pair" "$PAYLOAD/usr-local-taskhub-pair"
 cp "$ROOT/packaging/macos/resources/Info.plist" "$APP_ROOT/Info.plist"
 cp "$ROOT/packaging/macos/resources/taskhub-host-app" "$APP_ROOT/MacOS/TaskHub Host"
 cp "$ROOT/packaging/macos/scripts/postinstall" "$SCRIPTS/postinstall"
@@ -47,10 +49,12 @@ cp "$ROOT/packaging/macos/scripts/postinstall" "$SCRIPTS/postinstall"
 
 mkdir -p "$PAYLOAD/usr/local/bin"
 mv "$PAYLOAD/usr-local-taskhub-provision" "$PAYLOAD/usr/local/bin/taskhub-provision"
+mv "$PAYLOAD/usr-local-taskhub-pair" "$PAYLOAD/usr/local/bin/taskhub-pair"
 chmod +x \
   "$INSTALL_ROOT/run_task_hub.sh" \
   "$INSTALL_ROOT/scripts/provision_sticks3.sh" \
   "$PAYLOAD/usr/local/bin/taskhub-provision" \
+  "$PAYLOAD/usr/local/bin/taskhub-pair" \
   "$APP_ROOT/MacOS/TaskHub Host" \
   "$SCRIPTS/postinstall"
 

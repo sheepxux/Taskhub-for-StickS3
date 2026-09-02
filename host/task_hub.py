@@ -44,6 +44,15 @@ from taskhub_config import (
     CLAUDE_MAX_TRANSCRIPTS,
     CLAUDE_RUNNING_STALE_MS,
     CLAUDE_TERMINAL_STOP_REASONS,
+    CLI_AGENT_DONE_WINDOW_MS,
+    CLI_AGENT_FAILED_TTL_MS,
+    CLI_AGENT_MAX_SESSIONS,
+    CLI_AGENT_NO_PROCESS_RUNNING_STALE_MS,
+    CLI_AGENT_RUNNING_STALE_MS,
+    CLINE_DONE_WINDOW_MS,
+    CLINE_FAILED_TTL_MS,
+    CLINE_MAX_TASKS,
+    CLINE_RUNNING_STALE_MS,
     CODEX_DONE_WINDOW_MS,
     CODEX_HUMAN_INPUT_FUNCTIONS,
     CODEX_MAX_THREADS,
@@ -81,6 +90,9 @@ from taskhub_config import (
     OPENCLAW_CLI_FALLBACK,
     MAX_TASKS,
     OPENCLAW_RUNNING_STALE_MS,
+    PAIR_APPROVED_TTL_MS,
+    PAIR_MAX_PENDING,
+    PAIR_PENDING_TTL_MS,
     PEER_CACHE_MS,
     PEER_DISCOVERY_MS,
     PEER_DISCOVERY_TIMEOUT_MS,
@@ -92,6 +104,7 @@ from taskhub_config import (
     QUESTION_WAITING_STALE_MS,
     TASK_BACKGROUND_REFRESH_MIN_MS,
     TASK_CACHE_MS,
+    TASK_COLD_START_WAIT_MS,
     TASK_HUB_VERSION,
     TASK_STICK_STALE_CACHE_MS,
     TRANSCRIPT_CACHE_MAX,
@@ -120,6 +133,8 @@ _CLAUDE_TRANSCRIPT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _CODEX_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _CURSOR_TRANSCRIPT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _WORKBUDDY_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_CLINE_TASK_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_CLI_AGENT_SESSION_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # ThreadingHTTPServer serves /tasks from multiple threads, and the bounded-cache
 # helpers below mutate the OrderedDict in several steps (set → move_to_end →
 # popitem). Those sequences are not atomic, so guard every access with a shared
@@ -152,6 +167,47 @@ def bounded_cache_set(
         cache.move_to_end(key)
         while len(cache) > TRANSCRIPT_CACHE_MAX:
             cache.popitem(last=False)
+
+
+# Data-source access failures (typically macOS TCC denials for a launchd-run
+# Host) must not be swallowed as "adapter ok, 0 tasks". Adapters record them
+# here per (source, aspect) and /diagnostics surfaces them as adapter errors.
+_SOURCE_ACCESS_ERRORS: Dict[str, Dict[str, str]] = {}
+_SOURCE_ACCESS_LOCK = threading.Lock()
+FULL_DISK_ACCESS_HINT = (
+    "macOS denied the read (TCC: protected app data, or a data folder that lives "
+    "on an external volume). Grant Full Disk Access to the Python interpreter "
+    "that runs the Host, then restart it."
+)
+
+
+def is_permission_denial(exc: BaseException) -> bool:
+    """True for filesystem/SQLite errors that mean macOS TCC (or classic Unix
+    permissions) blocked the read, as opposed to transient lock/missing-file
+    errors."""
+    if isinstance(exc, PermissionError):
+        return True
+    text = str(exc).lower()
+    return "authorization denied" in text or "operation not permitted" in text or "not authorized" in text
+
+
+def note_source_access(source: str, aspect: str, error: str = "") -> None:
+    """Record (or clear, when error is empty) a data-source access failure."""
+    with _SOURCE_ACCESS_LOCK:
+        aspects = _SOURCE_ACCESS_ERRORS.setdefault(source, {})
+        if error:
+            if aspects.get(aspect) != error:
+                aspects[aspect] = error
+                print(f"[{source}] access error ({aspect}): {error}", file=sys.stderr)
+        else:
+            aspects.pop(aspect, None)
+            if not aspects:
+                _SOURCE_ACCESS_ERRORS.pop(source, None)
+
+
+def source_access_errors(source: str) -> Dict[str, str]:
+    with _SOURCE_ACCESS_LOCK:
+        return dict(_SOURCE_ACCESS_ERRORS.get(source) or {})
 
 
 def ci_contains(needle: str, hay: str) -> bool:
@@ -298,15 +354,107 @@ def sort_key(t: Task) -> Tuple[int, int]:
     return rank, -int(t.get("updated_ms") or 0)
 
 
-def local_ip_hint() -> str:
+def _route_ip(target: str) -> str:
+    """Source IP the kernel would use to reach `target` (no packets sent)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect(("8.8.8.8", 80))
+        sock.connect((target, 80))
         return sock.getsockname()[0]
     except OSError:
-        return "127.0.0.1"
+        return ""
     finally:
         sock.close()
+
+
+def _is_tunnel_ip(ip: str) -> bool:
+    # Fake-IP / CGNAT ranges used by Clash, Surge, Tailscale and friends. A
+    # StickS3 on the LAN can never reach these, so never advertise them.
+    try:
+        import ipaddress
+
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    if addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+        return True
+    for net in ("198.18.0.0/15", "100.64.0.0/10"):
+        if addr in ipaddress.ip_network(net):
+            return True
+    return False
+
+
+_LAN_IP_CACHE: Dict[str, Any] = {"ip": "", "at": 0}
+
+
+def _lan_interface_ips() -> List[str]:
+    """IPv4 addresses of real LAN interfaces (en*/eth*/wlan*), default-route first."""
+    ips: List[str] = []
+    preferred = ""
+    try:
+        code, out, _ = run(["route", "-n", "get", "default"], timeout=1.5)
+        if code == 0:
+            for line in out.splitlines():
+                if "interface:" in line:
+                    preferred = line.split("interface:", 1)[1].strip()
+    except Exception:
+        pass
+    try:
+        code, out, _ = run(["ifconfig"], timeout=1.5)
+    except Exception:
+        return ips
+    if code != 0:
+        return ips
+    current = ""
+    found: List[Tuple[str, str]] = []
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            current = line.split(":", 1)[0]
+            continue
+        stripped = line.strip()
+        if stripped.startswith("inet ") and current:
+            ip = stripped.split()[1]
+            if current.startswith(("en", "eth", "wlan", "bridge")) and not _is_tunnel_ip(ip):
+                found.append((current, ip))
+    found.sort(key=lambda item: (item[0] != preferred, item[0]))
+    for _, ip in found:
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+def local_ip_hint() -> str:
+    """Best LAN address to hand to a StickS3.
+
+    The classic connect-to-8.8.8.8 trick returns the VPN/proxy tunnel address
+    when one is active (198.18.0.1 for Clash fake-IP, 100.x for Tailscale),
+    which the device cannot reach. Prefer a real interface on the default
+    route and only fall back to the routing trick when nothing else is there.
+    """
+    now = now_ms()
+    if _LAN_IP_CACHE["ip"] and now - int(_LAN_IP_CACHE["at"]) < 30000:
+        return str(_LAN_IP_CACHE["ip"])
+    routed = _route_ip("8.8.8.8")
+    ip = ""
+    if routed and not _is_tunnel_ip(routed):
+        ip = routed
+    if not ip:
+        lan = _lan_interface_ips()
+        ip = lan[0] if lan else ""
+    if not ip:
+        ip = routed or "127.0.0.1"
+    _LAN_IP_CACHE["ip"] = ip
+    _LAN_IP_CACHE["at"] = now
+    return ip
+
+
+def local_ip_for_peer(peer_ip: str) -> str:
+    """The Host address a specific LAN peer should use: the source IP the
+    kernel picks for that peer, unless that turns out to be a tunnel."""
+    if peer_ip and not peer_ip.startswith("127."):
+        ip = _route_ip(peer_ip)
+        if ip and not _is_tunnel_ip(ip):
+            return ip
+    return local_ip_hint()
 
 
 def ps_commands() -> List[str]:
@@ -449,15 +597,38 @@ def process_name_running(name: str) -> bool:
     return code == 0
 
 
+# Each window_titles() call spawns an osascript subprocess that can burn its
+# full 2s timeout (e.g. when Automation permission is missing and the call
+# yields nothing). Memoise per app for a few seconds so one slow AppleScript
+# round-trip is paid at most once per refresh cycle, not once per adapter call.
+_WINDOW_TITLES_CACHE: Dict[str, Tuple[int, List[str]]] = {}
+WINDOW_TITLES_TTL_MS = 5000
+# An empty result usually means the call burned its full osascript timeout
+# (app not running, or the Host lacks Automation permission for System
+# Events). Titles only feed cosmetic fallbacks, so back off much longer
+# before paying that timeout again.
+WINDOW_TITLES_EMPTY_TTL_MS = 60000
+
+
 def window_titles(app_name: str) -> List[str]:
+    now = now_ms()
+    cached = _WINDOW_TITLES_CACHE.get(app_name)
+    if cached:
+        ttl = WINDOW_TITLES_TTL_MS if cached[1] else WINDOW_TITLES_EMPTY_TTL_MS
+        if now - cached[0] < ttl:
+            return list(cached[1])
     script = (
         f'tell application "System Events" to '
         f'if exists process "{app_name}" then get name of every window of process "{app_name}"'
     )
     code, out, _ = run(["osascript", "-e", script], timeout=2)
-    if code != 0:
-        return []
-    return [part.strip() for part in out.replace("\n", ",").split(",") if part.strip()]
+    titles = (
+        []
+        if code != 0
+        else [part.strip() for part in out.replace("\n", ",").split(",") if part.strip()]
+    )
+    _WINDOW_TITLES_CACHE[app_name] = (now, titles)
+    return list(titles)
 
 
 def accessibility_labels(process_name: str, limit: int = 160) -> List[str]:
@@ -1009,145 +1180,202 @@ def codex_session_index() -> Dict[str, Dict[str, Any]]:
     return records
 
 
+def _new_codex_scan_state() -> Dict[str, Any]:
+    return {
+        "session_id": "",
+        "cwd": "",
+        "updated_ms": 0,
+        "token_usage": {},
+        "rate_percent": None,
+        "turns": 0,
+        "latest_turn_id": "",
+        "latest_turn_ms": 0,
+        "latest_completed_turn_id": "",
+        "latest_completed_ms": 0,
+        "latest_event_ms": 0,
+        "latest_user_ms": 0,
+        "latest_agent_message_ms": 0,
+        "latest_agent_message_text": "",
+        "latest_tool_call_ms": 0,
+        "latest_human_input_request_ms": 0,
+    }
+
+
+def _feed_codex_scan_state(state: Dict[str, Any], raw_line: bytes) -> bool:
+    """Fold one rollout JSONL line into the accumulated scan state. Returns
+    True when the line held valid JSON (i.e. it was a complete line)."""
+    try:
+        item = json.loads(raw_line.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(item, dict):
+        return True
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    item_type = str(item.get("type") or "")
+    payload_type = str(payload.get("type") or "")
+    event_ms = iso_to_ms(item.get("timestamp"))
+    if event_ms:
+        state["latest_event_ms"] = max(state["latest_event_ms"], event_ms)
+    if item_type == "session_meta":
+        state["session_id"] = str(payload.get("id") or state["session_id"])
+        state["cwd"] = str(payload.get("cwd") or state["cwd"])
+        state["updated_ms"] = iso_to_ms(payload.get("timestamp")) or state["updated_ms"]
+    elif payload_type == "user_message":
+        state["latest_user_ms"] = event_ms or state["latest_user_ms"]
+    elif payload_type in {"task_started", "turn_started"} or item_type == "turn_context" or payload_type == "turn_context":
+        turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
+        state["latest_turn_id"] = str(
+            payload.get("turn_id") or turn.get("id") or item.get("turn_id") or state["latest_turn_id"]
+        )
+        state["latest_turn_ms"] = safe_ms(payload.get("started_at")) or event_ms or state["latest_turn_ms"]
+        state["updated_ms"] = state["latest_turn_ms"] or event_ms or state["updated_ms"]
+    elif payload_type == "agent_message":
+        state["latest_agent_message_ms"] = event_ms or state["latest_agent_message_ms"]
+        state["latest_agent_message_text"] = str(payload.get("message") or state["latest_agent_message_text"])
+        state["updated_ms"] = event_ms or state["updated_ms"]
+    elif item_type == "response_item" and payload_type == "message":
+        role = str(payload.get("role") or "")
+        if role == "assistant":
+            text = extract_text(payload.get("content"))
+            if text:
+                state["latest_agent_message_ms"] = event_ms or state["latest_agent_message_ms"]
+                state["latest_agent_message_text"] = text
+                state["updated_ms"] = event_ms or state["updated_ms"]
+        elif role == "user":
+            state["latest_user_ms"] = event_ms or state["latest_user_ms"]
+    elif item_type == "response_item" and payload_type in {
+        "function_call",
+        "custom_tool_call",
+        "local_shell_call",
+        "mcp_tool_call",
+        "tool_search_call",
+        "web_search_call",
+        "image_generation_call",
+    }:
+        name = str(payload.get("name") or "")
+        if name in CODEX_HUMAN_INPUT_FUNCTIONS:
+            state["latest_human_input_request_ms"] = event_ms or state["latest_human_input_request_ms"]
+        state["latest_tool_call_ms"] = event_ms or state["latest_tool_call_ms"]
+    elif payload_type == "token_count":
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        raw_usage = info.get("total_token_usage")
+        if isinstance(raw_usage, dict):
+            state["token_usage"] = raw_usage
+        limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+        primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
+        state["rate_percent"] = safe_float(primary.get("used_percent"))
+        state["updated_ms"] = iso_to_ms(item.get("timestamp")) or state["updated_ms"]
+    elif payload_type in {
+        "task_complete",
+        "turn_completed",
+        "turn_aborted",
+        "turn_interrupted",
+        "turn_failed",
+    }:
+        if payload_type in {"task_complete", "turn_completed"}:
+            state["turns"] += 1
+        turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
+        state["latest_completed_turn_id"] = str(
+            payload.get("turn_id") or turn.get("id") or state["latest_completed_turn_id"]
+        )
+        state["latest_completed_ms"] = (
+            safe_ms(payload.get("completed_at") or turn.get("completed_at"))
+            or event_ms
+            or state["latest_completed_ms"]
+        )
+        state["updated_ms"] = state["latest_completed_ms"] or state["updated_ms"]
+    return True
+
+
 def _scan_codex_session(path: str) -> Optional[Dict[str, Any]]:
-    """Walk a single codex rollout JSONL once; memoise the result by
-    (path, mtime, size). The hot path on a /tasks request becomes O(1) for
-    every session the user hasn't touched since the previous scan."""
+    """Scan a codex rollout JSONL, memoised by (path, mtime, size) and
+    resumable: rollouts are append-only, so when a cached file grows we keep
+    the accumulated parse state and only fold in the appended lines. Active
+    sessions can reach hundreds of MB; re-parsing them from scratch on every
+    /tasks refresh used to cost seconds per request."""
     try:
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (int(st.st_mtime * 1000), int(st.st_size))
-    cached = bounded_cache_get(_CODEX_SESSION_CACHE, path, cache_key)
-    if cached:
-        return cached
+    size = int(st.st_size)
+    cache_key = (int(st.st_mtime * 1000), size)
 
-    session_id = ""
-    cwd = ""
-    file_mtime_ms = int(st.st_mtime * 1000)
-    updated_ms = file_mtime_ms
-    token_usage: Dict[str, Any] = {}
-    rate_percent: Optional[float] = None
-    turns = 0
-    latest_turn_id = ""
-    latest_turn_ms = 0
-    latest_completed_turn_id = ""
-    latest_completed_ms = 0
-    latest_event_ms = 0
-    latest_user_ms = 0
-    latest_agent_message_ms = 0
-    latest_agent_message_text = ""
-    latest_tool_call_ms = 0
-    latest_human_input_request_ms = 0
+    prior_state: Optional[Dict[str, Any]] = None
+    offset = 0
+    with _CACHE_LOCK:
+        cached = _CODEX_SESSION_CACHE.get(path)
+        if cached and cached.get("_key") == cache_key:
+            _CODEX_SESSION_CACHE.move_to_end(path)
+            return cached
+        if cached:
+            cached_offset = safe_int(cached.get("_offset"))
+            cached_state = cached.get("_state")
+            # Resume only if the file grew (or matched) past what we already
+            # parsed; a shrink means truncation/rotation, so rescan fully.
+            if isinstance(cached_state, dict) and 0 < cached_offset <= size:
+                prior_state = dict(cached_state)
+                offset = cached_offset
+            _CODEX_SESSION_CACHE.pop(path, None)
+
+    state = prior_state or _new_codex_scan_state()
+    if not state["updated_ms"]:
+        state["updated_ms"] = int(st.st_mtime * 1000)
 
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-                item_type = str(item.get("type") or "")
-                payload_type = str(payload.get("type") or "")
-                event_ms = iso_to_ms(item.get("timestamp"))
-                if event_ms:
-                    latest_event_ms = max(latest_event_ms, event_ms)
-                if item_type == "session_meta":
-                    session_id = str(payload.get("id") or session_id)
-                    cwd = str(payload.get("cwd") or cwd)
-                    updated_ms = iso_to_ms(payload.get("timestamp")) or updated_ms
-                elif payload_type == "user_message":
-                    latest_user_ms = event_ms or latest_user_ms
-                elif payload_type in {"task_started", "turn_started"} or item_type == "turn_context" or payload_type == "turn_context":
-                    turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
-                    latest_turn_id = str(
-                        payload.get("turn_id") or turn.get("id") or item.get("turn_id") or latest_turn_id
-                    )
-                    latest_turn_ms = safe_ms(payload.get("started_at")) or event_ms or latest_turn_ms
-                    updated_ms = latest_turn_ms or event_ms or updated_ms
-                elif payload_type == "agent_message":
-                    latest_agent_message_ms = event_ms or latest_agent_message_ms
-                    latest_agent_message_text = str(payload.get("message") or latest_agent_message_text)
-                    updated_ms = event_ms or updated_ms
-                elif item_type == "response_item" and payload_type == "message":
-                    role = str(payload.get("role") or "")
-                    if role == "assistant":
-                        text = extract_text(payload.get("content"))
-                        if text:
-                            latest_agent_message_ms = event_ms or latest_agent_message_ms
-                            latest_agent_message_text = text
-                            updated_ms = event_ms or updated_ms
-                    elif role == "user":
-                        latest_user_ms = event_ms or latest_user_ms
-                elif item_type == "response_item" and payload_type in {
-                    "function_call",
-                    "custom_tool_call",
-                    "local_shell_call",
-                    "mcp_tool_call",
-                    "tool_search_call",
-                    "web_search_call",
-                    "image_generation_call",
-                }:
-                    name = str(payload.get("name") or "")
-                    if name in CODEX_HUMAN_INPUT_FUNCTIONS:
-                        latest_human_input_request_ms = event_ms or latest_human_input_request_ms
-                    latest_tool_call_ms = event_ms or latest_tool_call_ms
-                elif payload_type == "token_count":
-                    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-                    raw_usage = info.get("total_token_usage")
-                    if isinstance(raw_usage, dict):
-                        token_usage = raw_usage
-                    limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
-                    primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
-                    rate_percent = safe_float(primary.get("used_percent"))
-                    updated_ms = iso_to_ms(item.get("timestamp")) or updated_ms
-                elif payload_type in {
-                    "task_complete",
-                    "turn_completed",
-                    "turn_aborted",
-                    "turn_interrupted",
-                    "turn_failed",
-                }:
-                    if payload_type in {"task_complete", "turn_completed"}:
-                        turns += 1
-                    turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
-                    latest_completed_turn_id = str(
-                        payload.get("turn_id") or turn.get("id") or latest_completed_turn_id
-                    )
-                    latest_completed_ms = (
-                        safe_ms(payload.get("completed_at") or turn.get("completed_at"))
-                        or event_ms
-                        or latest_completed_ms
-                    )
-                    updated_ms = latest_completed_ms or updated_ms
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            remainder = b""
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                remainder += chunk
+                start = 0
+                while True:
+                    newline = remainder.find(b"\n", start)
+                    if newline < 0:
+                        break
+                    _feed_codex_scan_state(state, remainder[start:newline])
+                    start = newline + 1
+                offset += start
+                remainder = remainder[start:]
+            # A trailing line without a newline is either a complete final
+            # record (consume it and advance) or a partial line still being
+            # written (leave the offset before it so the next scan, triggered
+            # by the size change, re-reads it once complete).
+            if remainder and _feed_codex_scan_state(state, remainder):
+                offset += len(remainder)
     except OSError:
         return None
 
     scan = {
         "_key": cache_key,
-        "session_id": session_id,
-        "cwd": cwd,
-        "updated_ms": updated_ms,
-        "token_usage": token_usage,
-        "rate_percent": rate_percent,
-        "turns": turns,
-        "latest_turn_id": latest_turn_id,
-        "latest_turn_ms": latest_turn_ms,
-        "latest_completed_turn_id": latest_completed_turn_id,
-        "latest_completed_ms": latest_completed_ms,
-        "latest_event_ms": latest_event_ms,
-        "file_mtime_ms": file_mtime_ms,
-        "latest_user_ms": latest_user_ms,
-        "latest_agent_message_ms": latest_agent_message_ms,
-        "latest_tool_call_ms": latest_tool_call_ms,
-        "latest_human_input_request_ms": latest_human_input_request_ms,
-        "active_turn": bool(latest_turn_id and latest_turn_id != latest_completed_turn_id),
+        "_offset": offset,
+        "_state": state,
+        "session_id": state["session_id"],
+        "cwd": state["cwd"],
+        "updated_ms": state["updated_ms"],
+        "token_usage": state["token_usage"],
+        "rate_percent": state["rate_percent"],
+        "turns": state["turns"],
+        "latest_turn_id": state["latest_turn_id"],
+        "latest_turn_ms": state["latest_turn_ms"],
+        "latest_completed_turn_id": state["latest_completed_turn_id"],
+        "latest_completed_ms": state["latest_completed_ms"],
+        "latest_event_ms": state["latest_event_ms"],
+        "file_mtime_ms": int(st.st_mtime * 1000),
+        "latest_user_ms": state["latest_user_ms"],
+        "latest_agent_message_ms": state["latest_agent_message_ms"],
+        "latest_tool_call_ms": state["latest_tool_call_ms"],
+        "latest_human_input_request_ms": state["latest_human_input_request_ms"],
+        "active_turn": bool(
+            state["latest_turn_id"] and state["latest_turn_id"] != state["latest_completed_turn_id"]
+        ),
         # Mirror the Claude model: WAIT only for an explicit, unanswered
         # request_user_input call — a turn ending with a question in prose is a
         # completed turn (DONE), not a WAIT.
         "waiting_for_user": is_unanswered_human_input_request(
-            latest_human_input_request_ms, latest_user_ms
+            state["latest_human_input_request_ms"], state["latest_user_ms"]
         ),
     }
     bounded_cache_set(_CODEX_SESSION_CACHE, path, scan)
@@ -2272,8 +2500,11 @@ def cursor_composer_headers(limit: int) -> List[Dict[str, Any]]:
             ).fetchall()
         finally:
             con.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if is_permission_denial(exc):
+            note_source_access("Cursor", "global-storage-db", f"{display_path(path)}: {exc}. {FULL_DISK_ACCESS_HINT}")
         return []
+    note_source_access("Cursor", "global-storage-db", "")
 
     headers: List[Dict[str, Any]] = []
     for row in rows:
@@ -2354,7 +2585,9 @@ def cursor_composer_live(composer_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                 live[composer_id] = info
         finally:
             con.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if is_permission_denial(exc):
+            note_source_access("Cursor", "global-storage-db", f"{display_path(path)}: {exc}. {FULL_DISK_ACCESS_HINT}")
         return live
     return live
 
@@ -2364,6 +2597,19 @@ def cursor_transcript_index() -> Dict[str, str]:
     directory deeper (…/subagents/*.jsonl) and are intentionally not matched."""
     root = os.path.expanduser(CURSOR_PROJECTS_ROOT)
     index: Dict[str, str] = {}
+    # glob() swallows EPERM as an empty result, so probe the root explicitly:
+    # a TCC denial must surface in /diagnostics, not read as "no transcripts".
+    try:
+        os.listdir(root)
+        note_source_access("Cursor", "projects-root", "")
+    except FileNotFoundError:
+        note_source_access("Cursor", "projects-root", "")
+        return index
+    except PermissionError as exc:
+        note_source_access("Cursor", "projects-root", f"{display_path(root)}: {exc}. {FULL_DISK_ACCESS_HINT}")
+        return index
+    except OSError:
+        return index
     for path in glob.glob(os.path.join(root, "*", "agent-transcripts", "*", "*.jsonl")):
         composer_id = os.path.splitext(os.path.basename(path))[0]
         if os.path.basename(os.path.dirname(path)) != composer_id:
@@ -2585,14 +2831,19 @@ class CursorAdapter:
                 tasks.append(self._build_task(composer_id, {}, scan, status, updated, "cursor-transcript"))
 
         if not tasks and app_is_running:
+            access = source_access_errors(self.source)
             tasks.append(
                 task(
                     task_id="cursor-app",
                     source=self.source,
                     title="Cursor",
                     status="recent",
-                    subtitle="app open · no recent agent session",
-                    detail={"app_running": True, "metadata_source": "app-fallback"},
+                    subtitle="needs Full Disk Access" if access else "app open · no recent agent session",
+                    detail={
+                        "app_running": True,
+                        "metadata_source": "app-fallback",
+                        "access_errors": access or None,
+                    },
                     open_action={"type": "app", "target": self.bundle_id},
                 )
             )
@@ -2840,6 +3091,644 @@ class WorkBuddyAdapter:
                     open_action={"type": "app", "target": self.bundle_id},
                 )
             )
+        return tasks
+
+
+# ---------------------------------------------------------------------------
+# Cline family: Cline / Roo Code / Kilo Code, VS Code-style extensions that can
+# run inside VS Code, Cursor, Windsurf, VSCodium, Antigravity or Trae. Each
+# task keeps its whole UI transcript in
+#   <Application Support>/<Host>/User/globalStorage/<extension>/tasks/<id>/ui_messages.json
+# as a JSON array of {ts, type: "say"|"ask", say?, ask?, text?, partial?}.
+# The final message tells the story: an unanswered `ask` is the extension
+# blocked on the user (tool approval, follow-up question, plan review),
+# `say: api_req_started` is a request in flight, and `completion_result` means
+# the task finished. The file is rewritten on every message, so its mtime is
+# an honest freshness signal.
+# ---------------------------------------------------------------------------
+CLINE_EXTENSIONS: List[Tuple[str, str]] = [
+    ("Cline", "saoudrizwan.claude-dev"),
+    ("Roo Code", "rooveterinaryinc.roo-cline"),
+    ("Kilo Code", "kilocode.kilo-code"),
+]
+# (host label, Application Support folder, app bundle path fragment, `open -a` name)
+CLINE_HOSTS: List[Tuple[str, str, str, str]] = [
+    ("VS Code", "Code", "/Visual Studio Code.app/", "Visual Studio Code"),
+    ("VS Code Insiders", "Code - Insiders", "/Visual Studio Code - Insiders.app/", "Visual Studio Code - Insiders"),
+    ("Cursor", "Cursor", "/Cursor.app/", "Cursor"),
+    ("Windsurf", "Windsurf", "/Windsurf.app/", "Windsurf"),
+    ("VSCodium", "VSCodium", "/VSCodium.app/", "VSCodium"),
+    ("Antigravity", "Antigravity", "/Antigravity.app/", "Antigravity"),
+    ("Trae", "Trae", "/Trae.app/", "Trae"),
+]
+# `ask` values that end a task rather than block on the user.
+CLINE_DONE_ASKS = {"completion_result", "resume_completed_task"}
+# The extension host restarted with this task open; it is parked, not waiting.
+CLINE_PAUSED_ASKS = {"resume_task"}
+# Provider/API failures the user has to retry by hand.
+CLINE_FAILED_ASKS = {"api_req_failed"}
+
+
+def _scan_cline_task(path: str) -> Optional[Dict[str, Any]]:
+    """Summarise one Cline-family ui_messages.json (memoised by mtime/size)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    stamp = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = bounded_cache_get(_CLINE_TASK_CACHE, path, stamp)
+    if cached:
+        return cached
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            messages = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(messages, list):
+        return None
+
+    task_text = ""
+    latest_ms = 0
+    latest_user_ms = 0
+    requests = 0
+    fields = {"tokensIn": 0, "tokensOut": 0, "cacheWrites": 0, "cacheReads": 0}
+    cost = 0.0
+    last: Dict[str, Any] = {}
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        ts = safe_ms(item.get("ts")) or 0
+        latest_ms = max(latest_ms, ts)
+        kind = str(item.get("type") or "")
+        say = str(item.get("say") or "")
+        if kind == "say" and say == "task" and not task_text:
+            task_text = task_title_text(item.get("text"))
+        elif kind == "say" and say == "user_feedback":
+            latest_user_ms = ts or latest_user_ms
+        elif kind == "say" and say == "api_req_started":
+            requests += 1
+            try:
+                meta = json.loads(item.get("text") or "{}")
+            except (TypeError, ValueError):
+                meta = {}
+            if isinstance(meta, dict):
+                for field in fields:
+                    fields[field] += safe_int(meta.get(field))
+                cost += safe_float(meta.get("cost")) or 0.0
+        last = item
+
+    last_type = str(last.get("type") or "")
+    last_say = str(last.get("say") or "")
+    last_ask = str(last.get("ask") or "")
+    partial = bool(last.get("partial"))
+    completed = (last_type == "ask" and last_ask in CLINE_DONE_ASKS) or (
+        last_type == "say" and last_say == "completion_result" and not partial
+    )
+    failed = (last_type == "ask" and last_ask in CLINE_FAILED_ASKS) or (last_type == "say" and last_say == "error")
+    paused = last_type == "ask" and last_ask in CLINE_PAUSED_ASKS
+    waiting = last_type == "ask" and not partial and not (completed or failed or paused)
+    active_turn = bool(last) and not (waiting or completed or failed or paused)
+
+    total_tokens = sum(fields.values())
+    scan = {
+        "_key": stamp,
+        "task_text": task_text,
+        "latest_event_ms": latest_ms or stamp[0],
+        "latest_user_ms": latest_user_ms,
+        "last_kind": f"{last_type}:{last_ask or last_say}" if last else "",
+        "waiting_for_user": waiting,
+        "active_turn": active_turn,
+        "completed": completed,
+        "failed": failed,
+        "paused": paused,
+        "requests": requests,
+        "usage": build_usage(
+            total_tokens=total_tokens,
+            turns=requests,
+            fields={"source": "cline-ui-messages", **fields, "cost_usd": round(cost, 4)},
+        )
+        if requests
+        else {},
+    }
+    bounded_cache_set(_CLINE_TASK_CACHE, path, scan)
+    return scan
+
+
+def cline_status(scan: Dict[str, Any], host_running: bool) -> str:
+    latest = safe_int(scan.get("latest_event_ms"))
+    age = now_ms() - latest if latest else None
+    if host_running:
+        if scan.get("waiting_for_user") and age is not None and age <= QUESTION_WAITING_STALE_MS:
+            return "waiting"
+        if scan.get("failed") and age is not None and age <= CLINE_FAILED_TTL_MS:
+            return "failed"
+        if scan.get("active_turn") and age is not None and age < CLINE_RUNNING_STALE_MS:
+            return "running"
+        if scan.get("completed") and age is not None and age < CLINE_DONE_WINDOW_MS:
+            return "done"
+    if age is not None and age < ACTIVE_MINUTES * 60 * 1000:
+        return "recent"
+    return "idle"
+
+
+def _cline_task_history(store_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Newer Cline builds keep state/taskHistory.json with the task prompt and
+    the workspace the task was started in; older builds have neither."""
+    path = os.path.join(store_dir, "state", "taskHistory.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and row.get("id"):
+                out[str(row["id"])] = row
+    return out
+
+
+class ClineAdapter:
+    source = "Cline"
+
+    def __init__(self, stores: Optional[List[Dict[str, str]]] = None) -> None:
+        self.stores = stores if stores is not None else self._default_stores()
+
+    @staticmethod
+    def _default_stores() -> List[Dict[str, str]]:
+        base = os.path.expanduser("~/Library/Application Support")
+        stores: List[Dict[str, str]] = []
+        for host_label, folder, bundle_fragment, app_name in CLINE_HOSTS:
+            for ext_label, ext_id in CLINE_EXTENSIONS:
+                stores.append(
+                    {
+                        "source": ext_label,
+                        "host": host_label,
+                        "store_dir": os.path.join(base, folder, "User", "globalStorage", ext_id),
+                        "bundle_fragment": bundle_fragment,
+                        "app_name": app_name,
+                    }
+                )
+        return stores
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        cutoff = now_ms() - ACTIVE_MINUTES * 60 * 1000
+        tasks: List[Task] = []
+        for store in self.stores:
+            tasks_dir = os.path.join(store["store_dir"], "tasks")
+            if not os.path.isdir(tasks_dir):
+                continue
+            try:
+                entries = os.listdir(tasks_dir)
+            except OSError as exc:
+                if is_permission_denial(exc):
+                    note_source_access(self.source, tasks_dir, f"{display_path(tasks_dir)}: {exc}. {FULL_DISK_ACCESS_HINT}")
+                continue
+            note_source_access(self.source, tasks_dir, "")
+            host_running = any(ci_contains(store["bundle_fragment"], line) for line in commands)
+            history = _cline_task_history(store["store_dir"])
+
+            candidates: List[Tuple[float, str, str]] = []
+            for entry in entries:
+                path = os.path.join(tasks_dir, entry, "ui_messages.json")
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                candidates.append((mtime, entry, path))
+            candidates.sort(reverse=True)
+
+            per_store = 0
+            for mtime, task_id, path in candidates:
+                # The file is rewritten on every message, so an old mtime means
+                # the task cannot be RUN/WAIT; skip parsing it entirely.
+                if int(mtime * 1000) < cutoff:
+                    break
+                scan = _scan_cline_task(path)
+                if not scan:
+                    continue
+                status = cline_status(scan, host_running)
+                if status == "idle":
+                    continue
+                meta = history.get(task_id) or {}
+                cwd = str(meta.get("cwdOnTaskInitialization") or meta.get("cwd") or "")
+                title = task_title_text(
+                    scan.get("task_text") or meta.get("task"),
+                    folder_label(cwd) or f"{store['source']} task",
+                )
+                state = {"waiting": "wait", "running": "active", "done": "done", "failed": "fail"}.get(status, "recent")
+                tasks.append(
+                    task(
+                        task_id=stable_id("cline", f"{store['store_dir']}:{task_id}"),
+                        source=store["source"],
+                        title=title,
+                        status=status,
+                        updated_ms=safe_int(scan.get("latest_event_ms")) or None,
+                        subtitle=join_parts([store["host"], folder_label(cwd), state]),
+                        detail={
+                            "task_id": task_id,
+                            "host": store["host"],
+                            "extension": store["source"],
+                            "cwd": cwd,
+                            "host_running": host_running,
+                            "active_turn": bool(scan.get("active_turn")),
+                            "waiting_for_user": bool(scan.get("waiting_for_user")),
+                            "last_message": scan.get("last_kind"),
+                            "requests": safe_int(scan.get("requests")),
+                            "metadata_source": "cline-ui-messages",
+                        },
+                        usage=scan.get("usage") or {},
+                        open_action={"type": "app-name", "target": store["app_name"]},
+                        needs_attention=status == "waiting",
+                    )
+                )
+                per_store += 1
+                if per_store >= CLINE_MAX_TASKS:
+                    break
+        return tasks
+
+
+# ---------------------------------------------------------------------------
+# Terminal coding agents with per-message timestamped transcripts.
+# ---------------------------------------------------------------------------
+def cli_process_running(commands: Iterable[str], names: Iterable[str], exclude: Iterable[str] = ()) -> bool:
+    """True when a command line runs one of `names` as a program (bare binary,
+    `node .../name.js`, or `.../bin/name`), ignoring lines that mention any of
+    `exclude` (e.g. a desktop app of the same brand)."""
+    patterns = [re.compile(rf"(?:^|[\s/]){re.escape(name)}(?:\.js|\.mjs|\.cjs)?(?:\s|$)", re.IGNORECASE) for name in names]
+    excludes = [item.lower() for item in exclude]
+    for line in commands:
+        low = line.lower()
+        if any(item in low for item in excludes):
+            continue
+        if any(pattern.search(line) for pattern in patterns):
+            return True
+    return False
+
+
+def cli_agent_status(scan: Dict[str, Any], process_running: bool) -> str:
+    latest = safe_int(scan.get("latest_event_ms"))
+    age = now_ms() - latest if latest else None
+    if age is None:
+        return "idle"
+    if scan.get("waiting_for_user") and age <= QUESTION_WAITING_STALE_MS and (process_running or age < CLI_AGENT_NO_PROCESS_RUNNING_STALE_MS):
+        return "waiting"
+    if scan.get("failed") and age <= CLI_AGENT_FAILED_TTL_MS:
+        return "failed"
+    if scan.get("active_turn"):
+        limit = CLI_AGENT_RUNNING_STALE_MS if process_running else CLI_AGENT_NO_PROCESS_RUNNING_STALE_MS
+        if age < limit:
+            return "running"
+    if scan.get("completed") and age < CLI_AGENT_DONE_WINDOW_MS:
+        return "done"
+    if age < ACTIVE_MINUTES * 60 * 1000:
+        return "recent"
+    return "idle"
+
+
+def _gemini_cli_project_paths(root: str) -> Dict[str, str]:
+    """Gemini CLI names each project folder under tmp/ by sha256(project path);
+    projects.json holds the paths, so invert it to label sessions by folder."""
+    path = os.path.join(root, "projects.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    projects = data.get("projects") if isinstance(data, dict) else None
+    out: Dict[str, str] = {}
+    if isinstance(projects, dict):
+        for project_path in projects.keys():
+            digest = hashlib.sha256(str(project_path).encode("utf-8", "ignore")).hexdigest()
+            out[digest] = str(project_path)
+    return out
+
+
+def _scan_gemini_cli_session(path: str) -> Optional[Dict[str, Any]]:
+    """Gemini CLI / Qwen Code chat recording:
+    {sessionId, projectHash, startTime, lastUpdated,
+     messages: [{id, timestamp, type: user|gemini|info|error|warning, content,
+                 toolCalls?: [{id, name, status, ...}], tokens?: {...}}]}"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    stamp = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = bounded_cache_get(_CLI_AGENT_SESSION_CACHE, path, stamp)
+    if cached:
+        return cached
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+    first_user_text = ""
+    latest_ms = iso_to_ms(data.get("lastUpdated")) or 0
+    latest_user_ms = 0
+    user_turns = 0
+    total_tokens = 0
+    last: Dict[str, Any] = {}
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        ts = iso_to_ms(item.get("timestamp")) or 0
+        latest_ms = max(latest_ms, ts)
+        kind = str(item.get("type") or "").lower()
+        if kind == "user":
+            user_turns += 1
+            latest_user_ms = ts or latest_user_ms
+            if not first_user_text:
+                first_user_text = task_title_text(item.get("content"))
+        tokens = item.get("tokens") if isinstance(item.get("tokens"), dict) else {}
+        total_tokens += safe_int(tokens.get("total")) or (safe_int(tokens.get("input")) + safe_int(tokens.get("output")))
+        if kind in {"user", "gemini", "qwen", "assistant", "error"}:
+            last = item
+
+    last_kind = str(last.get("type") or "").lower()
+    tool_calls = last.get("toolCalls") if isinstance(last.get("toolCalls"), list) else []
+    tool_statuses = [str(call.get("status") or "").lower() for call in tool_calls if isinstance(call, dict)]
+    awaiting_approval = any(status in {"awaiting_approval", "awaiting-approval"} for status in tool_statuses)
+    tools_in_flight = any(status in {"validating", "scheduled", "executing"} for status in tool_statuses)
+    failed = last_kind == "error"
+    waiting = awaiting_approval and not failed
+    active_turn = (last_kind == "user" or tools_in_flight) and not (waiting or failed)
+    completed = last_kind in {"gemini", "qwen", "assistant"} and not (waiting or active_turn or failed)
+
+    scan = {
+        "_key": stamp,
+        "session_id": str(data.get("sessionId") or ""),
+        "project_hash": str(data.get("projectHash") or ""),
+        "first_user_text": first_user_text,
+        "latest_event_ms": latest_ms or stamp[0],
+        "latest_user_ms": latest_user_ms,
+        "last_kind": last_kind,
+        "waiting_for_user": waiting,
+        "active_turn": active_turn,
+        "completed": completed,
+        "failed": failed,
+        "turns": user_turns,
+        "usage": build_usage(
+            total_tokens=total_tokens,
+            turns=user_turns,
+            fields={"source": "gemini-cli-chat"},
+        )
+        if total_tokens or user_turns
+        else {},
+    }
+    bounded_cache_set(_CLI_AGENT_SESSION_CACHE, path, scan)
+    return scan
+
+
+class GeminiCliAdapter:
+    """Gemini CLI (~/.gemini) and its fork Qwen Code (~/.qwen): both record
+    chats as tmp/<projectHash>/chats/session-*.json."""
+
+    def __init__(
+        self,
+        source: str = "Gemini CLI",
+        root: str = "~/.gemini",
+        binaries: Iterable[str] = ("gemini",),
+        exclude_process_fragments: Iterable[str] = ("Gemini.app", "GeminiMacOS"),
+    ) -> None:
+        self.source = source
+        self.root = os.path.expanduser(root)
+        self.binaries = tuple(binaries)
+        self.exclude_process_fragments = tuple(exclude_process_fragments)
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        chats_glob = os.path.join(self.root, "tmp", "*", "chats", "*.json")
+        try:
+            paths = glob.glob(chats_glob)
+        except OSError:
+            paths = []
+        if not paths:
+            return []
+        process_running = cli_process_running(commands, self.binaries, self.exclude_process_fragments)
+        cutoff = now_ms() - ACTIVE_MINUTES * 60 * 1000
+        projects = _gemini_cli_project_paths(self.root)
+        paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+        tasks: List[Task] = []
+        seen = set()
+        for path in paths[: max(CLI_AGENT_MAX_SESSIONS * 4, CLI_AGENT_MAX_SESSIONS)]:
+            try:
+                if int(os.path.getmtime(path) * 1000) < cutoff:
+                    break
+            except OSError:
+                continue
+            scan = _scan_gemini_cli_session(path)
+            if not scan:
+                continue
+            session_id = str(scan.get("session_id") or os.path.splitext(os.path.basename(path))[0])
+            if session_id in seen:
+                continue
+            seen.add(session_id)
+            status = cli_agent_status(scan, process_running)
+            if status == "idle":
+                continue
+            project_hash = str(scan.get("project_hash") or os.path.basename(os.path.dirname(os.path.dirname(path))))
+            cwd = projects.get(project_hash, "")
+            title = task_title_text(scan.get("first_user_text"), folder_label(cwd) or f"{self.source} session")
+            state = {"waiting": "wait", "running": "active", "done": "done", "failed": "fail"}.get(status, "recent")
+            tasks.append(
+                task(
+                    task_id=stable_id(self.source.lower().replace(" ", "-"), session_id),
+                    source=self.source,
+                    title=title,
+                    status=status,
+                    updated_ms=safe_int(scan.get("latest_event_ms")) or None,
+                    subtitle=join_parts([folder_label(cwd), state]),
+                    detail={
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "project_hash": project_hash,
+                        "process_running": process_running,
+                        "active_turn": bool(scan.get("active_turn")),
+                        "waiting_for_user": bool(scan.get("waiting_for_user")),
+                        "last_kind": scan.get("last_kind"),
+                        "metadata_source": "gemini-cli-chat",
+                    },
+                    usage=scan.get("usage") or {},
+                    needs_attention=status == "waiting",
+                )
+            )
+            if len(tasks) >= CLI_AGENT_MAX_SESSIONS:
+                break
+        return tasks
+
+
+COPILOT_CLI_TURN_END_EVENTS = {"assistant.turn_end", "assistant.turn.end", "turn.end"}
+COPILOT_CLI_CLOSE_EVENTS = {"session.shutdown", "session.end", "session.close"}
+COPILOT_CLI_ERROR_EVENTS = {"session.error", "assistant.error", "error"}
+
+
+def _copilot_cli_workspace(session_dir: str) -> Dict[str, str]:
+    """workspace.yaml is a flat key: value file (cwd, summary, ...); read it
+    without a YAML dependency."""
+    path = os.path.join(session_dir, "workspace.yaml")
+    out: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if ":" not in line or line.startswith((" ", "\t", "#", "-")):
+                    continue
+                key, _, value = line.partition(":")
+                out[key.strip()] = value.strip().strip("\"'")
+    except OSError:
+        pass
+    return out
+
+
+def _scan_copilot_cli_session(path: str) -> Optional[Dict[str, Any]]:
+    """GitHub Copilot CLI session-state/<id>/events.jsonl: one event per line,
+    {type, data, timestamp}. Turn boundaries and tool executions carry their
+    own event types; anything mentioning permission/approval that is not
+    followed by another event is treated as a pending prompt."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    stamp = (int(st.st_mtime * 1000), int(st.st_size))
+    cached = bounded_cache_get(_CLI_AGENT_SESSION_CACHE, path, stamp)
+    if cached:
+        return cached
+
+    first_user_text = ""
+    cwd = ""
+    latest_ms = 0
+    latest_user_ms = 0
+    user_turns = 0
+    last_type = ""
+    last_data: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                event_type = str(item.get("type") or "").lower()
+                data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                ts = iso_to_ms(item.get("timestamp")) or safe_ms(item.get("timestamp")) or 0
+                latest_ms = max(latest_ms, ts)
+                if event_type in {"session.start", "session.resume"}:
+                    cwd = str(data.get("cwd") or data.get("workingDirectory") or cwd)
+                elif event_type == "user.message":
+                    user_turns += 1
+                    latest_user_ms = ts or latest_user_ms
+                    if not first_user_text:
+                        first_user_text = task_title_text(data.get("content") or data.get("message") or data.get("text"))
+                last_type = event_type
+                last_data = data
+    except OSError:
+        return None
+
+    pending_prompt = bool(re.search(r"permission|approval|confirm", last_type)) and not re.search(
+        r"(granted|denied|resolved|complete|response|result)", last_type
+    )
+    failed = last_type in COPILOT_CLI_ERROR_EVENTS or last_type.endswith(".error")
+    closed = last_type in COPILOT_CLI_CLOSE_EVENTS
+    completed = last_type in COPILOT_CLI_TURN_END_EVENTS or (
+        last_type == "assistant.message" and not last_data.get("toolRequests")
+    )
+    waiting = pending_prompt and not failed
+    active_turn = bool(last_type) and not (waiting or failed or closed or completed)
+
+    scan = {
+        "_key": stamp,
+        "first_user_text": first_user_text,
+        "cwd": cwd,
+        "latest_event_ms": latest_ms or stamp[0],
+        "latest_user_ms": latest_user_ms,
+        "last_kind": last_type,
+        "waiting_for_user": waiting,
+        "active_turn": active_turn,
+        "completed": completed,
+        "failed": failed,
+        "closed": closed,
+        "turns": user_turns,
+        "usage": build_usage(turns=user_turns, fields={"source": "copilot-cli-events"}) if user_turns else {},
+    }
+    bounded_cache_set(_CLI_AGENT_SESSION_CACHE, path, scan)
+    return scan
+
+
+class CopilotCliAdapter:
+    source = "Copilot CLI"
+
+    def __init__(self, root: str = "~/.copilot") -> None:
+        self.root = os.path.expanduser(root)
+
+    def list_tasks(self, commands: Optional[List[str]] = None) -> List[Task]:
+        commands = commands or ps_commands()
+        state_dir = os.path.join(self.root, "session-state")
+        if not os.path.isdir(state_dir):
+            return []
+        paths = glob.glob(os.path.join(state_dir, "*", "events.jsonl"))
+        if not paths:
+            return []
+        process_running = cli_process_running(
+            commands,
+            ("copilot",),
+            exclude=("copilot-chat", "copilot-language-server", "github.copilot", "/extensions/"),
+        )
+        cutoff = now_ms() - ACTIVE_MINUTES * 60 * 1000
+        paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+        tasks: List[Task] = []
+        for path in paths[: max(CLI_AGENT_MAX_SESSIONS * 4, CLI_AGENT_MAX_SESSIONS)]:
+            try:
+                if int(os.path.getmtime(path) * 1000) < cutoff:
+                    break
+            except OSError:
+                continue
+            scan = _scan_copilot_cli_session(path)
+            if not scan:
+                continue
+            session_dir = os.path.dirname(path)
+            session_id = os.path.basename(session_dir)
+            status = cli_agent_status(scan, process_running)
+            if status == "idle":
+                continue
+            workspace = _copilot_cli_workspace(session_dir)
+            cwd = str(scan.get("cwd") or workspace.get("cwd") or "")
+            title = task_title_text(
+                workspace.get("summary") or scan.get("first_user_text"),
+                folder_label(cwd) or "Copilot CLI session",
+            )
+            state = {"waiting": "wait", "running": "active", "done": "done", "failed": "fail"}.get(status, "recent")
+            tasks.append(
+                task(
+                    task_id=stable_id("copilot-cli", session_id),
+                    source=self.source,
+                    title=title,
+                    status=status,
+                    updated_ms=safe_int(scan.get("latest_event_ms")) or None,
+                    subtitle=join_parts([folder_label(cwd), state]),
+                    detail={
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "process_running": process_running,
+                        "active_turn": bool(scan.get("active_turn")),
+                        "waiting_for_user": bool(scan.get("waiting_for_user")),
+                        "last_kind": scan.get("last_kind"),
+                        "metadata_source": "copilot-cli-events",
+                    },
+                    usage=scan.get("usage") or {},
+                    needs_attention=status == "waiting",
+                )
+            )
+            if len(tasks) >= CLI_AGENT_MAX_SESSIONS:
+                break
         return tasks
 
 
@@ -5749,6 +6638,15 @@ class Hub:
             CodexAdapter(),
             CursorAdapter(),
             WorkBuddyAdapter(),
+            ClineAdapter(),
+            GeminiCliAdapter(),
+            GeminiCliAdapter(
+                source="Qwen Code",
+                root="~/.qwen",
+                binaries=("qwen",),
+                exclude_process_fragments=(),
+            ),
+            CopilotCliAdapter(),
             ManusAdapter(),
             PerplexityAdapter(),
             GeminiAdapter(),
@@ -5793,6 +6691,7 @@ class Hub:
         self.cache_at = 0
         self.cache_lock = threading.Lock()
         self.refresh_lock = threading.Lock()
+        self.refresh_done = threading.Condition(self.refresh_lock)
         self.refreshing = False
         self.refresh_started_at = 0
         self.last_refresh_error = ""
@@ -5807,6 +6706,9 @@ class Hub:
                 CodexAdapter,
                 CursorAdapter,
                 WorkBuddyAdapter,
+                ClineAdapter,
+                GeminiCliAdapter,
+                CopilotCliAdapter,
                 ManusAdapter,
                 PerplexityAdapter,
                 GeminiAdapter,
@@ -5887,8 +6789,30 @@ class Hub:
             finally:
                 with self.refresh_lock:
                     self.refreshing = False
+                    self.refresh_done.notify_all()
 
         threading.Thread(target=worker, name="taskhub-cache-refresh", daemon=True).start()
+
+    def warm_cache(self) -> None:
+        """Start filling the task cache right after boot so the Stick's first
+        request does not pay for a cold scan (parsing every Codex/Claude
+        transcript from byte zero can take ~10s, past the Stick's timeout)."""
+        self._refresh_tasks_background(include_remote=True)
+
+    def _wait_for_refresh(self, timeout_ms: int) -> None:
+        """Block until an in-flight background refresh finishes or timeout_ms
+        elapses. No-op when nothing is refreshing."""
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        with self.refresh_lock:
+            while self.refreshing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self.refresh_done.wait(remaining)
+
+    def is_refreshing(self) -> bool:
+        with self.refresh_lock:
+            return self.refreshing
 
     def cache_age_ms(self) -> Optional[int]:
         with self.cache_lock:
@@ -5914,6 +6838,16 @@ class Hub:
                 if allow_stale and stale_ms > 0 and cache_age < stale_ms:
                     self._refresh_tasks_background(include_remote=True)
                     return cache
+            elif allow_stale and self.is_refreshing():
+                # Cold cache with the startup warm-up (or another request's
+                # refresh) already scanning: piggyback on it instead of running
+                # a second full scan in parallel. If it is not done in time,
+                # answer empty with syncing=true so the Stick retries shortly.
+                self._wait_for_refresh(TASK_COLD_START_WAIT_MS)
+                with self.cache_lock:
+                    if self.cache_at:
+                        return list(self.cache)
+                return []
 
         return self._update_task_cache(include_remote=include_remote)
 
@@ -5928,16 +6862,19 @@ class Hub:
             try:
                 tasks = self._list_adapter_tasks(adapter, commands)
                 summary = diagnostic_task_summary(tasks)
-                return (
-                    index,
-                    {
-                        "source": source,
-                        "ok": True,
-                        "duration_ms": int((time.monotonic() - started) * 1000),
-                        **summary,
-                    },
-                    tasks,
-                )
+                row: Dict[str, Any] = {
+                    "source": source,
+                    "ok": True,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    **summary,
+                }
+                # The adapter ran, but if its data sources were unreadable
+                # (macOS TCC denial) "ok, 0 tasks" would be a lie; flag it.
+                access = source_access_errors(source)
+                if access:
+                    row["ok"] = False
+                    row["error"] = "; ".join(access.values())[:240]
+                return (index, row, tasks)
             except Exception as exc:
                 traceback.print_exc()
                 return (
@@ -6060,7 +6997,7 @@ class Hub:
             return open_action({"type": "app", "target": "im.manus.desktop"})
         if task_id.startswith("perplexity-"):
             return open_action({"type": "app", "target": "ai.perplexity.macv3"})
-        if task_id.startswith("gemini-"):
+        if task_id.startswith("gemini-") and not task_id.startswith("gemini-cli-"):
             return open_action({"type": "app", "target": "com.google.GeminiMacOS"})
         if task_id == "lovable-app":
             return open_action({"type": "app", "target": "dev.lovable.build"})
@@ -6074,13 +7011,16 @@ def open_action(action: Dict[str, str]) -> Tuple[bool, str]:
     target = action.get("target")
     if not kind:
         return False, "no open action"
-    if kind in {"url", "app"} and not target:
+    if kind in {"url", "app", "app-name"} and not target:
         return False, "no open target"
     try:
         if kind == "url":
             subprocess.Popen(["open", target])
         elif kind == "app":
             subprocess.Popen(["open", "-b", target])
+        elif kind == "app-name":
+            # `open -a` by display name, for hosts whose bundle id varies.
+            subprocess.Popen(["open", "-a", target])
         elif kind == "remote":
             task_id = action.get("task_id") or ""
             base_url = (action.get("url") or "").rstrip("/")
@@ -6108,9 +7048,134 @@ def open_action(action: Dict[str, str]) -> Tuple[bool, str]:
         return False, str(exc)
 
 
+_PAIR_CODE_RE = re.compile(r"^[0-9]{4,8}$")
+
+
+class PairingManager:
+    """First-run pairing for StickS3 devices that were burned without a token.
+
+    The device shows a short numeric code on its screen and keeps POSTing it to
+    /pair. Nothing is handed out until someone on this Mac approves that exact
+    code through the loopback-only /pair/approve endpoint (the install script
+    or the TaskHub Host app asks for it). Only then does the next /pair poll
+    from that device receive the token. The code itself is never returned to
+    LAN callers, so an attacker who can reach the Host still has to guess the
+    digits on a screen they cannot see, within a short window.
+    """
+
+    def __init__(self, token: str, http_port: int = DEFAULT_PORT) -> None:
+        self.token = token
+        self.http_port = http_port
+        self.lock = threading.Lock()
+        self.pending: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.paired: List[Dict[str, Any]] = []
+
+    def _expire(self, now: int) -> None:
+        for key in list(self.pending.keys()):
+            entry = self.pending[key]
+            ttl = PAIR_APPROVED_TTL_MS if entry.get("approved_at") else PAIR_PENDING_TTL_MS
+            base = entry.get("approved_at") or entry.get("updated_at") or entry.get("created_at") or 0
+            if now - int(base) > ttl:
+                self.pending.pop(key, None)
+
+    def request(self, device_id: str, name: str, code: str, ip: str, version: str = "") -> Dict[str, Any]:
+        device_id = (device_id or "").strip()[:64]
+        name = (name or device_id or "StickS3").strip()[:48]
+        code = (code or "").strip()
+        if not device_id:
+            return {"ok": False, "error": "device_id required"}
+        if not _PAIR_CODE_RE.match(code):
+            return {"ok": False, "error": "code must be 4-8 digits"}
+        if not self.token:
+            return {"ok": False, "error": "host has no device token configured"}
+        now = now_ms()
+        with self.lock:
+            self._expire(now)
+            entry = self.pending.get(device_id)
+            if entry is None:
+                if len(self.pending) >= PAIR_MAX_PENDING:
+                    return {"ok": False, "error": "too many pending pairing requests", "retry_ms": 30000}
+                entry = {
+                    "device_id": device_id,
+                    "created_at": now,
+                    "approved_at": 0,
+                    "delivered_at": 0,
+                }
+                self.pending[device_id] = entry
+            if entry.get("code") != code and entry.get("approved_at"):
+                # The device restarted and rolled a new code after approval:
+                # the old approval no longer applies.
+                entry["approved_at"] = 0
+                entry["delivered_at"] = 0
+            entry.update({"name": name, "code": code, "ip": ip, "version": version[:32], "updated_at": now})
+            if entry.get("approved_at"):
+                entry["delivered_at"] = now
+                self.paired.append({"device_id": device_id, "name": name, "ip": ip, "at": now})
+                del self.paired[:-16]
+                return {
+                    "ok": True,
+                    "status": "approved",
+                    "token": self.token,
+                    "host": local_ip_for_peer(ip),
+                    "port": self.http_port,
+                    "host_name": DEVICE_NAME,
+                    "host_id": DEVICE_ID,
+                }
+            return {"ok": True, "status": "pending", "retry_ms": 2000, "host_name": DEVICE_NAME}
+
+    def list_pending(self) -> List[Dict[str, Any]]:
+        now = now_ms()
+        with self.lock:
+            self._expire(now)
+            rows = []
+            for entry in self.pending.values():
+                rows.append(
+                    {
+                        "device_id": entry["device_id"],
+                        "name": entry.get("name") or entry["device_id"],
+                        "ip": entry.get("ip") or "",
+                        "version": entry.get("version") or "",
+                        "code_length": len(entry.get("code") or ""),
+                        "age_ms": max(0, now - int(entry.get("created_at") or now)),
+                        "last_seen_ms": max(0, now - int(entry.get("updated_at") or now)),
+                        "approved": bool(entry.get("approved_at")),
+                        "delivered": bool(entry.get("delivered_at")),
+                    }
+                )
+            return rows
+
+    def approve(self, code: str, device_id: str = "") -> Tuple[bool, str, Dict[str, Any]]:
+        code = (code or "").strip()
+        if not _PAIR_CODE_RE.match(code):
+            return False, "code must be 4-8 digits", {}
+        now = now_ms()
+        with self.lock:
+            self._expire(now)
+            matches = [
+                entry
+                for entry in self.pending.values()
+                if entry.get("code") == code
+                and not entry.get("approved_at")
+                and (not device_id or entry["device_id"] == device_id)
+            ]
+            if not matches:
+                return False, "no StickS3 is showing that code", {}
+            if len(matches) > 1:
+                return False, "more than one device shows that code; wait a moment and retry", {}
+            entry = matches[0]
+            entry["approved_at"] = now
+            info = {"device_id": entry["device_id"], "name": entry.get("name") or entry["device_id"], "ip": entry.get("ip") or ""}
+            return True, "approved", info
+
+    def recent_paired(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return list(self.paired)
+
+
 class Handler(BaseHTTPRequestHandler):
     hub: Hub
     token: str
+    pairing: Optional[PairingManager] = None
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -6159,6 +7224,24 @@ class Handler(BaseHTTPRequestHandler):
                     "device_id": DEVICE_ID,
                     "device_name": DEVICE_NAME,
                     "device_label": short_device_label(DEVICE_NAME),
+                },
+            )
+            return
+
+        if parsed.path == "/pair/pending":
+            # Loopback only: this is the Mac-side half of pairing. The codes
+            # themselves are never listed; the human reads them off the Stick.
+            if not self.is_loopback():
+                self.send_json(403, {"ok": False, "error": "loopback only"})
+                return
+            pairing = self.pairing
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "pending": pairing.list_pending() if pairing else [],
+                    "paired": pairing.recent_paired() if pairing else [],
+                    "host_name": DEVICE_NAME,
                 },
             )
             return
@@ -6268,7 +7351,14 @@ class Handler(BaseHTTPRequestHandler):
                 "active": active,
                 "attention": attention,
                 "cache_age_ms": cache_age,
-                "syncing": bool(include_remote and cache_age is not None and cache_age >= TASK_CACHE_MS),
+                "syncing": bool(
+                    include_remote
+                    and (
+                        cache_age is None
+                        or cache_age >= TASK_CACHE_MS
+                        or self.hub.is_refreshing()
+                    )
+                ),
                 "device": short_device_label(DEVICE_NAME),
                 "tasks": [compact_task(t) for t in tasks[: max(1, min(limit, 12))]],
             }
@@ -6288,8 +7378,57 @@ class Handler(BaseHTTPRequestHandler):
             }
         self.send_json(200, payload)
 
+    def read_json_body(self, limit: int = 256 * 1024) -> Optional[Dict[str, Any]]:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > limit:
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == "/pair":
+            # Unauthenticated by design: this is how a device without a token
+            # asks for one. It only ever learns "pending" until a human on this
+            # Mac approves the code shown on its screen.
+            pairing = self.pairing
+            if pairing is None:
+                self.send_json(503, {"ok": False, "error": "pairing disabled"})
+                return
+            payload = self.read_json_body(4096)
+            if payload is None:
+                self.send_json(400, {"ok": False, "error": "invalid JSON"})
+                return
+            result = pairing.request(
+                str(payload.get("device_id") or payload.get("device") or ""),
+                str(payload.get("name") or ""),
+                str(payload.get("code") or ""),
+                self.client_address[0],
+                str(payload.get("version") or ""),
+            )
+            if result.get("ok") and result.get("status") == "approved":
+                print(f"[pair] token delivered to {payload.get('device_id')} @ {self.client_address[0]}")
+            self.send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if parsed.path == "/pair/approve":
+            if not self.is_loopback():
+                self.send_json(403, {"ok": False, "error": "loopback only"})
+                return
+            pairing = self.pairing
+            if pairing is None:
+                self.send_json(503, {"ok": False, "error": "pairing disabled"})
+                return
+            payload = self.read_json_body(4096) or {}
+            ok, message, info = pairing.approve(str(payload.get("code") or ""), str(payload.get("device_id") or ""))
+            if ok:
+                print(f"[pair] approved {info.get('name')} ({info.get('device_id')}) @ {info.get('ip')}")
+            self.send_json(200 if ok else 404, {"ok": ok, "message": message, **info})
+            return
 
         if parsed.path == "/ingest":
             if not self.authorized():
@@ -6390,11 +7529,15 @@ class DiscoveryHandler(socketserver.BaseRequestHandler):
             return
 
         token = getattr(self.server, "token", "")
-        if token and payload.get("token") != token:
+        # An unpaired device (fresh M5Burner firmware) has no token yet; it
+        # asks with pair=true and only learns where to POST /pair. Anything
+        # else with a wrong token is ignored as before.
+        pairing_request = bool(payload.get("pair")) and not payload.get("token")
+        if token and payload.get("token") != token and not pairing_request:
             return
 
         http_port = int(getattr(self.server, "http_port", DEFAULT_PORT))
-        host = local_ip_hint()
+        host = local_ip_for_peer(self.client_address[0])
         response = {
             "ok": True,
             "type": "sticks3.hub",
@@ -6405,6 +7548,7 @@ class DiscoveryHandler(socketserver.BaseRequestHandler):
             "host": host,
             "port": http_port,
             "url": f"http://{host}:{http_port}",
+            "pairing": pairing_request,
             "ts": now_ms(),
         }
         body = json.dumps(response, separators=(",", ":")).encode("utf-8")
@@ -6438,8 +7582,10 @@ def main() -> int:
     hub.detail_base_url = f"http://127.0.0.1:{args.port}"
     Handler.hub = hub
     Handler.token = args.token
+    Handler.pairing = PairingManager(args.token, args.port)
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     discovery = start_discovery(args.bind, args.discovery_port, args.port, args.token)
+    hub.warm_cache()
     print(f"Task Hub listening on http://{args.bind}:{args.port}")
     print(f"Device: {DEVICE_NAME} ({DEVICE_ID})")
     print(f"Peer aggregation: {'enabled' if PEER_ENABLED else 'disabled'}")

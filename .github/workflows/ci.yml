@@ -19,7 +19,12 @@ jobs:
       - name: Run adapter regression tests
         run: python3 -m unittest discover -s host/tests -v
       - name: Byte-compile host
-        run: python3 -m py_compile host/task_hub.py host/taskhub_config.py
+        run: python3 -m py_compile host/task_hub.py host/taskhub_config.py host/taskhub_pair.py
+      - name: Shell syntax (installers)
+        run: |
+          bash -n scripts/install.sh
+          sh -n host/install_task_hub.sh
+          sh -n packaging/macos/resources/taskhub-host-app
 
   firmware-build:
     name: Firmware compile

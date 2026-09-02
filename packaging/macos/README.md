@@ -8,8 +8,10 @@ Build an unsigned development installer:
 
 The package is written to `dist/macos/`. It installs the Host code from an
 explicit allowlist, creates a random per-user device token when needed,
-registers the LaunchAgent, adds `/usr/local/bin/taskhub-provision`, and installs
-`/Applications/TaskHub Host.app` as a diagnostics launcher.
+registers the LaunchAgent, adds `/usr/local/bin/taskhub-pair` and
+`/usr/local/bin/taskhub-provision`, and installs `/Applications/TaskHub Host.app`.
+The app opens the StickS3 pairing dialog (or diagnostics); `postinstall`
+launches it once so the installer ends on "type the code shown on your Stick".
 
 Public distribution requires a Developer ID Installer certificate:
 

@@ -16,12 +16,22 @@ for helper in "$ROOT"/host/taskhub_*.py; do
   [ -f "$helper" ] || continue
   cp "$helper" "$APP_DIR/$(basename "$helper")"
 done
-if [ -d "$ROOT/host/models" ]; then
-  if [ -L "$APP_DIR/models" ]; then
-    rm -f "$APP_DIR/models"
-  fi
-  if [ ! -e "$APP_DIR/models" ]; then
-    ln -s "$ROOT/host/models" "$APP_DIR/models"
+# Copy whisper models onto the internal disk instead of symlinking into the
+# repo: a launchd-run agent cannot follow a symlink into an external volume
+# (possibly unmounted at login) or a TCC-protected folder such as ~/Desktop.
+if [ -L "$APP_DIR/models" ]; then
+  rm -f "$APP_DIR/models"
+fi
+mkdir -p "$APP_DIR/models"
+# Only the model the Host actually uses (default, or TASK_HUB_WHISPER_MODEL):
+# whisper models are 0.5-1.6GB each, so copying every *.bin wastes disk.
+WHISPER_MODEL_NAME="$(basename "${TASK_HUB_WHISPER_MODEL:-ggml-large-v3-turbo-q5_0.bin}")"
+model="$ROOT/host/models/$WHISPER_MODEL_NAME"
+if [ -f "$model" ]; then
+  target="$APP_DIR/models/$WHISPER_MODEL_NAME"
+  if [ ! -f "$target" ] || [ "$(stat -f %z "$model")" != "$(stat -f %z "$target")" ]; then
+    echo "Copying model $WHISPER_MODEL_NAME to $APP_DIR/models ..."
+    cp "$model" "$target.partial" && mv "$target.partial" "$target"
   fi
 fi
 
@@ -56,6 +66,14 @@ cat > "$APP_DIR/run_task_hub.sh" <<'SH'
 set -eu
 
 ROOT="$HOME/Library/Application Support/StickS3TaskHub"
+
+# launchd appends forever; cap the log at ~10MB, keeping the recent tail.
+LOG="$ROOT/task_hub.log"
+if [ -f "$LOG" ] && [ "$(stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then
+  tail -c 1048576 "$LOG" > "$LOG.prev" 2>/dev/null || true
+  : > "$LOG"
+fi
+
 TOKEN="$(cat "$ROOT/token" 2>/dev/null || true)"
 [ -n "$TOKEN" ] || {
   echo "Task Hub token is missing: $ROOT/token" >&2
@@ -122,3 +140,48 @@ launchctl kickstart -k "gui/$(id -u)/com.sticks3.taskhub"
 
 echo "Task Hub installed and started."
 echo "Health: http://127.0.0.1:5577/health"
+
+# Post-install check: the launchd-run Host has no Terminal/IDE permissions of
+# its own, so adapters that read other apps' data (or data folders that live on
+# an external volume) silently get EPERM until the Python binary launchd runs
+# is granted Full Disk Access. Surface that here instead of on the Stick.
+i=0
+while [ $i -lt 20 ]; do
+  if curl -fsS -m 2 http://127.0.0.1:5577/health >/dev/null 2>&1; then break; fi
+  i=$((i + 1)); sleep 0.5
+done
+if [ $i -ge 20 ]; then
+  echo "Warning: Host did not answer /health within 10s; check $APP_DIR/task_hub.log" >&2
+  exit 0
+fi
+DIAG="$(curl -fsS -m 60 -H "X-Device-Token: $(cat "$TOKEN_FILE")" http://127.0.0.1:5577/diagnostics.json 2>/dev/null || true)"
+BLOCKED="$(printf '%s' "$DIAG" | /usr/bin/python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for row in d.get("adapters", []):
+    err = str(row.get("error") or "")
+    if not row.get("ok") and err:
+        print("  - %s: %s" % (row.get("source"), err[:160]))
+' 2>/dev/null || true)"
+if [ -n "$BLOCKED" ]; then
+  HOST_PID="$(launchctl print "gui/$(id -u)/com.sticks3.taskhub" 2>/dev/null | awk '/^[[:space:]]*pid = /{print $3; exit}')"
+  HOST_BIN="$( [ -n "$HOST_PID" ] && ps -o comm= -p "$HOST_PID" 2>/dev/null || true)"
+  echo ""
+  echo "Some adapters could not read their data:"
+  echo "$BLOCKED"
+  if printf '%s' "$DIAG" | grep -q "Full Disk Access"; then
+    echo ""
+    echo "Fix: System Settings > Privacy & Security > Full Disk Access > '+', press"
+    echo "Cmd+Shift+G and add this binary (the one launchd actually runs):"
+    echo "  ${HOST_BIN:-/usr/bin/python3}"
+    case "$HOST_BIN" in
+      *Python.app/Contents/MacOS/Python)
+        echo "  (or its bundle: ${HOST_BIN%/Contents/MacOS/Python})" ;;
+    esac
+    echo "then restart the Host:  launchctl kickstart -k gui/$(id -u)/com.sticks3.taskhub"
+    echo "Open the pane:  open 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'"
+  fi
+fi

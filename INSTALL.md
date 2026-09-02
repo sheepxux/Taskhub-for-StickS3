@@ -1,6 +1,9 @@
 # Installation
 
-This guide is for setting up TaskHub for StickS3 from a fresh clone.
+**Just want to use it?** Burn the firmware with M5Burner, put the Stick on Wi-Fi
+from your phone, and install the Mac Host with one command; see
+[End-User Setup](#end-user-setup-m5burner--one-command-host). The rest of this
+guide is for developers who build from source or need the USB/manual paths.
 
 TaskHub has two parts:
 
@@ -60,28 +63,75 @@ The resulting `dist/macos/TaskHub-Host-<version>.pkg` contains only an explicit
 Host-code allowlist. It does not include firmware `secrets.h`, Wi-Fi values,
 tokens, models, logs, caches, or repository metadata. Installation creates a
 random per-user token, starts the Host LaunchAgent, installs the TaskHub Host
-diagnostics app, and adds the `taskhub-provision` command.
+app (pairing dialog + diagnostics) and adds the `taskhub-pair` and
+`taskhub-provision` commands. The installer ends by opening the pairing dialog.
 
 The development package is unsigned. Public distribution requires a Developer
 ID Installer certificate and Apple notarization; see
 [`packaging/macos/README.md`](packaging/macos/README.md).
 
-## M5Burner / Public Firmware Setup
+## End-User Setup (M5Burner + one-command Host)
 
-M5Burner should use the public firmware build, not a binary compiled from your
-local `secrets.h`.
+No `arduino-cli`, no `secrets.h`, no USB provisioning.
 
-Build public artifacts:
+1. **Firmware**: open [M5Burner](https://docs.m5stack.com/en/download), search
+   `TaskHub for StickS3`, connect the Stick over USB-C, click **Burn**.
+2. **Wi-Fi**: power the Stick on. It starts an open hotspot `TaskHub-XXXX` and
+   shows a QR code. Join it from your phone; the captive page lists nearby
+   networks, pick yours and enter the password. The Stick joins, then shows a
+   4-digit **pairing code** (the phone page shows it too).
+3. **Host + pairing**: on the Mac, in Terminal:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/sheepxux/Taskhub-for-StickS3/main/scripts/install.sh | bash
+   ```
+
+   The script installs the Host LaunchAgent, waits for the Stick to ask for
+   pairing over the LAN, and prompts for the code. The token is only sent to
+   the device after the exact code is entered. The Stick saves it and restarts
+   into the task list.
+
+Pair again later (another Stick, or after a factory reset):
+
+```bash
+python3 ~/Library/Application\ Support/StickS3TaskHub/taskhub_pair.py
+```
+
+Device-side resets: hold **both buttons while powering on** to clear Wi-Fi and
+token (back to the hotspot screen); hold **A for 3s on the pairing screen** to
+redo only the Wi-Fi.
+
+If the first Terminal command opens an Apple "Command Line Tools" installer,
+finish that install and run the command again; macOS ships `python3` that way.
+
+### How pairing works
+
+- The Stick broadcasts `sticks3.discover` with `pair: true` on UDP `5578`;
+  the Host answers with its LAN address (the interface facing the Stick, so
+  a VPN/proxy tunnel IP is never advertised).
+- The Stick POSTs `{device_id, name, code}` to `/pair` every 2.5s and shows
+  the code. `/pair` is unauthenticated but only ever answers `pending`.
+- `taskhub_pair.py` (or TaskHub Host.app) reads `/pair/pending` and calls
+  `/pair/approve` with the code you type; both are loopback-only.
+- The next `/pair` poll from that device gets the token and Host address.
+  Pending requests expire after 5 minutes; wrong codes are simply rejected.
+
+## Developer / USB Provisioning Of The Public Firmware
+
+Build the public artifacts yourself:
 
 ```bash
 ./firmware/build_m5burner_public.sh
 ```
 
 This compiles with `TASKHUB_PUBLIC_BUILD=1`, which ignores
-`firmware/task_monitor/secrets.h` even if it exists. The resulting firmware has
-no Wi-Fi password or Host token baked in. On first boot it shows `USB Setup`.
+`firmware/task_monitor/secrets.h` even if it exists, writes
+`dist/m5burner/TaskHub-StickS3-v<version>.bin` and aborts if any local secret
+string is found in the binary. Publishing steps are in
+[`packaging/m5burner/README.md`](packaging/m5burner/README.md).
 
-After burning the public firmware, plug the StickS3 into the Mac and run:
+USB serial provisioning still works on the hotspot and pairing screens and is
+handy for scripted setups. Plug the StickS3 into the Mac and run:
 
 ```bash
 ./scripts/setup.sh --skip-firmware --provision
@@ -97,8 +147,8 @@ The helper will:
 - send one JSON config line over USB serial
 - store the config in StickS3 NVS and restart the device
 
-The on-device UI defaults to English. Add `--lang zh` to the provisioning
-command if you want Chinese fixed UI text:
+The on-device UI defaults to English (the captive portal also offers 中文). Add
+`--lang zh` to the provisioning command for Chinese fixed UI text:
 
 ```bash
 ./scripts/setup.sh --skip-firmware --provision --lang zh
@@ -127,9 +177,6 @@ Rotate an old/default shared token only while the StickS3 is connected:
 
 The helper updates the physical device first and replaces the Host token only
 after USB provisioning succeeds.
-
-You can also clear runtime config by holding both StickS3 buttons during boot.
-On public builds that returns the device to the `USB Setup` screen.
 
 ## One-Pass Setup With Firmware Compile
 
@@ -298,6 +345,27 @@ Host runner accessibility permission:
 
 TaskHub still works without this permission, but browser-based sources may only
 show app activity rather than detailed titles or visible `RUN`/`WAIT` signals.
+
+### Full Disk Access (macOS 15+)
+
+Newer macOS versions protect other apps' data folders (TCC app-data
+protection). The launchd-run Host is denied reads of, for example, Cursor's
+`~/Library/Application Support/Cursor` and `~/.cursor/projects`, so the Cursor
+adapter silently reports zero tasks even though the adapter itself is healthy.
+
+Grant **Full Disk Access** to the Python interpreter that runs the Host:
+
+1. Open **System Settings** → **Privacy & Security** → **Full Disk Access**.
+2. Click **+** and add the interpreter binary. With the default LaunchAgent
+   this is the Python that `/usr/bin/python3` resolves to — usually the
+   Command Line Tools (`/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/Current/Resources/Python.app`)
+   or, if only Xcode is installed,
+   `/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/Current/Resources/Python.app`.
+   Press Cmd+Shift+G in the file picker to paste the path.
+3. Restart the Host: `launchctl kickstart -k gui/$(id -u)/com.sticks3.taskhub`.
+
+`/diagnostics` flags affected adapters with a "Full Disk Access" error instead
+of pretending the source is simply idle.
 
 ## Troubleshooting
 

@@ -12,8 +12,9 @@
 [![License](https://img.shields.io/badge/license-MIT-374151)](LICENSE)
 
 TaskHub for StickS3 可以把 M5StickS3 变成一个小型 AI Agent 状态屏。
-Mac 上的 TaskHub Host 会读取 Codex、Claude Code、Cursor、OpenClaw、Manus、
-Perplexity、Gemini、Lovable、Kimi、WorkBuddy、Grok 等工具的本地任务状态，发现同一局域网内
+Mac 上的 TaskHub Host 会读取 Codex、Claude Code、Cursor、Cline / Roo Code / Kilo Code、
+Gemini CLI、Qwen Code、GitHub Copilot CLI、OpenClaw、Manus、Perplexity、Gemini、Lovable、
+Kimi、WorkBuddy、Grok 等工具的本地任务状态，发现同一局域网内
 其他授权 Host，然后把精简后的任务列表通过 Wi-Fi 发送给 StickS3。
 
 设备可以显示哪个任务正在运行、哪个任务正在等待你回复、哪些任务刚完成，
@@ -72,15 +73,16 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
 | StickS3 固件 | Ready | 原生 240x135 UI、按钮、Wi-Fi 发现、深度睡眠 |
-| M5Burner 公开固件 | Ready | 不编译本机 secrets，首次使用通过 USB 写入 NVS 配置 |
+| M5Burner 公开固件 | 已就绪 | 二进制不含任何密钥；首次开机进入 Wi-Fi 配网热点，然后用 4 位配对码与 Host 配对 |
 | macOS Host | Ready | LaunchAgent 安装、本地 HTTP API、UDP 发现 |
 | macOS Host 安装包 | Preview | 可构建不含隐私配置的 `.pkg`；公开分发仍需 Developer ID 签名和公证 |
 | Host 诊断 | Ready | `/diagnostics` 汇总 adapter、语音、权限、缓存和 peer 状态，不暴露 token 或任务标题 |
 | 多 Mac 聚合 | Ready | 同 token Host 可互相发现并合并任务 |
 | BtnB 打开来源 | Ready | 本机任务打开本机 App，远程任务转发到来源 Mac |
 | WAIT 注意模式 | Ready | 任务等待输入时点亮并保持一段时间，之后睡眠并周期检查 |
-| WAIT 提醒 | Ready | 任务首次需要输入时边沿触发：点亮屏幕 + 短促双蜂鸣（`ALERT_*` 可调） |
-| DONE 提醒 | Ready | 运行任务完成时边沿触发：更柔和的上行提示音 |
+| WAIT 提醒 | Ready | 逐任务边沿触发：每个任务进入 WAIT 时点亮屏幕 + 短促双蜂鸣，已有任务在等也不会漏报（`ALERT_*` 可调） |
+| DONE 提醒 | Ready | 逐任务边沿触发：运行中的任务完成时播放更柔和的上行提示音 |
+| FAIL 提醒 | Ready | 逐任务边沿触发：任务出错时播放下行双音 |
 | 省电策略 | Ready | 默认深度睡眠、低亮度、短暂显示 |
 | 自动旋转 | Ready | IMU 重力感应按握持方向旋转屏幕；竖屏显示多任务列表（`ROTATE_*` 可调） |
 | 语音输入 | Ready | 长按 BtnB 说话（普通话/英文）→ 本地 whisper.cpp 转写 → 文字填入并发送到选中任务对应 App（`POST /voice?enter=1`） |
@@ -94,6 +96,9 @@ App 或网页工具，有些状态只能通过本地活动、进程、缓存、�
 | Lovable 适配器 | Activity | App/网页活动、renderer CPU、可见生成控件 |
 | Kimi 适配器 | Activity | 本地会话状态结合 daemon 活跃回合及网页标题；仅打开 App 不算 RUN |
 | WorkBuddy 适配器 | Detailed | 本地会话标题、工具调用、RUN/WAIT/DONE、文件夹及可用 token 信息 |
+| Cline / Roo Code / Kilo Code 适配器 | Detailed | 读取 VS Code、Cursor、Windsurf、VSCodium、Antigravity、Trae 内的插件任务记录；未回应的审批/提问即精确 WAIT，请求进行中为 RUN，完成为 DONE，含 token 与费用 |
+| Gemini CLI / Qwen Code 适配器 | Detailed | 读取 `~/.gemini` / `~/.qwen` 的聊天记录：模型回答或工具执行中为 RUN，工具等待批准为 WAIT，回复完成为 DONE，文件夹来自 `projects.json`（基于 fixture 验证，欢迎真机反馈） |
+| GitHub Copilot CLI 适配器 | Best effort | 读取 `~/.copilot/session-state/*/events.jsonl` 的回合事件：RUN/DONE/FAIL，权限请求挂起为 WAIT，工作区摘要作标题（基于 fixture 验证，欢迎真机反馈） |
 | Grok 适配器 | Activity | 网页/Safari App 标题和可见停止控件；仅打开 App 不算 RUN |
 | 浏览器桥接 | Optional | `extension/` 读取 Gemini/Grok/Kimi/Lovable/Perplexity 的网页任务标题并推送给 Host |
 
@@ -189,106 +194,44 @@ flowchart LR
 
 ## 快速安装
 
-完整安装说明见 [INSTALL.md](INSTALL.md)。
+只需要两样东西，StickS3 这一侧完全不用打开终端：**固件来自 M5Burner**
+（M5Stack 官方烧录工具），**Mac Host 来自 GitHub**。
 
-现在有两种安装路径：
+### 第 1 步：烧录固件
 
-- **开发/源码刷机**：clone 仓库，生成 `secrets.h`，用 Arduino CLI 编译上传。
-- **M5Burner 公开固件**：先用 M5Burner 烧录公开固件，再安装 Mac Host，
-  最后通过 USB 配置一次 Wi-Fi 和共享 token。
+打开 [M5Burner](https://docs.m5stack.com/zh_CN/download)，搜索 **TaskHub for
+StickS3**，用 USB-C 线连上 StickS3，点 **Burn**。
 
-```bash
-git clone https://github.com/sheepxux/Taskhub-for-StickS3.git
-cd Taskhub-for-StickS3
-./scripts/setup.sh
-```
+### 第 2 步：让 StickS3 连上 Wi-Fi
 
-也可以在 macOS 上构建一个不包含 Wi-Fi、Token、模型和本机路径的开发版
-Host 安装包：
+开机后屏幕会显示一个二维码和类似 `TaskHub-3F2A` 的热点名。用手机扫码（或在
+Wi-Fi 设置里选择这个热点）加入，手机会自动弹出配置页；在页面里选择家里的
+Wi-Fi 并输入密码。连上之后 StickS3 会显示一个 **4 位配对码**。
 
-```bash
-./packaging/macos/build_host_pkg.sh
-```
+### 第 3 步：安装 Mac Host 并配对
 
-公开分发前仍需使用 Developer ID Installer 证书签名并完成 Apple 公证，详见
-[`packaging/macos/README.md`](packaging/macos/README.md)。
-
-如果已经安装好 `arduino-cli`，可以直接编译固件：
+在 Mac 的「终端」里粘贴（聚焦搜索里输入 Terminal 即可打开）：
 
 ```bash
-./scripts/setup.sh --compile
+curl -fsSL https://raw.githubusercontent.com/sheepxux/Taskhub-for-StickS3/main/scripts/install.sh | bash
 ```
 
-如果希望脚本安装 ESP32 core 和 Arduino 依赖库：
+脚本会把 Host 安装为登录项，然后提示你输入 StickS3 屏幕上的配对码。输入后
+StickS3 重启进入任务列表。之后它会自己在局域网里找到 Host（UDP `5578` 端口
+发现），Mac 的 IP 变了也没关系。
 
-```bash
-./scripts/setup.sh --deps --compile
-```
+以后要再配一台 StickS3：运行
+`python3 ~/Library/Application\ Support/StickS3TaskHub/taskhub_pair.py`，或者
+如果装的是 `.pkg`，打开 **TaskHub Host.app**。开机时同时按住两个按钮会清除
+StickS3 里保存的 Wi-Fi 和 token；在配对界面长按 **A** 只重配 Wi-Fi。
 
-如果 StickS3 已经插入电脑，并且想直接刷机：
+### 其他安装方式
 
-```bash
-./scripts/setup.sh --deps --upload
-```
-
-## M5Burner 用户
-
-M5Burner 公开固件不会把 `secrets.h` 打进 `.bin`。烧录后，StickS3 会显示
-`USB Setup`，这时运行：
-
-```bash
-./scripts/setup.sh --skip-firmware --provision
-```
-
-脚本会安装/修复 Mac Host，读取 Host token，提示输入 Wi-Fi 信息，然后通过
-USB 把配置写入 StickS3 的 NVS。设备会自动重启并连接 TaskHub。
-
-设备 UI 默认是英文。想把固定界面文案切成中文，可以在 USB 配置时传：
-
-```bash
-./scripts/setup.sh --skip-firmware --provision --lang zh
-```
-
-用于 M5Burner 发布的公开固件包可以这样构建：
-
-```bash
-./firmware/build_m5burner_public.sh
-```
-
-## 手动安装概要
-
-安装或修复 Mac Host：
-
-```bash
-./host/install_task_hub.sh
-```
-
-检查 Host：
-
-```bash
-curl http://127.0.0.1:5577/health
-```
-
-配置固件：
-
-```bash
-cp firmware/task_monitor/secrets.h.example firmware/task_monitor/secrets.h
-```
-
-编辑 `firmware/task_monitor/secrets.h`：
-
-```cpp
-#define WIFI_SSID       "your-wifi-ssid"
-#define WIFI_PASSWORD   "your-wifi-password"
-#define DEVICE_TOKEN    "same-token-as-the-mac-host"
-#define TASKHUB_LANG    "en"  // 或 "zh"
-```
-
-刷入 StickS3：
-
-```bash
-./firmware/flash_task_monitor.sh all
-```
+- **macOS `.pkg`**：双击安装，结束时直接弹出配对对话框。安装包在获得
+  Developer ID 签名之前，第一次打开会被 macOS 拦截（系统设置 → 隐私与安全性
+  → 仍要打开）。
+- **开发者**：用 `arduino-cli` 从源码编译刷机，把 Wi-Fi 和 token 写进
+  `secrets.h`，或通过 USB 串口配置。详见 [INSTALL.md](INSTALL.md)。
 
 ## 按钮
 
@@ -330,6 +273,8 @@ curl http://127.0.0.1:5577/peers.json?refresh=1
 | `/tasks/:id/open` | 从 StickS3 打开任务来源 |
 | `/tasks/:id/open-native` | Host 之间转发打开请求 |
 | `/voice` | 转写上传的音频并粘进目标 App（语音模式） |
+| `POST /pair` | 未配置的 StickS3 轮询配对（无需 token），配对码被确认前只返回 `pending` |
+| `/pair/pending`、`POST /pair/approve` | 仅限本机回环：列出请求配对的设备、确认配对码（`taskhub_pair.py` 使用） |
 | `/diagnostics` | Host、adapter、语音、缓存、多设备状态诊断页 |
 | `/diagnostics.json` | 机器可读诊断信息，不包含 token 值或任务标题 |
 | `/peers` | 多设备诊断页面 |
@@ -363,14 +308,17 @@ WAIT 几乎总是在某个任务运行时出现，此时设备多半正深睡。
 把"新 WAIT 被发现"的最坏延迟控制在约 2 分钟，同时把无线电唤醒次数比旧的
 60 秒默认减少一半。想恢复旧的 WAIT 常亮行为，可以设 `WAIT_ATTENTION_TIMEOUT_MS=0`。
 
-设备端 WAIT/DONE 提醒可在 `firmware/task_monitor/secrets.h` 调整：
+设备端 WAIT/DONE/FAIL 提醒可在 `firmware/task_monitor/secrets.h` 调整。状态变化按任务
+（以 id 区分）与上一次刷新逐个比对，所以第二个进入 WAIT 的会话同样会响；同一次刷新出现
+多个变化时只播最紧急的一种（WAIT > FAIL > DONE），并把屏幕切到那个任务。
 
 | 设置 | 默认值 | 作用 |
 | --- | --- | --- |
 | `ALERT_ON_WAIT` | `1` | WAIT 提醒总开关 |
 | `ALERT_ON_DONE` | `1` | DONE 完成提示音总开关 |
+| `ALERT_ON_FAIL` | `1` | FAIL 出错提示音总开关 |
 | `ALERT_BEEP` | `1` | 蜂鸣/提示音；设 `0` 则只点亮屏幕、不出声 |
-| `ALERT_WAIT_HZ` / `ALERT_DONE_HZ` | `2400` / `1500` | WAIT 双蜂鸣音调与 DONE 基础音调 |
+| `ALERT_WAIT_HZ` / `ALERT_DONE_HZ` / `ALERT_FAIL_HZ` | `2400` / `1500` / `1800` | WAIT 双蜂鸣音调、DONE 基础音调、FAIL 起始音调 |
 | `ALERT_BEEP_VOLUME` | `150` | 共用扬声器音量 |
 
 > 振动：当前固定版本的 M5Unified 不会把 M5StickS3 当作马达驱动，所以
@@ -396,6 +344,9 @@ TaskHub 只读取本地数据。准确性取决于对应 AI 工具是否暴露�
 | Lovable | App/浏览器活动、项目 tab、renderer CPU、可见生成控件 |
 | Kimi | 本地 `running/completed` 状态结合 daemon 活跃回合，并读取浏览器标题 |
 | WorkBuddy | 本地会话标题、文件夹、工具调用、完成状态和可用 token 信息 |
+| Cline / Roo Code / Kilo Code | 任务提示词、宿主编辑器、工作区文件夹、待审批/提问（WAIT）、请求进行中（RUN）、完成、token 与费用 |
+| Gemini CLI / Qwen Code | 首条提示词、项目文件夹、模型/工具回合状态、工具等待批准（WAIT）、token 用量 |
+| GitHub Copilot CLI | 工作区摘要、文件夹、回合起止与工具事件、权限请求挂起（WAIT） |
 | Grok | Safari Web App/浏览器标题、可见停止控件；配合浏览器桥接时标题更准确 |
 
 如果某个 App 只是打开着但没有真正生成或执行，TaskHub 应显示 `REC` 或
@@ -417,9 +368,11 @@ TaskHub 是 local-first 设计：
 
 | 问题 | 检查 |
 | --- | --- |
-| StickS3 找不到 Host | 确认同一 Wi-Fi，并打开 `/health` |
-| 返回 `401` | 检查 `DEVICE_TOKEN` 是否和 Host token 一致 |
+| StickS3 找不到 Host | 确认同一 Wi-Fi，并打开 `/health`。开着 Clash / Surge / Tailscale 等代理时旧版 Host 会把隧道 IP 报给设备，现在会选面向设备的局域网网卡 |
+| 配对界面一直"正在寻找 Mac Host" | 和 Mac 在同一个 Wi-Fi 吗？访客网络 / AP 隔离会拦掉 UDP `5578` 发现；Host 在运行吗（`/health`）？ |
+| 返回 `401` | 检查 `DEVICE_TOKEN` 是否和 Host token 一致；或者重新配对：开机时按住两个按钮，然后运行 `taskhub_pair.py` |
 | 任务状态不刷新或不准 | 打开 `/diagnostics`，看对应来源的 adapter 行 |
+| Cursor 等来源显示 0 任务且 adapter 报 "Full Disk Access" | 新版 macOS 的 TCC 会拦截后台 Host 读取其他 App 数据；给运行 Host 的 Python 授予完全磁盘访问权限（见 [INSTALL.md](INSTALL.md#full-disk-access-macos-15)） |
 | 多 Mac 不显示 | 打开 `/peers.json?refresh=1`，检查 token 和 UDP `5578` |
 | App 只显示 `REC` | 该 App 可能只暴露活动信号，没有稳定任务状态 |
 | Lovable 状态不准 | 打开 `/debug/lovable` 看 renderer CPU 和 browser basis |
@@ -458,7 +411,7 @@ extension/               Chrome/Edge Web Bridge
 - 为当前 macOS Host 安装包完成 Developer ID 签名和 Apple 公证。
 - 录制本地元数据 fixture，扩展适配器回归测试。
 - 随网页结构变化持续补充浏览器任务提取和录制 fixture。
-- 区别于 WAIT 的 FAIL 提醒音，以及可选的外接蜂鸣器。
+- 可选的外接蜂鸣器 / 振动马达提醒。
 - 面向非开发者的一次性引导流程。
 
 ## Release

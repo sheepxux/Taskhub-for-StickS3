@@ -417,6 +417,72 @@ class CodexSessionScan(unittest.TestCase):
             os.remove(path)
             th._CODEX_SESSION_CACHE.pop(path, None)
 
+    def test_incremental_rescan_resumes_from_cached_offset(self):
+        # Active rollouts grow into the hundreds of MB; a refresh must fold in
+        # only the appended lines instead of re-parsing from byte zero.
+        path = write_jsonl([
+            {"type": "session_meta", "timestamp": iso_now(-9000), "payload": {"id": "s-incr", "cwd": "/x"}},
+            {"type": "event_msg", "timestamp": iso_now(-8000), "payload": {"type": "task_started", "turn_id": "t1"}},
+            {"type": "event_msg", "timestamp": iso_now(-7000), "payload": {"type": "task_complete", "turn_id": "t1"}},
+        ])
+        try:
+            first = th._scan_codex_session(path)
+            self.assertEqual(first["session_id"], "s-incr")
+            self.assertEqual(first["turns"], 1)
+            self.assertEqual(first["_offset"], os.path.getsize(path))
+
+            # Blank out the already-parsed head (same byte length, so offsets
+            # stay valid). If the rescan wrongly restarts from byte zero it
+            # loses session_meta; a true incremental scan keeps it.
+            first_line_len = len(open(path, "rb").readline())
+            with open(path, "r+b") as fh:
+                fh.write(b" " * (first_line_len - 1) + b"\n")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "type": "event_msg",
+                    "timestamp": iso_now(),
+                    "payload": {"type": "task_started", "turn_id": "t2"},
+                }) + "\n")
+            future = (datetime.now(timezone.utc) + timedelta(seconds=2)).timestamp()
+            os.utime(path, (future, future))
+
+            second = th._scan_codex_session(path)
+            self.assertEqual(second["session_id"], "s-incr")  # from cached state
+            self.assertEqual(second["turns"], 1)  # t1 not double-counted
+            self.assertEqual(second["latest_turn_id"], "t2")
+            self.assertTrue(second["active_turn"])
+        finally:
+            os.remove(path)
+            th._CODEX_SESSION_CACHE.pop(path, None)
+
+    def test_truncated_rollout_is_rescanned_from_scratch(self):
+        path = write_jsonl([
+            {"type": "session_meta", "timestamp": iso_now(-9000), "payload": {"id": "s-old", "cwd": "/x"}},
+            {"type": "event_msg", "timestamp": iso_now(-8000), "payload": {"type": "task_started", "turn_id": "t1"}},
+            {"type": "event_msg", "timestamp": iso_now(-7000), "payload": {"type": "task_complete", "turn_id": "t1"}},
+        ])
+        try:
+            first = th._scan_codex_session(path)
+            self.assertEqual(first["turns"], 1)
+
+            # Rewrite the file smaller (rotation/truncation): the cached
+            # offset is past EOF, so the parser must restart from byte zero.
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "type": "session_meta",
+                    "timestamp": iso_now(),
+                    "payload": {"id": "s-new", "cwd": "/y"},
+                }) + "\n")
+            future = (datetime.now(timezone.utc) + timedelta(seconds=2)).timestamp()
+            os.utime(path, (future, future))
+
+            second = th._scan_codex_session(path)
+            self.assertEqual(second["session_id"], "s-new")
+            self.assertEqual(second["turns"], 0)
+        finally:
+            os.remove(path)
+            th._CODEX_SESSION_CACHE.pop(path, None)
+
     def test_pending_request_user_input_is_waiting(self):
         # An explicit request_user_input function call (unanswered) is a WAIT.
         path = write_jsonl([

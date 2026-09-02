@@ -4,6 +4,121 @@
 
 ### Added
 
+- **Terminal-free first run for M5Burner users.** The public firmware no longer
+  boots into a `USB Setup` screen that needs `provision_sticks3.sh`:
+  - *Wi-Fi captive portal*: with no Wi-Fi stored, the Stick opens a hotspot
+    `TaskHub-XXXX` (QR on screen), a phone that joins it gets a page listing
+    nearby networks; the choice, password and UI language are saved to NVS
+    (`wifi_saved`). iOS/Android/Windows captive-portal probes are redirected so
+    the page pops up by itself; `192.168.4.1` works as a fallback.
+  - *Code pairing*: once on Wi-Fi with no token, the Stick finds the Host via
+    UDP discovery (`pair: true`), shows a 4-digit code (also on the phone page)
+    and polls `POST /pair`. The Host hands the token out only after that code
+    is approved on the Mac through the loopback-only `/pair/approve`. Wrong
+    codes are rejected, requests expire after 5 min, and a code rolled by a
+    device reboot invalidates a previous approval. Hold **A** for 3s on the
+    pairing screen to redo Wi-Fi; both buttons at power-on still wipe all.
+  - `host/taskhub_pair.py`: Mac-side prompt (terminal or `--gui` osascript
+    dialogs, reads `/dev/tty` so it works under `curl | bash`).
+  - `scripts/install.sh`: one-line Host installer for a fresh Mac (tarball
+    download, no git needed, detects missing Command Line Tools) that ends by
+    asking for the pairing code.
+  - macOS `.pkg`: ships `taskhub_pair.py`, adds `/usr/local/bin/taskhub-pair`,
+    `TaskHub Host.app` now opens the pairing dialog (or diagnostics), and
+    `postinstall` launches it so the installer ends on "type the code".
+  - `packaging/m5burner/`: publishing guide, listing text (EN/ZH) and a
+    generated cover; `build_m5burner_public.sh` now writes
+    `dist/m5burner/TaskHub-StickS3-v<version>.bin` + SHA-256 and refuses to
+    publish a binary that contains any string from the local `secrets.h`.
+  - Firmware reports `TASKHUB_FW_VERSION` (2.3.0) when pairing; USB serial
+    status now includes `stage`, `wifi_configured`, `ap_ssid`, `pair_code`.
+- README (EN/ZH) Quick Start is now the 3-step end-user path (M5Burner → phone
+  Wi-Fi → one command); source/USB/manual paths moved to INSTALL.md.
+
+- New Host adapters for three more agent families:
+  - **Cline / Roo Code / Kilo Code** (`ClineAdapter`): reads each host
+    editor's `globalStorage/<extension>/tasks/<id>/ui_messages.json` across
+    VS Code, VS Code Insiders, Cursor, Windsurf, VSCodium, Antigravity and
+    Trae. An unanswered `ask` is an exact WAIT (tool/command approval,
+    follow-up question, plan review), `api_req_started` is RUN,
+    `completion_result` is DONE, `api_req_failed`/`error` is FAIL, and token
+    counts + cost come from the request metadata. Opens the host editor via
+    the new `app-name` open action.
+  - **Gemini CLI / Qwen Code** (`GeminiCliAdapter`): parses
+    `tmp/<projectHash>/chats/session-*.json` under `~/.gemini` / `~/.qwen`,
+    maps the project hash back to a folder via `projects.json`, and derives
+    RUN/WAIT (tool `awaiting_approval`)/DONE/FAIL from the last message.
+  - **GitHub Copilot CLI** (`CopilotCliAdapter`): parses
+    `~/.copilot/session-state/<id>/events.jsonl` + `workspace.yaml`.
+  Both CLI adapters gate RUN on a live CLI process (`cli_process_running`),
+  falling back to a 2-minute freshness window when the process is not
+  visible. All three are fixture-tested (`host/tests/test_extension_and_cli_adapters.py`);
+  the formats were reconstructed from public sources rather than captured
+  on this machine, so real-world reports are welcome.
+- StickS3 source icons and colors for Cline-family, Copilot and Qwen rows
+  (Gemini CLI reuses the Gemini mark).
+- `install_task_hub.sh` now waits for `/health`, pulls `/diagnostics.json`
+  and prints any adapter blocked by macOS TCC together with the exact Python
+  binary launchd runs (the one to add under Full Disk Access).
+- StickS3 FAIL alert: a task entering `fail` now wakes the screen and plays a
+  falling two-note buzz, distinct from the WAIT double beep and the DONE
+  chime. Tunable via `ALERT_ON_FAIL` / `ALERT_FAIL_HZ`.
+- The top-bar battery icon shows a bolt (and a blue level bar) while the
+  StickS3 is charging over USB.
+
+### Fixed
+
+- The Host advertised the wrong address when a VPN/proxy was active.
+  `local_ip_hint()` used the connect-to-8.8.8.8 trick, which returns the tunnel
+  IP (`198.18.0.1` for Clash/Surge fake-IP, `100.x` for Tailscale); a Stick on
+  the LAN cannot reach that. Discovery and pairing now answer with the address
+  of the interface facing the requesting device (`local_ip_for_peer`), and
+  `/health` falls back to the default-route LAN interface, skipping tunnel and
+  CGNAT ranges.
+- Host cold start no longer makes the Stick's first fetch time out. The Host
+  begins filling its task cache as soon as it is listening (`Hub.warm_cache`),
+  a Stick request that arrives while that first scan runs waits for it
+  (up to `TASK_HUB_COLD_START_WAIT_MS`, default 6s, under the Stick's 8s
+  HTTP timeout) instead of launching a second full scan, and if the scan is
+  still going the Host answers empty with `syncing: true` so the Stick
+  re-polls a moment later. A cold Codex/Claude scan on a busy machine is
+  ~8-10s; the warm path is ~50ms.
+- The TCC hint now mentions the other common cause: an agent's data folder
+  (e.g. `~/.cursor`) symlinked onto an external volume, which a launchd
+  process cannot read without Full Disk Access.
+- StickS3 alerts are now edge-triggered per task instead of on the global
+  "any WAIT" / "any RUN" flags. Previously a second session entering WAIT
+  while another was already waiting never rang, and a task finishing while a
+  WAIT was pending never chimed. The firmware keeps a per-task status table in
+  RTC memory (survives deep sleep), diffs each refresh against it, plays at
+  most one alert per refresh (WAIT > FAIL > DONE), and jumps the screen to the
+  task that changed.
+- macOS TCC app-data denials (common for the launchd-run Host on macOS 15+)
+  no longer read as "adapter ok, 0 tasks". Cursor's global-storage DB and
+  `~/.cursor/projects` reads now record permission failures, `/diagnostics`
+  flags the adapter with a Full Disk Access error, and the on-device Cursor
+  fallback row says "needs Full Disk Access" instead of "no recent agent
+  session". INSTALL.md documents the grant.
+- `install_task_hub.sh` and `install_whisper_server.sh` now copy whisper
+  models onto the internal disk instead of symlinking into the repo. A repo
+  on an external volume (unmounted at login) or under a TCC-protected folder
+  like `~/Desktop` made launchd's whisper-server crash-loop on a model it
+  could not open, flooding its log.
+- LaunchAgent logs (`task_hub.log`, `whisper-server.log`) are trimmed at
+  startup once they exceed ~10MB (recent tail kept in `*.prev`), and the
+  whisper agent gained a 30s `ThrottleInterval` so a crash loop cannot flood
+  the disk.
+
+### Changed
+
+- Codex rollout scans are now incremental: the parser memoises its state and
+  file offset per session, so a growing rollout only folds in appended lines.
+  Active Codex sessions in the hundreds of MB used to be re-parsed from byte
+  zero on every `/tasks` refresh, costing multiple seconds per request; the
+  same refresh now costs milliseconds.
+
+### Added
+
 - Added a detailed Cursor adapter. It reads Cursor's composer index
   (`state.vscdb`) and the per-project agent transcripts under
   `~/.cursor/projects` for chat titles, workspace folders, turn state,
